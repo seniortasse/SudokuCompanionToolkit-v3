@@ -1,0 +1,44 @@
+[
+  {
+    "id": "tech_naked_single_basic",
+    "title": "Naked Single",
+    "short": "A cell where only one digit can fit given row, column, and box constraints.",
+    "how_to_detect": "Compute candidates. If a cell has exactly one candidate, place it.",
+    "difficulty": 1
+  },
+  {
+    "id": "tech_hidden_single_basic",
+    "title": "Hidden Single",
+    "short": "A digit that appears as a candidate in only one cell within a unit (row/column/box).",
+    "how_to_detect": "For each unit and digit 1\u20139, if the digit is a candidate in exactly one cell, place it.",
+    "difficulty": 2
+  },
+  {
+    "id": "tech_locked_candidates_pointing",
+    "title": "Locked Candidates (Pointing)",
+    "short": "If all candidates for a digit in a 3\u00d73 box lie in one row/column, eliminate that digit from the rest of that row/column outside the box.",
+    "how_to_detect": "Scan each box for a digit whose candidates fall in a single row/column; eliminate elsewhere in that line.",
+    "difficulty": 3
+  },
+  {
+    "id": "tech_locked_candidates_claiming",
+    "title": "Locked Candidates (Claiming)",
+    "short": "If all candidates for a digit in a row/column lie within one box, eliminate that digit from other cells in that box.",
+    "how_to_detect": "Scan each row/column for a digit whose candidates lie in a single box; eliminate in that box.",
+    "difficulty": 3
+  },
+  {
+    "id": "tech_xwing_basic",
+    "title": "X-Wing",
+    "short": "A pattern where a digit occupies two cells in two rows (or columns) aligned as a rectangle, allowing eliminations.",
+    "how_to_detect": "Look for two rows where a digit appears in exactly two columns, same columns in both rows; eliminate digit from other cells in those columns.",
+    "difficulty": 5
+  },
+  {
+    "id": "story_origin",
+    "title": "A Short History of Sudoku",
+    "short": "Sudoku evolved from Latin squares (Euler) to modern number puzzles popularized in Japan, then worldwide in the 2000s.",
+    "how_to_use": "Provide on-demand as a fun aside; keep it brief and optional.",
+    "difficulty": 0
+  }
+]

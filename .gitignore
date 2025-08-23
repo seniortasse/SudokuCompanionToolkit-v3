@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Outputs & temp
+demo_export/
+eval_*/
+checkpoints*/
+data/
+*.gif
+*.mp4
+*.png
+*.jpg
+
+# IDE
+.vscode/
+.DS_Store

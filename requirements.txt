@@ -1,0 +1,6 @@
+# Minimal runtime for demo & visualization (no ML training required)
+opencv-python>=4.9
+pillow>=10.0
+numpy>=1.24
+imageio>=2.34
+imageio-ffmpeg>=0.4

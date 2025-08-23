@@ -1,0 +1,104 @@
+[
+  {
+    "file": "apps/cli/demo_cli_overlay.py",
+    "exists": true,
+    "inserted": [
+      "main"
+    ],
+    "skipped": [
+      "parse_args"
+    ],
+    "module_doc": true
+  },
+  {
+    "file": "apps/cli/demo_cli.py",
+    "exists": true,
+    "inserted": [],
+    "skipped": [
+      "mock_classify_cells"
+    ],
+    "module_doc": true
+  },
+  {
+    "file": "apps/cli/overlay_renderer.py",
+    "exists": true,
+    "inserted": [
+      "draw_move"
+    ],
+    "skipped": [],
+    "module_doc": true
+  },
+  {
+    "file": "apps/cli/storyboard_sheet.py",
+    "exists": true,
+    "inserted": [
+      "read_moves_json",
+      "main"
+    ],
+    "skipped": [
+      "layout_grid"
+    ],
+    "module_doc": true
+  },
+  {
+    "file": "apps/cli/animate_gif.py",
+    "exists": true,
+    "inserted": [
+      "main"
+    ],
+    "skipped": [],
+    "module_doc": true
+  },
+  {
+    "file": "apps/cli/animate_mp4.py",
+    "exists": true,
+    "inserted": [
+      "main"
+    ],
+    "skipped": [],
+    "module_doc": true
+  },
+  {
+    "file": "vision/rectify/opencv_rectify.py",
+    "exists": true,
+    "inserted": [
+      "remove_grid_lines",
+      "process"
+    ],
+    "skipped": [
+      "find_grid_contour",
+      "perspective_warp",
+      "crop_cells"
+    ],
+    "module_doc": true
+  },
+  {
+    "file": "solver/sudoku_tools.py",
+    "exists": true,
+    "inserted": [
+      "compute_candidates_tool",
+      "next_moves"
+    ],
+    "skipped": [
+      "find_naked_singles",
+      "find_hidden_singles",
+      "find_locked_candidates_pointing",
+      "chain_followup_singles"
+    ],
+    "module_doc": true
+  },
+  {
+    "file": "solver/solver_core.py",
+    "exists": true,
+    "inserted": [
+      "peers"
+    ],
+    "skipped": [
+      "rc_to_idx",
+      "house_iter",
+      "place_digit",
+      "eliminate_candidate"
+    ],
+    "module_doc": true
+  }
+]

@@ -1,0 +1,52 @@
+[
+  {
+    "file": "solver/sudoku_tools.py",
+    "exists": true,
+    "changed": [],
+    "skipped": [
+      "compute_candidates_tool",
+      "find_naked_singles",
+      "find_hidden_singles",
+      "find_locked_candidates_pointing",
+      "chain_followup_singles",
+      "next_moves"
+    ]
+  },
+  {
+    "file": "apps/cli/demo_cli_overlay.py",
+    "exists": true,
+    "changed": [
+      "main"
+    ],
+    "skipped": [
+      "parse_args"
+    ]
+  },
+  {
+    "file": "apps/cli/storyboard_sheet.py",
+    "exists": true,
+    "changed": [
+      "read_moves_json",
+      "main"
+    ],
+    "skipped": [
+      "layout_grid"
+    ]
+  },
+  {
+    "file": "apps/cli/overlay_renderer.py",
+    "exists": true,
+    "changed": [
+      "draw_move"
+    ],
+    "skipped": []
+  },
+  {
+    "file": "vision/rectify/opencv_rectify.py",
+    "exists": true,
+    "changed": [
+      "process"
+    ],
+    "skipped": []
+  }
+]

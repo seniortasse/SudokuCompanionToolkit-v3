@@ -1,0 +1,4 @@
+# Extras for training & quantization (optional)
+tensorflow>=2.12
+tensorflow-addons>=0.20
+tensorflow-model-optimization>=0.7
