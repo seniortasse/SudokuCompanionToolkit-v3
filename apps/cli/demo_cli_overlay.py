@@ -1,6 +1,5 @@
 from __future__ import annotations
-from typing import List, Dict, Optional, Tuple, Any
-from types_sudoku import Grid, Candidates, Move
+
 """CLI orchestrator for the demo pipeline. Loads an image, runs OpenCV rectification, obtains a (mock) board state, computes candidates and next moves with chaining, renders overlay images per move, and prints a JSON report to stdout."""
 
 
@@ -8,13 +7,16 @@ from types_sudoku import Grid, Candidates, Move
 # Demo CLI with visual overlays per move.
 # Usage:
 #   python demo_cli_overlay.py --image /path/to/photo.jpg --out demo_export --mode demo --max_moves 5
-import argparse, json
+import argparse
+import json
 from pathlib import Path
 
-from vision.rectify.opencv_rectify import process as rectify_process
 from solver.sudoku_tools import compute_candidates_tool, next_moves
-from .overlay_renderer import draw_move
+from vision.rectify.opencv_rectify import process as rectify_process
+
 from .demo_cli import mock_classify_cells  # reuse
+from .overlay_renderer import draw_move
+
 
 def main(args=None) -> None:
     if args is None:
@@ -22,7 +24,7 @@ def main(args=None) -> None:
         ap = argparse.ArgumentParser()
         ap.add_argument("--image", required=True)
         ap.add_argument("--out", type=str, default="demo_export")
-        ap.add_argument("--mode", type=str, default="demo", choices=["demo","random","blank"])
+        ap.add_argument("--mode", type=str, default="demo", choices=["demo", "random", "blank"])
         ap.add_argument("--seed", type=int, default=123)
         ap.add_argument("--max_moves", type=int, default=5)
         ap.add_argument("--json", type=str, default=None)
@@ -34,11 +36,13 @@ def main(args=None) -> None:
     info = rectify_process(args.image, export_dir)
     original, current = mock_classify_cells(info["cells_json"], mode=args.mode, seed=args.seed)
 
-    cands  = compute_candidates_tool(current)["candidates"]
-    result = next_moves(current, cands, max_difficulty="locked", max_moves=args.max_moves, chain=True)
+    cands = compute_candidates_tool(current)["candidates"]
+    result = next_moves(
+        current, cands, max_difficulty="locked", max_moves=args.max_moves, chain=True
+    )
 
     warped = info["warped"]
-    moves  = result["moves"]
+    moves = result["moves"]
 
     overlays = []
     for i, mv in enumerate(moves, 1):
@@ -52,7 +56,6 @@ def main(args=None) -> None:
         Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
     else:
         print(json.dumps(payload, indent=2))
-    
 
 
 if __name__ == "__main__":

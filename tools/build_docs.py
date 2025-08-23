@@ -1,11 +1,12 @@
 # tools/build_docs.py
-"""
-Build API docs (HTML) into docs/site using pdoc.
+"""Build API docs (HTML) into docs/site using pdoc.
 - Requires: pip install -r requirements-docs.txt
-- Usage: python tools/build_docs.py
+- Usage: python tools/build_docs.py.
 """
-import subprocess, sys, shutil, os
+import subprocess
+import sys
 from pathlib import Path
+
 
 def main():
     root = Path(__file__).resolve().parents[1]
@@ -17,6 +18,7 @@ def main():
     print("Running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
     print(f"Docs built → {out} (open index.html)")
+
 
 if __name__ == "__main__":
     main()
