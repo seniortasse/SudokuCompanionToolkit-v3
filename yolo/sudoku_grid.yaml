@@ -1,0 +1,5 @@
+path: ./datasets/sudoku_grids
+train: images/train
+val: images/val
+names:
+  0: grid
