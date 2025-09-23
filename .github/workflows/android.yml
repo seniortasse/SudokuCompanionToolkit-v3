@@ -39,7 +39,9 @@ jobs:
                         "ndk;26.1.10909125"
 
       - name: Export NDK/CMake to env
+        shell: bash
         run: |
+          set -e
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.1.10909125" >> $GITHUB_ENV
           echo "${ANDROID_SDK_ROOT}/cmake/3.22.1/bin" >> $GITHUB_PATH
           cmake --version
@@ -55,21 +57,44 @@ jobs:
 
       # 🧹 Fix CRLF + exec bit so Linux can run gradlew
       - name: Fix Gradle wrapper line endings
+        shell: bash
         run: |
+          set -e
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
 
       # 📦 Fetch OpenCV Android SDK into the path your CMakeLists expects
       - name: Fetch OpenCV Android SDK
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p app/src/main/cpp/third_party
           cd app/src/main/cpp/third_party
+
+          echo "Downloading OpenCV Android SDK…"
           curl -L -o opencv.zip https://github.com/opencv/opencv/releases/download/4.10.0/opencv-4.10.0-android-sdk.zip
+
+          echo "Unzipping…"
           unzip -q opencv.zip
-          mv opencv-*-android-sdk OpenCV-android-sdk
+
+          # Find the extracted folder (case-insensitive match on *android-sdk)
+          SRC_DIR="$(find . -maxdepth 1 -type d -iname '*android-sdk' -printf '%f\n' | head -n1 || true)"
+          if [[ -z "${SRC_DIR:-}" ]]; then
+            echo "ERROR: Could not locate extracted OpenCV SDK directory"
+            ls -la
+            exit 1
+          fi
+
+          # Normalize to the path CMake expects
+          if [[ "${SRC_DIR}" != "OpenCV-android-sdk" ]]; then
+            mv "$SRC_DIR" OpenCV-android-sdk
+          fi
+
           test -d OpenCV-android-sdk/sdk/native/jni/include/opencv2
+          echo "OpenCV SDK ready at: $(pwd)/OpenCV-android-sdk"
 
       - name: Assemble Debug
+        shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
       - name: Upload APK artifact
