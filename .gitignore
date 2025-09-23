@@ -1,18 +1,60 @@
-# Python
-.venv/
+# --- Android / Gradle
+.gradle/
+**/build/
+**/.cxx/
+**/.idea/
+**/*.iml
+local.properties
+
+# --- OpenCV Android SDK (keep local; don't commit thousands of files)
+app/src/main/cpp/third_party/OpenCV-android-sdk/
+
+# --- ML artifacts & datasets
+runs/
+datasets/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.engine
+*.npy
+*.npz
+*.pkl
+*.h5
 __pycache__/
 *.pyc
 
-# Outputs & temp
-demo_export/
-eval_*/
-checkpoints*/
-data/
-*.gif
-*.mp4
-*.png
-*.jpg
+# --- Python envs
+.venv/
+venv/
+env/
+.tfliteenv/
+pip-wheel-metadata/
 
-# IDE
-.vscode/
+# --- Logs / caches / temp
+logs/
+wandb/
+.tensorboard/
+*.log
+*.tmp
+*.cache/
+.cache/
+
+# --- Media & large samples (keep out of git; store elsewhere or LFS)
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+
+# --- OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
