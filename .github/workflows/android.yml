@@ -1,0 +1,33 @@
+name: Android
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  assembleDebug:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build debug APK
+        working-directory: python/mobile/android
+        run: ./gradlew :app:assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: python/mobile/android/app/build/outputs/apk/debug/*.apk

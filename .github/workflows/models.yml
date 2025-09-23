@@ -1,0 +1,48 @@
+name: Models
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  export-tflite:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          # main requirements (adjust if you keep train/api/docs separate)
+          pip install -r python/requirements.txt || true
+          # optional extras (safe to skip if missing)
+          if [ -f python/requirements-train.txt ]; then pip install -r python/requirements-train.txt; fi
+
+      # Example YOLO→TFLite export (edit paths if needed)
+      - name: Export YOLO to TFLite (FP32)
+        run: |
+          python tools/export_tflite.py \
+            --pt yolov8n.pt \
+            --out python/mobile/android/app/src/main/assets/best_float32.tflite || true
+
+      # Corner heatmap / cell classifier exports (placeholders until Tasks 3 & 6)
+      - name: Export corners / cells (stubs)
+        run: |
+          if [ -f python/vision/train/export_corners_tflite.py ]; then python python/vision/train/export_corners_tflite.py; else echo "no corners export yet"; fi
+          if [ -f python/vision/train/export_cells_tflite.py   ]; then python python/vision/train/export_cells_tflite.py;   else echo "no cells export yet"; fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tflite-models
+          path: |
+            python/mobile/android/app/src/main/assets/*.tflite
+            **/eval/*.csv
