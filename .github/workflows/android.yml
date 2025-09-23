@@ -21,19 +21,27 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Install Android SDK components (platform + build-tools + CMake)
-        run: |
-          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          sdkmanager "platform-tools" \
-                     "platforms;android-34" \
-                     "build-tools;34.0.0" \
-                     "cmake;3.22.1" \
-                     "ndk;26.1.10909125"
+      # 🔧 Install Android SDK + cmdline-tools (gives us `sdkmanager`)
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Set up NDK env
+      # Accept licenses & install exact components we need
+      - name: Install Android SDK components (platform/build-tools/CMake/NDK)
+        shell: bash
         run: |
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.1.10909125" >> $GITHUB_ENV
-          echo "${ANDROID_HOME}/cmake/3.22.1/bin" >> $GITHUB_PATH
+          set -e
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" "platform-tools" \
+                        "platforms;android-34" \
+                        "build-tools;34.0.0" \
+                        "cmake;3.22.1" \
+                        "ndk;26.1.10909125"
+
+      - name: Export NDK/CMake to env
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "${ANDROID_SDK_ROOT}/cmake/3.22.1/bin" >> $GITHUB_PATH
           cmake --version
 
       - name: Cache Gradle
@@ -45,12 +53,13 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: ${{ runner.os }}-gradle-
 
-      # >>> This step fixes your error <<<
+      # 🧹 Fix CRLF + exec bit so Linux can run gradlew
       - name: Fix Gradle wrapper line endings
         run: |
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
 
+      # 📦 Fetch OpenCV Android SDK into the path your CMakeLists expects
       - name: Fetch OpenCV Android SDK
         run: |
           mkdir -p app/src/main/cpp/third_party
