@@ -1,4 +1,4 @@
-# --- Android / Gradle
+# --- Android / Gradle (generic)
 .gradle/
 **/build/
 **/.cxx/
@@ -6,8 +6,23 @@
 **/*.iml
 local.properties
 
-# --- OpenCV Android SDK (keep local; don't commit thousands of files)
-app/src/main/cpp/third_party/OpenCV-android-sdk/
+# --- Android / Gradle (your tree under python/mobile/android)
+python/mobile/android/.gradle/
+python/mobile/android/**/build/
+python/mobile/android/**/.cxx/
+python/mobile/android/**/.idea/
+python/mobile/android/**/*.iml
+python/mobile/android/java_pid*.hprof
+python/mobile/android/**/captures/
+python/mobile/android/**/outputs/**/*.apk
+python/mobile/android/**/outputs/**/*.aab
+
+# --- OpenCV Android SDK (keep local; CI will fetch it)
+python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
+python/mobile/android/app/src/main/cpp/third_party/opencv*.zip
+
+# --- Native/NDK compiled libs (covered by build/, but explicit for safety)
+**/jniLibs/*.so
 
 # --- ML artifacts & datasets
 runs/
@@ -23,10 +38,12 @@ checkpoints/
 *.npz
 *.pkl
 *.h5
+
+# --- Python caches
 __pycache__/
 *.pyc
 
-# --- Python envs
+# --- Python envs (never commit)
 .venv/
 venv/
 env/
@@ -53,6 +70,10 @@ wandb/
 *.jpg
 *.jpeg
 *.png
+
+# --- Signing/keystore (never commit real keys)
+*.keystore
+*.jks
 
 # --- OS/editor
 .DS_Store
