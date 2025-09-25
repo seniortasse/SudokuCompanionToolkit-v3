@@ -6,6 +6,7 @@ plugins {
 android {
     namespace "com.contextionary.sudoku"
     compileSdk 34
+
     defaultConfig {
         applicationId "com.contextionary.sudoku"
         minSdk 24
@@ -17,10 +18,29 @@ android {
             abiFilters "arm64-v8a"
         }
 
-        externalNativeBuild { cmake { cppFlags "-std=c++20 -O3" } }
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20 -O3"
+            }
+        }
     }
-    buildFeatures { buildConfig = true }
-    externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt" } }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+
+    // Make Gradle package OpenCV's prebuilt native libs with the APK
+    sourceSets {
+        main {
+            jniLibs.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"]
+        }
+    }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -57,8 +77,10 @@ dependencies {
     implementation "org.tensorflow:tensorflow-lite:2.14.0"
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
 
-    // OpenCV prefab (or link SDK yourself — see CMakeLists)
-    //mplementation 'org.opencv:opencv-android:4.9.0'
+    // OpenCV via fetched Android SDK (matches CI download of 4.10.0)
+    implementation files('src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/bin/opencv-4100.jar')
+    // If you prefer Maven prefab instead of SDK download, use:
+    // implementation 'org.opencv:opencv-android:4.9.0'  // and adjust CMake accordingly
 
     implementation "androidx.constraintlayout:constraintlayout:2.1.4"
 
