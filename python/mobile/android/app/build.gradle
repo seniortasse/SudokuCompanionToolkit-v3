@@ -35,7 +35,7 @@ android {
         }
     }
 
-    // Make Gradle package OpenCV's prebuilt native libs with the APK
+    // Package OpenCV's prebuilt native libs from the fetched SDK
     sourceSets {
         main {
             jniLibs.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"]
@@ -78,9 +78,8 @@ dependencies {
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
 
     // OpenCV via fetched Android SDK (matches CI download of 4.10.0)
-    implementation files('src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/bin/opencv-4100.jar')
-    // If you prefer Maven prefab instead of SDK download, use:
-    // implementation 'org.opencv:opencv-android:4.9.0'  // and adjust CMake accordingly
+    // NOTE: jar path is .../sdk/java/opencv-4100.jar (no "bin" folder)
+    implementation files('src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/opencv-4100.jar')
 
     implementation "androidx.constraintlayout:constraintlayout:2.1.4"
 
