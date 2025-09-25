@@ -1,0 +1,87 @@
+{
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r1c8_56a5502e.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r1c8_56a5502e_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r2c1_74671118.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r2c1_74671118_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r2c1_77abed39.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r2c1_77abed39_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r2c9_37794a05.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r2c9_37794a05_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r4c3_3d9d0a3c.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r4c3_3d9d0a3c_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r5c3_cb0a4052.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r5c3_cb0a4052_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r5c9_2d838a86.png": {
+    "split": "train",
+    "label": 6,
+    "dest": "train\\6\\r5c9_2d838a86_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r7c1_f5881748.png": {
+    "split": "train",
+    "label": 6,
+    "dest": "train\\6\\r7c1_f5881748_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r7c7_6baf22b7.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r7c7_6baf22b7_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r8c3_a6256795.png": {
+    "split": "train",
+    "label": 9,
+    "dest": "train\\9\\r8c3_a6256795_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r8c9_18a368b9.png": {
+    "split": "train",
+    "label": 4,
+    "dest": "train\\4\\r8c9_18a368b9_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c1_34655c5f.png": {
+    "split": "train",
+    "label": 0,
+    "dest": "train\\0\\r9c1_34655c5f_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c2_93abda5b.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r9c2_93abda5b_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c6_a20be0a8.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r9c6_a20be0a8_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c7_b2cb082f.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r9c7_b2cb082f_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c8_d78b17af.png": {
+    "split": "train",
+    "label": 7,
+    "dest": "train\\7\\r9c8_d78b17af_r999c999.png"
+  },
+  "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\data\\extra7\\queue\\r9c9_66f8e2cf.png": {
+    "split": "train",
+    "label": 9,
+    "dest": "train\\9\\r9c9_66f8e2cf_r999c999.png"
+  }
+}

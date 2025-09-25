@@ -1,0 +1,19 @@
+{
+  "script_version": "predict_cells_v2",
+  "src": "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\demo_export",
+  "out": "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\3,2",
+  "model": "C:\\Users\\17347\\Desktop\\CONTEXTIONARY\\1- SUDOKU COMPANION\\SudokuCompanionToolkit v3\\vision\\train\\checkpoints\\best.pt",
+  "img": 28,
+  "device": "cpu",
+  "calibration_path": ".\\vision\\train\\calibration.json",
+  "temperature": 0.22920913994312286,
+  "thresholds": {
+    "low": 0.9,
+    "margin": 0.1
+  },
+  "inner_crop": 0.92,
+  "boards": 65,
+  "tiles": 5265,
+  "low_total": 12,
+  "low_rate": 0.002279202279202279
+}

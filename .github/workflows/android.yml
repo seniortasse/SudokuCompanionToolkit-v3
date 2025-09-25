@@ -2,32 +2,108 @@ name: Android
 
 on:
   push:
-    branches: [ main ]
   pull_request:
 
 jobs:
   assembleDebug:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python/mobile/android
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: 17
+          cache: gradle
 
-      - name: Gradle cache
-        uses: gradle/actions/setup-gradle@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Build debug APK
-        working-directory: python/mobile/android
-        run: ./gradlew :app:assembleDebug
+      - name: Install Android SDK components (platform/build-tools/CMake/NDK)
+        shell: bash
+        run: |
+          set -e
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "cmake;3.22.1" \
+            "ndk;26.1.10909125"
+
+      - name: Export NDK/CMake to env
+        shell: bash
+        run: |
+          set -e
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "${ANDROID_SDK_ROOT}/cmake/3.22.1/bin" >> $GITHUB_PATH
+          cmake --version
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Fix Gradle wrapper line endings
+        shell: bash
+        run: |
+          set -e
+          sed -i 's/\r$//' gradlew
+          chmod +x gradlew
+          ./gradlew --version
+
+      # Fetch OpenCV Android SDK into the location expected by app/build.gradle sourceSets
+      - name: Fetch OpenCV Android SDK 4.9.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          OPENCV_URL="https://github.com/opencv/opencv/releases/download/4.9.0/opencv-4.9.0-android-sdk.zip"
+          DEST_DIR="app/src/main/cpp/third_party"
+          TARGET="${DEST_DIR}/OpenCV-android-sdk"
+          TMP_DIR="$(mktemp -d)"
+
+          mkdir -p "${DEST_DIR}"
+          echo "Downloading OpenCV from: ${OPENCV_URL}"
+          curl -L "${OPENCV_URL}" -o "${TMP_DIR}/opencv.zip"
+
+          echo "Unzipping OpenCV…"
+          unzip -q "${TMP_DIR}/opencv.zip" -d "${TMP_DIR}"
+
+          if [ ! -d "${TMP_DIR}/OpenCV-android-sdk" ]; then
+            echo "❌ Expected folder not found after unzip: ${TMP_DIR}/OpenCV-android-sdk"
+            exit 1
+          fi
+
+          # Replace any existing copy to avoid 'move into subdirectory of itself' errors
+          rm -rf "${TARGET}"
+          mv "${TMP_DIR}/OpenCV-android-sdk" "${DEST_DIR}/"
+          echo "✅ OpenCV installed at ${TARGET}"
+
+          # Quick sanity check for folders used by sourceSets
+          test -d "${TARGET}/sdk/java/src" || (echo "Missing OpenCV Java sources" && exit 1)
+          test -d "${TARGET}/sdk/native/libs" || (echo "Missing OpenCV native libs" && exit 1)
+
+      - name: Kotlin compile (show errors clearly)
+        shell: bash
+        run: ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all --build-cache
+
+      - name: Assemble Debug
+        shell: bash
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon --build-cache
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: python/mobile/android/app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*.apk

@@ -1,18 +1,84 @@
-# Python
-.venv/
+# --- Android / Gradle (generic)
+.gradle/
+**/build/
+**/.cxx/
+**/.idea/
+**/*.iml
+local.properties
+
+# --- Android / Gradle (your tree under python/mobile/android)
+python/mobile/android/.gradle/
+python/mobile/android/**/build/
+python/mobile/android/**/.cxx/
+python/mobile/android/**/.idea/
+python/mobile/android/**/*.iml
+python/mobile/android/java_pid*.hprof
+python/mobile/android/**/captures/
+python/mobile/android/**/outputs/**/*.apk
+python/mobile/android/**/outputs/**/*.aab
+
+# --- OpenCV Android SDK (keep local; CI will fetch it)
+python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
+python/mobile/android/app/src/main/cpp/third_party/opencv*.zip
+
+# --- Native/NDK compiled libs (covered by build/, but explicit for safety)
+**/jniLibs/*.so
+
+# --- ML artifacts & datasets
+runs/
+datasets/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.engine
+*.npy
+*.npz
+*.pkl
+*.h5
+
+# --- Python caches
 __pycache__/
 *.pyc
 
-# Outputs & temp
-demo_export/
-eval_*/
-checkpoints*/
-data/
-*.gif
-*.mp4
-*.png
-*.jpg
+# --- Python envs (never commit)
+.venv/
+venv/
+env/
+.tfliteenv/
+pip-wheel-metadata/
 
-# IDE
-.vscode/
+# --- Logs / caches / temp
+logs/
+wandb/
+.tensorboard/
+*.log
+*.tmp
+*.cache/
+.cache/
+
+# --- Media & large samples (keep out of git; store elsewhere or LFS)
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.mp4
+*.mov
+*.avi
+*.jpg
+*.jpeg
+*.png
+
+# --- Signing/keystore (never commit real keys)
+*.keystore
+*.jks
+
+# --- OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
+# OpenCV Android SDK fetched by CI
+python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
+
