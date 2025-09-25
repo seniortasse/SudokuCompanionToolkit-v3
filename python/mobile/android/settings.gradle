@@ -4,10 +4,6 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
-    plugins {
-        id("com.android.application") version "8.4.2"
-        id("org.jetbrains.kotlin.android") version "1.9.24"
-    }
 }
 
 dependencyResolutionManagement {
@@ -18,5 +14,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "SudokuGridCapture"
+rootProject.name = "SudokuCompanion"
+
 include(":app")
+include(":openCV") // our thin wrapper module around the OpenCV SDK
