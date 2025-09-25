@@ -20,6 +20,7 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          cache: gradle
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -60,30 +61,46 @@ jobs:
           set -e
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
+          ./gradlew --version
 
-      # Fetch OpenCV Android SDK into the location expected by :openCV sourceSets
+      # Fetch OpenCV Android SDK into the location expected by app/build.gradle sourceSets
       - name: Fetch OpenCV Android SDK 4.9.0
         shell: bash
         run: |
-          set -e
-          OPENCV_ZIP="opencv-4.9.0-android-sdk.zip"
-          OPENCV_URL="https://github.com/opencv/opencv/releases/download/4.9.0/${OPENCV_ZIP}"
-          mkdir -p app/src/main/cpp/third_party
-          cd app/src/main/cpp/third_party
-          if [ ! -d "OpenCV-android-sdk" ]; then
-            curl -L "$OPENCV_URL" -o "$OPENCV_ZIP"
-            unzip -q "$OPENCV_ZIP"
-            mv OpenCV-android-sdk OpenCV-android-sdk
-            rm -f "$OPENCV_ZIP"
+          set -euo pipefail
+          OPENCV_URL="https://github.com/opencv/opencv/releases/download/4.9.0/opencv-4.9.0-android-sdk.zip"
+          DEST_DIR="app/src/main/cpp/third_party"
+          TARGET="${DEST_DIR}/OpenCV-android-sdk"
+          TMP_DIR="$(mktemp -d)"
+
+          mkdir -p "${DEST_DIR}"
+          echo "Downloading OpenCV from: ${OPENCV_URL}"
+          curl -L "${OPENCV_URL}" -o "${TMP_DIR}/opencv.zip"
+
+          echo "Unzipping OpenCV…"
+          unzip -q "${TMP_DIR}/opencv.zip" -d "${TMP_DIR}"
+
+          if [ ! -d "${TMP_DIR}/OpenCV-android-sdk" ]; then
+            echo "❌ Expected folder not found after unzip: ${TMP_DIR}/OpenCV-android-sdk"
+            exit 1
           fi
+
+          # Replace any existing copy to avoid 'move into subdirectory of itself' errors
+          rm -rf "${TARGET}"
+          mv "${TMP_DIR}/OpenCV-android-sdk" "${DEST_DIR}/"
+          echo "✅ OpenCV installed at ${TARGET}"
+
+          # Quick sanity check for folders used by sourceSets
+          test -d "${TARGET}/sdk/java/src" || (echo "Missing OpenCV Java sources" && exit 1)
+          test -d "${TARGET}/sdk/native/libs" || (echo "Missing OpenCV native libs" && exit 1)
 
       - name: Kotlin compile (show errors clearly)
         shell: bash
-        run: ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all
+        run: ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all --build-cache
 
       - name: Assemble Debug
         shell: bash
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon --build-cache
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
