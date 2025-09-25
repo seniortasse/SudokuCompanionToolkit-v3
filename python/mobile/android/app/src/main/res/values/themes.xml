@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Keep the name Theme.App to match AndroidManifest.xml -->
+    <style name="Theme.App" parent="Theme.DeviceDefault.DayNight.NoActionBar">
+        <!-- Keep it minimal to avoid extra deps -->
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+    </style>
+</resources>
