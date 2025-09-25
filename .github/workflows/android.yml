@@ -21,11 +21,11 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # 🔧 Install Android SDK + cmdline-tools (gives us `sdkmanager`)
+      # Android SDK + cmdline-tools (provides sdkmanager/avdmanager/adb, etc.)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # Accept licenses & install exact components we need
+      # Accept licenses & install the components we need
       - name: Install Android SDK components (platform/build-tools/CMake/NDK)
         shell: bash
         run: |
@@ -55,7 +55,7 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: ${{ runner.os }}-gradle-
 
-      # 🧹 Fix CRLF + exec bit so Linux can run gradlew
+      # Fix CRLF + ensure wrapper is executable on Linux runners
       - name: Fix Gradle wrapper line endings
         shell: bash
         run: |
@@ -63,36 +63,7 @@ jobs:
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
 
-      # 📦 Fetch OpenCV Android SDK into the path your CMakeLists expects
-      - name: Fetch OpenCV Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p app/src/main/cpp/third_party
-          cd app/src/main/cpp/third_party
-
-          echo "Downloading OpenCV Android SDK…"
-          curl -L -o opencv.zip https://github.com/opencv/opencv/releases/download/4.10.0/opencv-4.10.0-android-sdk.zip
-
-          echo "Unzipping…"
-          unzip -q opencv.zip
-
-          # Find the extracted folder (case-insensitive match on *android-sdk)
-          SRC_DIR="$(find . -maxdepth 1 -type d -iname '*android-sdk' -printf '%f\n' | head -n1 || true)"
-          if [[ -z "${SRC_DIR:-}" ]]; then
-            echo "ERROR: Could not locate extracted OpenCV SDK directory"
-            ls -la
-            exit 1
-          fi
-
-          # Normalize to the path CMake expects
-          if [[ "${SRC_DIR}" != "OpenCV-android-sdk" ]]; then
-            mv "$SRC_DIR" OpenCV-android-sdk
-          fi
-
-          test -d OpenCV-android-sdk/sdk/native/jni/include/opencv2
-          echo "OpenCV SDK ready at: $(pwd)/OpenCV-android-sdk"
-
+      # Build debug APK
       - name: Assemble Debug
         shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon

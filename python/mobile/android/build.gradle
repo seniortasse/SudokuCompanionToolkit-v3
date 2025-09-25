@@ -1,5 +1,6 @@
-buildscript {
-    repositories { google(); mavenCentral() }
-    dependencies { classpath "com.android.tools.build:gradle:8.5.2" }
+// Root build.gradle (project-level) — no repositories here
+
+// If you want a clean task, you can keep this:
+tasks.register("clean", Delete) {
+    delete(rootProject.buildDir)
 }
-allprojects { repositories { google(); mavenCentral() } }

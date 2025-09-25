@@ -1,6 +1,6 @@
 plugins {
     id 'com.android.application'
-    id 'org.jetbrains.kotlin.android' version '1.9.24'
+    id 'org.jetbrains.kotlin.android'
 }
 
 android {
@@ -14,51 +14,26 @@ android {
         versionCode 1
         versionName "1.0"
 
-        ndk {
-            abiFilters "arm64-v8a"
-        }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++20 -O3"
-            }
-        }
+        ndk { abiFilters "arm64-v8a" }
+        externalNativeBuild { cmake { cppFlags "-std=c++20 -O3" } }
     }
 
-    buildFeatures {
-        buildConfig = true
-    }
-
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt"
-        }
-    }
-
-    // Keep using the downloaded SDK for native libs/headers (your CMake uses it)
-    sourceSets {
-        main {
-            jniLibs.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"]
-        }
-    }
+    buildFeatures { buildConfig = true }
+    externalNativeBuild { cmake { path "src/main/cpp/CMakeLists.txt" } }
 
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = '17'
-    }
+    kotlinOptions { jvmTarget = '17' }
 
     androidResources {
-        // keep big ML assets uncompressed
         noCompress += ["tflite", "ptl", "pt", "bin", "onnx"]
     }
 }
 
 kotlin {
-    // Kotlin 1.9 + AGP 8 recommendation
     jvmToolchain(17)
 }
 
@@ -66,6 +41,7 @@ dependencies {
     implementation "androidx.core:core-ktx:1.13.1"
     implementation "androidx.appcompat:appcompat:1.7.0"
     implementation "com.google.android.material:material:1.12.0"
+    implementation "androidx.constraintlayout:constraintlayout:2.1.4"
 
     // CameraX
     implementation "androidx.camera:camera-core:1.3.4"
@@ -77,10 +53,8 @@ dependencies {
     implementation "org.tensorflow:tensorflow-lite:2.14.0"
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
 
-    // ✅ OpenCV Java wrapper from Maven (provides OpenCVLoader, etc.)
-    implementation "org.opencv:opencv-android:4.10.0"
-
-    implementation "androidx.constraintlayout:constraintlayout:2.1.4"
+    // OpenCV from Maven Central
+    implementation "org.opencv:opencv-android:4.9.0"
 
     // PyTorch Mobile
     implementation "org.pytorch:pytorch_android:1.13.1"
