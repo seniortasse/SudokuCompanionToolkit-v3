@@ -64,6 +64,16 @@ jobs:
           chmod +x gradlew
 
       # Build debug APK
+
+
+      - name: Compile (show Kotlin errors clearly)
+        shell: bash
+        run: |
+          ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all
+
+
+
+
       - name: Assemble Debug
         shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
