@@ -35,7 +35,7 @@ android {
         }
     }
 
-    // Package OpenCV's prebuilt native libs from the fetched SDK
+    // Keep using the downloaded SDK for native libs/headers (your CMake uses it)
     sourceSets {
         main {
             jniLibs.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"]
@@ -57,8 +57,8 @@ android {
     }
 }
 
-// Strongly recommended with Kotlin 1.9+/AGP 8+: use the JVM toolchain
 kotlin {
+    // Kotlin 1.9 + AGP 8 recommendation
     jvmToolchain(17)
 }
 
@@ -77,13 +77,12 @@ dependencies {
     implementation "org.tensorflow:tensorflow-lite:2.14.0"
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
 
-    // OpenCV via fetched Android SDK (matches CI download of 4.10.0)
-    // NOTE: jar path is .../sdk/java/opencv-4100.jar (no "bin" folder)
-    implementation files('src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/opencv-4100.jar')
+    // ✅ OpenCV Java wrapper from Maven (provides OpenCVLoader, etc.)
+    implementation "org.opencv:opencv-android:4.10.0"
 
     implementation "androidx.constraintlayout:constraintlayout:2.1.4"
 
-    // PyTorch Mobile (Lite = smaller; switch to full if you need ops not in lite)
+    // PyTorch Mobile
     implementation "org.pytorch:pytorch_android:1.13.1"
     implementation "org.pytorch:pytorch_android_torchvision:1.13.1"
 }
