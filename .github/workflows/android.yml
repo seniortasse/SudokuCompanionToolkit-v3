@@ -21,7 +21,7 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # Android SDK + cmdline-tools (provides sdkmanager/avdmanager/adb, etc.)
+      # Android SDK + cmdline-tools (provides sdkmanager/adb)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -63,17 +63,42 @@ jobs:
           sed -i 's/\r$//' gradlew
           chmod +x gradlew
 
-      # Build debug APK
-
-
-      - name: Compile (show Kotlin errors clearly)
+      # Fetch OpenCV Android SDK where build.gradle expects it
+      - name: Fetch OpenCV Android SDK
         shell: bash
         run: |
-          ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all
+          set -euo pipefail
+          mkdir -p app/src/main/cpp/third_party
+          cd app/src/main/cpp/third_party
 
+          echo "Downloading OpenCV Android SDK…"
+          curl -L -o opencv.zip https://github.com/opencv/opencv/releases/download/4.10.0/opencv-4.10.0-android-sdk.zip
 
+          echo "Unzipping…"
+          unzip -q opencv.zip
 
+          # Find the extracted folder (*android-sdk) and normalize its name
+          SRC_DIR="$(find . -maxdepth 1 -type d -iname '*android-sdk' -printf '%f\n' | head -n1 || true)"
+          if [[ -z "${SRC_DIR:-}" ]]; then
+            echo "ERROR: Could not locate extracted OpenCV SDK directory"
+            ls -la
+            exit 1
+          fi
+          if [[ "${SRC_DIR}" != "OpenCV-android-sdk" ]]; then
+            mv "$SRC_DIR" OpenCV-android-sdk
+          fi
 
+          # Sanity checks
+          test -d OpenCV-android-sdk/sdk/java/src
+          test -d OpenCV-android-sdk/sdk/native/libs
+          echo "OpenCV SDK ready at: $(pwd)/OpenCV-android-sdk"
+
+      # Show detailed Kotlin errors first
+      - name: Compile (show Kotlin errors clearly)
+        shell: bash
+        run: ./gradlew clean :app:compileDebugKotlin --stacktrace --info --warning-mode all
+
+      # Build debug APK
       - name: Assemble Debug
         shell: bash
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon

@@ -23,23 +23,25 @@ android {
         }
     }
 
-    buildFeatures { buildConfig = true }
+    buildFeatures {
+        buildConfig = true
+    }
 
     externalNativeBuild {
         cmake { path "src/main/cpp/CMakeLists.txt" }
     }
 
-    // Compile OpenCV Java API from the SDK and package its native .so libs
+    // Compile OpenCV Java API from the SDK and package its native .so libs.
     // The CI job puts the SDK at:
     // app/src/main/cpp/third_party/OpenCV-android-sdk/...
     sourceSets {
-        getByName("main") {
+        main {
             // Java sources for OpenCV Android API
-            java.srcDirs += "src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/src"
+            java.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/src"]
             // Native shared libraries (.so)
-            jniLibs.srcDirs += "src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"
-            // Optional OpenCV assets (e.g., haarcascades); safe to keep even if unused
-            assets.srcDirs += "src/main/cpp/third_party/OpenCV-android-sdk/sdk/etc"
+            jniLibs.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"]
+            // Optional OpenCV assets (e.g., haarcascades)
+            assets.srcDirs += ["src/main/cpp/third_party/OpenCV-android-sdk/sdk/etc"]
         }
     }
 
@@ -57,7 +59,7 @@ android {
 }
 
 kotlin {
-    // Strongly recommended with Kotlin 1.9+/AGP 8+
+    // Recommended with Kotlin 1.9+/AGP 8+
     jvmToolchain(17)
 }
 
@@ -77,8 +79,8 @@ dependencies {
     implementation "org.tensorflow:tensorflow-lite:2.14.0"
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
 
-    // 🔴 DO NOT use a Maven OpenCV dependency — there isn't an official AAR.
-    // We compile OpenCV from the SDK sources via sourceSets above.
+    // DO NOT use a Maven OpenCV dependency — there isn't an official AAR.
+    // We compile OpenCV from SDK sources via sourceSets above.
 
     // PyTorch Mobile
     implementation "org.pytorch:pytorch_android:1.13.1"
