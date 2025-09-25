@@ -79,3 +79,6 @@ wandb/
 .DS_Store
 Thumbs.db
 .vscode/
+# OpenCV Android SDK fetched by CI
+python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
+
