@@ -8,6 +8,10 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // 🔹 Run the debug smoke test at startup.
+        // It's safe to call in release too, but keep it while you're verifying.
+        OpenCVSmoke.run(this)
+
         // Load native lib first (if it also depends on OpenCV, either order works in practice)
         try {
             System.loadLibrary("native-lib")

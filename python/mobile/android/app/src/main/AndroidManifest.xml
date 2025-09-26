@@ -1,5 +1,4 @@
 <manifest
-    package="com.contextionary.sudoku"
     xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- Camera permission is already requested in code; declare it here too -->

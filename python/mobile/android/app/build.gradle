@@ -21,6 +21,13 @@ android {
         }
     }
 
+    packagingOptions {
+        jniLibs {
+            // Prefer the one we ship in app/src/main/jniLibs
+            pickFirsts += ['**/libc++_shared.so']
+        }
+    }
+
     buildFeatures { buildConfig = true }
 
     externalNativeBuild {
@@ -69,4 +76,8 @@ dependencies {
     // PyTorch Mobile
     implementation "org.pytorch:pytorch_android:1.13.1"
     implementation "org.pytorch:pytorch_android_torchvision:1.13.1"
+
+    // Android instrumentation test stack
+    androidTestImplementation "androidx.test.ext:junit:1.1.5"
+    androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
 }
