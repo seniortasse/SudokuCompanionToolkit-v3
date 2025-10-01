@@ -5,9 +5,12 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.support.common.FileUtil
+import org.tensorflow.lite.DataType
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.round
 
 /**
  * Describes the letterbox transform used during pre-processing.
@@ -32,114 +35,187 @@ data class LbTransform(
  * Responsibilities:
  * 1) Preprocess camera bitmaps via YOLO-style letterboxing to 640×640.
  * 2) Run the TFLite model (shape-agnostic across CF/CL output layouts).
- * 3) Parse model outputs into candidate boxes.
- * 4) 🚩 Rotate model boxes 90° CW (fixes the plane mismatch you discovered).
+ * 3) Parse model outputs into candidate boxes (basic YOLO-ish parser).
+ * 4) Rotate model boxes 90° CW (plane mismatch fix).
  * 5) Unletterbox boxes back to bitmap space.
  * 6) Geometric gates + NMS + small cooldown reuse for stability.
  */
 class Detector(
     ctx: Context,
     modelAsset: String,
-    @Suppress("unused") private val labelsAsset: String
+    @Suppress("unused") private val labelsAsset: String,
+    private val enableNnapi: Boolean = false,
+    private val numThreads: Int = 4
 ) {
-
     // ---- Constants / knobs ---------------------------------------------------
-
     private val TAG = "Detector"
-
-    /** Model input is 640×640×3 float32 (NHWC). */
     private val INPUT_SIZE = 640
-
-    /** Small reuse window when no fresh boxes pass the gates (frames). */
     private val COOLDOWN_FRAMES = 3
-
-    /** Upper bound of how many candidates we’ll hold before NMS. */
     private val MAX_CANDIDATES = 300
 
-    // ---- State for logging / cooldown ---------------------------------------
+    // ---- Public fields some UI code expects ----------------------------------
+    var inputW: Int = INPUT_SIZE; private set
+    var inputH: Int = INPUT_SIZE; private set
+    var inputC: Int = 3;          private set
+    var lastMaxDets: Int = 0;     private set
 
+    // ---- Interpreter and IO metadata ----------------------------------------
+    private var interpreter: Interpreter
+    private var isNCHW: Boolean = false
+    private var outShapes: List<IntArray> = emptyList()
     private var printedModelInfo = false
-    private var frameCount = 0
 
+    // ---- Runtime state -------------------------------------------------------
+    private var frameCount = 0
     private var lastKept: List<Det> = emptyList()
     private var coolDown = 0
 
-    // ---- TFLite interpreter --------------------------------------------------
+    init {
+        interpreter = openInterpreter(ctx, modelAsset, numThreads)
+        inspectModelIO()   // fills inputW/H/C, isNCHW, outShapes, etc.
+        logModelSummary()
+    }
 
-    private val tflite: Interpreter = run {
-        val opts = Interpreter.Options().apply { setNumThreads(4) }
-        val model = FileUtil.loadMappedFile(ctx, modelAsset)
-        Interpreter(model, opts)
+    // -------------------------------------------------------------------------
+    //  TFLite interpreter setup
+    // -------------------------------------------------------------------------
+    private fun openInterpreter(ctx: Context, modelAssetPath: String, threads: Int): Interpreter {
+        val options = Interpreter.Options().apply {
+            setNumThreads(threads)
+            if (enableNnapi) {
+                try {
+                    addDelegate(NnApiDelegate())
+                    Log.d(TAG, "NNAPI delegate added")
+                } catch (t: Throwable) {
+                    Log.w(TAG, "NNAPI not available; using CPU", t)
+                }
+            }
+        }
+        val model = FileUtil.loadMappedFile(ctx, modelAssetPath)
+        return Interpreter(model, options)
     }
 
     /**
-     * Single detection returned to the UI.
-     *
-     * @param box   Rectangle in ORIGINAL BITMAP space (after unletterboxing)
-     * @param score Confidence score in [0,1]
-     * @param cls   Class index (0 for grids; included for completeness)
-     * @param cx640,cy640,w640,h640  Rectangle in MODEL/LETTERBOX space (0..640)
-     *                                — we store the FINAL values we used, i.e.
-     *                                after the 90° CW rotation fix, so the HUD
-     *                                matches the red rectangle visually.
+     * Read the *actual* model IO and allocate tensors up front.
      */
-    data class Det(
-        val box: RectF,
-        val score: Float,
-        val cls: Int = 0,
-        val cx640: Float,
-        val cy640: Float,
-        val w640: Float,
-        val h640: Float
-    )
+    private fun inspectModelIO() {
+        val it = interpreter
+
+        // Input tensor shape & layout
+        val inT = it.getInputTensor(0)
+        val inShape = inT.shape() // rank 4 expected
+        val rank = inShape.size
+        if (rank != 4) {
+            throw IllegalStateException("Unsupported input rank=$rank, shape=${inShape.contentToString()}")
+        }
+
+        // Guess layout by where channel dimension is (3 or 1)
+        when {
+            inShape[1] == 3 || inShape[1] == 1 -> {
+                // [1, C, H, W]
+                isNCHW = true
+                inputC = inShape[1]
+                inputH = inShape[2]
+                inputW = inShape[3]
+            }
+            inShape[3] == 3 || inShape[3] == 1 -> {
+                // [1, H, W, C]
+                isNCHW = false
+                inputH = inShape[1]
+                inputW = inShape[2]
+                inputC = inShape[3]
+            }
+            else -> {
+                throw IllegalStateException("Cannot infer layout from input shape=${inShape.contentToString()}")
+            }
+        }
+
+        // If the model expects something other than our default 640x640, respect it
+        if (inputW != INPUT_SIZE || inputH != INPUT_SIZE) {
+            Log.w(TAG, "Model expects $inputW x $inputH (C=$inputC, ${if (isNCHW) "NCHW" else "NHWC"}), not $INPUT_SIZE — will resize inputs accordingly.")
+        }
+
+        // Ensure tensors are allocated for the current input shape
+        it.resizeInput(0, inShape)
+        it.allocateTensors()
+
+        // Output tensors
+        val outs = ArrayList<IntArray>()
+        for (i in 0 until it.outputTensorCount) {
+            outs += it.getOutputTensor(i).shape()
+        }
+        outShapes = outs
+    }
+
+    fun logModelSummary() {
+        if (printedModelInfo) return
+        printedModelInfo = true
+
+        val it = interpreter
+        val inT = it.getInputTensor(0)
+        val inQ = inT.quantizationParams()
+        Log.i(TAG, "=== Model Summary ===")
+        Log.i(TAG, "Input0 shape=${inT.shape().contentToString()} type=${inT.dataType()} qScale=${inQ.scale} qZp=${inQ.zeroPoint} layout=${if (isNCHW) "NCHW" else "NHWC"}")
+
+        for (i in 0 until it.outputTensorCount) {
+            val t = it.getOutputTensor(i)
+            val q = t.quantizationParams()
+            Log.i(TAG, "Out[$i] shape=${t.shape().contentToString()} type=${t.dataType()} qScale=${q.scale} qZp=${q.zeroPoint}")
+        }
+    }
 
     // -------------------------------------------------------------------------
-    //  Pre-processing (letterbox) : Bitmap -> 640×640 float32 NHWC + transform
+    //  Pre-processing (letterbox) : Bitmap -> NHWC float32 [1,H,W,C] + transform
     // -------------------------------------------------------------------------
+    private fun preprocessLetterbox(src: Bitmap): Triple<Array<Array<Array<FloatArray>>>, LbTransform, Bitmap> {
+        val sizeW = inputW
+        val sizeH = inputH
 
-    private fun preprocessLetterbox(
-        src: Bitmap
-    ): Triple<Array<Array<Array<FloatArray>>>, LbTransform, Bitmap> {
-
-        val size = INPUT_SIZE
         val srcW = src.width
         val srcH = src.height
 
-        // scale so the longer edge touches SIZE, preserving aspect ratio
-        val scale = min(size.toFloat() / srcW, size.toFloat() / srcH)
-        val newW = (srcW * scale).toInt()
-        val newH = (srcH * scale).toInt()
-        val padX = (size - newW) / 2
-        val padY = (size - newH) / 2
+        // keep aspect ratio inside inputW x inputH
+        val scale = min(sizeW.toFloat() / srcW, sizeH.toFloat() / srcH)
+        val newW = (srcW * scale).toInt().coerceAtLeast(1)
+        val newH = (srcH * scale).toInt().coerceAtLeast(1)
+        val padX = (sizeW - newW) / 2
+        val padY = (sizeH - newH) / 2
 
-        // 640×640 gray canvas, then draw the scaled src inside it
-        val lb = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val lb = Bitmap.createBitmap(sizeW, sizeH, Bitmap.Config.ARGB_8888)
         val c = android.graphics.Canvas(lb)
         c.drawColor(android.graphics.Color.rgb(114, 114, 114)) // YOLO gray
         val dst = android.graphics.Rect(padX, padY, padX + newW, padY + newH)
         c.drawBitmap(src, null, dst, null)
 
-        // NHWC float32 [1,640,640,3], normalized to [0,1]
-        val out = Array(1) { Array(size) { Array(size) { FloatArray(3) } } }
-        val pixels = IntArray(size * size)
-        lb.getPixels(pixels, 0, size, 0, 0, size, size)
+        // Build NHWC float32 [1,H,W,C] normalized to [0,1]
+        val out = Array(1) { Array(sizeH) { Array(sizeW) { FloatArray(inputC) } } }
+        val pixels = IntArray(sizeW * sizeH)
+        lb.getPixels(pixels, 0, sizeW, 0, 0, sizeW, sizeH)
         var i = 0
-        for (y in 0 until size) {
-            for (x in 0 until size) {
+        for (y in 0 until sizeH) {
+            for (x in 0 until sizeW) {
                 val p = pixels[i++]
-                out[0][y][x][0] = ((p ushr 16) and 0xFF) / 255f // R
-                out[0][y][x][1] = ((p ushr 8) and 0xFF) / 255f  // G
-                out[0][y][x][2] = (p and 0xFF) / 255f           // B
+                val r = ((p ushr 16) and 0xFF) / 255f
+                val g = ((p ushr 8) and 0xFF) / 255f
+                val b = (p and 0xFF) / 255f
+                if (inputC == 3) {
+                    out[0][y][x][0] = r
+                    out[0][y][x][1] = g
+                    out[0][y][x][2] = b
+                } else { // grayscale
+                    val gray = 0.299f * r + 0.587f * g + 0.114f * b
+                    out[0][y][x][0] = gray
+                }
             }
         }
 
-        return Triple(out, LbTransform(scale, padX, padY, size), lb)
+        // For overlay math we still treat "model plane" size as square reference.
+        return Triple(out, LbTransform(scale, padX, padY, min(sizeW, sizeH)), lb)
     }
 
     // -------------------------------------------------------------------------
     //  Geometry helpers
     // -------------------------------------------------------------------------
-
     /** Map a model/letterbox-space rect back to ORIGINAL BITMAP space. */
     private fun unletterboxRect(
         cx640: Float, cy640: Float, w640: Float, h640: Float,
@@ -149,8 +225,6 @@ class Detector(
         val y1 = (cy640 - h640 / 2f - lb.padY) / lb.scale
         val x2 = (cx640 + w640 / 2f - lb.padX) / lb.scale
         val y2 = (cy640 + h640 / 2f - lb.padY) / lb.scale
-
-        // Keep inside bitmap bounds; any small overshoot from rounding is trimmed.
         return RectF(
             x1.coerceIn(0f, origW.toFloat()),
             y1.coerceIn(0f, origH.toFloat()),
@@ -184,18 +258,11 @@ class Detector(
     }
 
     // -------------------------------------------------------------------------
-    //  🔧 Rotation fix helpers (model plane → bitmap plane)
+    //  Rotation fix (model plane → bitmap plane)
     // -------------------------------------------------------------------------
-
     /**
-     * Rotate a box in the 640×640 MODEL plane by +90° (clockwise).
-     *
-     * You validated on-device that model boxes align with the paper after this
-     * transformation. This function is applied BEFORE unletterboxing so the
-     * returned bitmap-space rectangle lands where it should.
-     *
-     * For a 90° CW rotation in a W×H plane (here 640×640):
-     *   (cx, cy, w, h) → (cx', cy', w', h') = (W - cy, cx, h, w)
+     * Rotate a box in the model plane by +90° CW, within a given plane size.
+     * (cx,cy,w,h) -> (W - cy, cx, h, w)
      */
     private inline fun rotateModelBox90CW(
         cx: Float, cy: Float, w: Float, h: Float, planeSize: Float
@@ -208,151 +275,260 @@ class Detector(
     }
 
     // -------------------------------------------------------------------------
+    //  Public data model for UI
+    // -------------------------------------------------------------------------
+    data class Det(
+        val box: RectF,
+        val score: Float,
+        val cls: Int = 0,
+        val cx640: Float,
+        val cy640: Float,
+        val w640: Float,
+        val h640: Float
+    )
+
+    // -------------------------------------------------------------------------
     //  Inference entry point
     // -------------------------------------------------------------------------
-
-    /**
-     * Run detection on a bitmap.
-     *
-     * @param scoreThresh confidence threshold in [0,1]
-     * @param maxDets     maximum boxes to return after NMS
-     */
     fun infer(
         bmp: Bitmap,
         scoreThresh: Float = 0.55f,
         maxDets: Int = 6
     ): List<Det> {
         frameCount++
+        Log.i(TAG, "infer() start frame=$frameCount")
 
-        // 1) Preprocess (letterbox)
-        val (input, lb, _) = preprocessLetterbox(bmp)
+        // 1) Preprocess to NHWC float32 [1,H,W,C] in [0,1]
+        val (inputNHWC, lb, _) = preprocessLetterbox(bmp)
 
-        // 2) Run model — be robust to output layout differences:
-        //    - "channels first":  [1, C, N]
-        //    - "channels last" :  [1, N, C]
-        val shape = tflite.getOutputTensor(0).shape()
+        // 2) Build runtime input to match interpreter expectations (dtype + layout)
+        val inT = interpreter.getInputTensor(0)
+        val inType = inT.dataType()
+        val runtimeInput: Any = when (inType) {
+            DataType.FLOAT32 -> {
+                if (!isNCHW) {
+                    // NHWC already
+                    inputNHWC
+                } else {
+                    // Convert NHWC -> NCHW
+                    val arr = Array(1) { Array(inputC) { Array(inputH) { FloatArray(inputW) } } }
+                    for (y in 0 until inputH)
+                        for (x in 0 until inputW)
+                            for (c in 0 until inputC)
+                                arr[0][c][y][x] = inputNHWC[0][y][x][c]
+                    arr
+                }
+            }
+            DataType.INT8, DataType.UINT8 -> {
+                val q = inT.quantizationParams()
+                val scale = q.scale
+                val zp = q.zeroPoint
+                val isUint8 = (inType == DataType.UINT8)
+                val bb = java.nio.ByteBuffer
+                    .allocateDirect(1 * inputH * inputW * inputC)
+                    .order(java.nio.ByteOrder.nativeOrder())
+                fun clamp(v: Int, u8: Boolean) = if (u8) v.coerceIn(0, 255) else v.coerceIn(-128, 127)
+
+                if (!isNCHW) {
+                    for (y in 0 until inputH) for (x in 0 until inputW) {
+                        val rQ = clamp(round(inputNHWC[0][y][x][0] / scale + zp).toInt(), isUint8)
+                        val gQ = clamp(round(inputNHWC[0][y][x][1] / scale + zp).toInt(), isUint8)
+                        val bQ = clamp(round(inputNHWC[0][y][x][2] / scale + zp).toInt(), isUint8)
+                        bb.put(rQ.toByte()); bb.put(gQ.toByte()); bb.put(bQ.toByte())
+                    }
+                } else {
+                    // NHWC -> NCHW quantized write order (C major)
+                    val plane = inputH * inputW
+                    val tmp = FloatArray(plane * inputC)
+                    var k = 0
+                    for (c in 0 until inputC)
+                        for (y in 0 until inputH)
+                            for (x in 0 until inputW)
+                                tmp[k++] = inputNHWC[0][y][x][c]
+
+                    // Write channel-by-channel
+                    k = 0
+                    for (c in 0 until inputC) {
+                        for (j in 0 until plane) {
+                            val qv = clamp(round(tmp[k++] / scale + zp).toInt(), isUint8)
+                            bb.put(qv.toByte())
+                        }
+                    }
+                }
+                bb.rewind()
+                bb
+            }
+            else -> inputNHWC // fallback
+        }
+
+        // 3) Allocate output buffers to exactly match model outputs
+        val outCount = interpreter.outputTensorCount
+        val outputsMap = HashMap<Int, Any>(outCount)
+        for (i in 0 until outCount) {
+            val t = interpreter.getOutputTensor(i)
+            val s = t.shape()
+            val dt = t.dataType()
+            val arr: Any = when (dt) {
+                DataType.FLOAT32 -> when (s.size) {
+                    1 -> FloatArray(s[0])
+                    2 -> Array(s[0]) { FloatArray(s[1]) }
+                    3 -> Array(s[0]) { Array(s[1]) { FloatArray(s[2]) } }
+                    4 -> Array(s[0]) { Array(s[1]) { Array(s[2]) { FloatArray(s[3]) } } }
+                    else -> throw IllegalStateException("Unsupported FLOAT32 output rank ${s.size} at $i: ${s.contentToString()}")
+                }
+                DataType.INT8, DataType.UINT8 -> when (s.size) {
+                    1 -> ByteArray(s[0])
+                    2 -> Array(s[0]) { ByteArray(s[1]) }
+                    3 -> Array(s[0]) { Array(s[1]) { ByteArray(s[2]) } }
+                    4 -> Array(s[0]) { Array(s[1]) { Array(s[2]) { ByteArray(s[3]) } } }
+                    else -> throw IllegalStateException("Unsupported INT8/UINT8 output rank ${s.size} at $i: ${s.contentToString()}")
+                }
+                else -> when (s.size) {
+                    1 -> FloatArray(s[0])
+                    2 -> Array(s[0]) { FloatArray(s[1]) }
+                    3 -> Array(s[0]) { Array(s[1]) { FloatArray(s[2]) } }
+                    4 -> Array(s[0]) { Array(s[1]) { Array(s[2]) { FloatArray(s[3]) } } }
+                    else -> throw IllegalStateException("Unsupported output rank ${s.size} at $i")
+                }
+            }
+            outputsMap[i] = arr
+        }
+
+        // 4) Run inference (explicit tensors were already allocated in init)
+        try {
+            interpreter.runForMultipleInputsOutputs(arrayOf(runtimeInput), outputsMap)
+        } catch (t: Throwable) {
+            Log.e(TAG, "infer() failed: ${t.message}", t)
+            lastMaxDets = 0
+            return emptyList()
+        }
+
+        // 5) Pick the first output as the detection head and parse in a YOLO-ish way.
+        //    (If your model really uses multi-head, we can adjust once we see the shapes in logs.)
+        val headTensor = interpreter.getOutputTensor(0)
+        val headShape = headTensor.shape() // e.g., [1, C, N] or [1, N, C]
+        val headType = headTensor.dataType()
+
+        // Helper to read as unified float with dequant if needed
+        val hQ = headTensor.quantizationParams()
+        val hScale = hQ.scale
+        val hZp = hQ.zeroPoint
+        val isFloatHead = (headType == DataType.FLOAT32)
+        val isUint8Head = (headType == DataType.UINT8)
+
+        // Determine layout of the head (channels-first vs last)
         var channelsFirst = true
-        val nA: Int
-        val ch: Int
-        if (shape.size == 3 && shape[0] == 1) {
-            val d1 = shape[1]; val d2 = shape[2]
+        var N: Int
+        var C: Int
+        if (headShape.size == 3 && headShape[0] == 1) {
+            val d1 = headShape[1]; val d2 = headShape[2]
             if (d1 <= 64 && d2 >= 1000) { // [1, C, N]
-                channelsFirst = true; ch = d1; nA = d2
-            } else {                      // [1, N, C]
-                channelsFirst = false; nA = d1; ch = d2
+                channelsFirst = true; C = d1; N = d2
+            } else {                       // [1, N, C]
+                channelsFirst = false; N = d1; C = d2
             }
         } else {
-            // Fall back to a common YOLO-ish layout if unknown.
-            channelsFirst = true; ch = 5; nA = 8400
+            // Fallback default
+            channelsFirst = true; C = 5; N = 8400
         }
 
-        val outCF: Array<Array<FloatArray>>?
-        val outCL: Array<Array<FloatArray>>?
-        if (channelsFirst) {
-            outCF = Array(1) { Array(ch) { FloatArray(nA) } }
-            outCL = null
-            tflite.run(input, outCF)
-        } else {
-            outCF = null
-            outCL = Array(1) { Array(nA) { FloatArray(ch) } }
-            tflite.run(input, outCL)
-        }
+        // Pull the array back from outputsMap[0] with the right type signature
+        val cfF = outputsMap[0] as? Array<Array<FloatArray>>
+        val clF = outputsMap[0] as? Array<Array<FloatArray>>
+        val cfB = outputsMap[0] as? Array<Array<ByteArray>>
+        val clB = outputsMap[0] as? Array<Array<ByteArray>>
 
-        fun get(i: Int, c: Int): Float =
-            if (channelsFirst) outCF!![0][c][i] else outCL!![0][i][c]
-
-        // 3) One-time model info log + quick scan of the score channel
-        val scoreIdx = if (ch >= 5) 4 else (ch - 1).coerceAtLeast(0)
-        if (!printedModelInfo) {
-            Log.d(TAG, "tflite out[0] shape=${shape.joinToString()} (nA=$nA, ch=$ch, channelsFirst=$channelsFirst)")
-            var minS = Float.POSITIVE_INFINITY
-            var maxS = Float.NEGATIVE_INFINITY
-            val stride = (nA / 400).coerceAtLeast(1)
-            var cnt = 0
-            for (i in 0 until nA step stride) {
-                val s = get(i, scoreIdx)
-                if (s < minS) minS = s
-                if (s > maxS) maxS = s
-                cnt++
+        fun read(i: Int, c: Int): Float {
+            return if (channelsFirst) {
+                if (isFloatHead) {
+                    (outputsMap[0] as Array<Array<FloatArray>>)[0][c][i]
+                } else {
+                    val b = (outputsMap[0] as Array<Array<ByteArray>>)[0][c][i]
+                    val q = if (isUint8Head) (b.toInt() and 0xFF) else b.toInt()
+                    (q - hZp) * hScale
+                }
+            } else {
+                if (isFloatHead) {
+                    (outputsMap[0] as Array<Array<FloatArray>>)[0][i][c]
+                } else {
+                    val b = (outputsMap[0] as Array<Array<ByteArray>>)[0][i][c]
+                    val q = if (isUint8Head) (b.toInt() and 0xFF) else b.toInt()
+                    (q - hZp) * hScale
+                }
             }
-            Log.d(TAG, "score channel sample (stride=$stride, n=$cnt): min=$minS, max=$maxS")
-            printedModelInfo = true
         }
 
-        // If the model emits logits, squash them; otherwise this is identity.
+        // If the head emits logits, squash; else identity.
         fun toProb(x: Float): Float = if (x in 0f..1f) x else (1f / (1f + kotlin.math.exp(-x)))
 
-        // 4) Parse predictions → candidates (cheap gates to keep FPS high)
-        val minBoxSizePx = 90f // very small squares are unlikely sudoku grids
-        val maxArea640 = 0.75f * lb.size * lb.size
+        // 6) Parse predictions → candidates (YOLO-ish: [cx,cy,w,h,obj,cls...])
+        val minBoxSizePx = 90f
+        val maxAreaRef = 0.75f * min(inputW, inputH) * min(inputW, inputH)
         val cand = ArrayList<Det>(MAX_CANDIDATES)
-        val nClassCh = (ch - 5).coerceAtLeast(0)
+        val scoreIdx = if (C >= 5) 4 else (C - 1).coerceAtLeast(0)
+        val nClassCh = (C - 5).coerceAtLeast(0)
 
-        for (i in 0 until nA) {
-            val objProb = toProb(get(i, scoreIdx))
-
-            // If there are class channels, combine with the best class prob.
-            val score = if (nClassCh >= 2) {
-                var best = 0f; var c = 5
-                while (c < ch) { val p = toProb(get(i, c)); if (p > best) best = p; c++ }
-                objProb * best
-            } else objProb
-
+        for (i in 0 until N) {
+            val obj = toProb(read(i, scoreIdx))
+            val clsProb = if (nClassCh >= 2) {
+                var best = 0f; var cc = 5
+                while (cc < C) { val p = toProb(read(i, cc)); if (p > best) best = p; cc++ }
+                best
+            } else 1f
+            val score = obj * clsProb
             if (score < scoreThresh) continue
 
-            // Raw model/letterbox-space box — coordinates are normalized to [0,1] or already [0,640].
-            val cx640 = get(i, 0) * INPUT_SIZE
-            val cy640 = get(i, 1) * INPUT_SIZE
-            val w640  = get(i, 2) * INPUT_SIZE
-            val h640  = get(i, 3) * INPUT_SIZE
+            // Model-plane coordinates are 0..inputW/H (we map to a square ref for rotate step)
+            val cx = read(i, 0) * inputW
+            val cy = read(i, 1) * inputH
+            val w  = read(i, 2) * inputW
+            val h  = read(i, 3) * inputH
 
-            // Geometric sanity gates
-            if (w640 < minBoxSizePx || h640 < minBoxSizePx) continue
-            val ar = if (h640 <= 0f) Float.POSITIVE_INFINITY else (w640 / h640)
-            if (ar < 0.85f || ar > 1.18f) continue // near-square only
-            if (w640 * h640 > maxArea640) continue
+            if (w < minBoxSizePx || h < minBoxSizePx) continue
+            val ar = if (h <= 0f) Float.POSITIVE_INFINITY else (w / h)
+            if (ar < 0.85f || ar > 1.18f) continue
+            if (w * h > maxAreaRef) continue
 
-            // 🔧 ROTATION FIX:
-            // Your A/B/C test showed the model plane is rotated w.r.t. bitmap/view.
-            // Rotate the model box +90° CW in the 640×640 plane BEFORE unletterboxing.
-            val (cxR, cyR, wR, hR) = rotateModelBox90CW(
-                cx = cx640, cy = cy640, w = w640, h = h640, planeSize = INPUT_SIZE.toFloat()
-            )
+            // Rotate +90° CW in model plane then unletterbox (use min(inputW,inputH) as plane)
+            //val plane = min(inputW, inputH).toFloat()
+            //val rot = rotateModelBox90CW(cx, cy, w, h, plane)
+            //val boxBmp = unletterboxRect(rot[0], rot[1], rot[2], rot[3], lb, bmp.width, bmp.height)
 
-            // Now map the rotated model box back to original bitmap space.
-            val boxBmp = unletterboxRect(cxR, cyR, wR, hR, lb, bmp.width, bmp.height)
+            //cand += Det(
+            //    box = boxBmp,
+            //    score = score,
+            //    cls = 0,
+            //    cx640 = rot[0], cy640 = rot[1], w640 = rot[2], h640 = rot[3]
+            //)
+
+            // No rotation needed: map model-plane box directly back to bitmap space
+            val boxBmp = unletterboxRect(cx, cy, w, h, lb, bmp.width, bmp.height)
 
             cand += Det(
                 box = boxBmp,
                 score = score,
                 cls = 0,
-                // Store the ROTATED model-space numbers so HUD/green overlays match red.
-                cx640 = cxR, cy640 = cyR, w640 = wR, h640 = hR
+                cx640 = cx, cy640 = cy, w640 = w, h640 = h
             )
 
             if (cand.size >= MAX_CANDIDATES) break
         }
 
-        // 5) Cooldown reuse if nothing passed the gates this frame
+        // 7) Cooldown reuse
         if (cand.isEmpty()) {
+            lastMaxDets = 0
             if (coolDown > 0) { coolDown--; return lastKept }
             return emptyList()
         }
 
-        // 6) NMS + cap
+        // 8) NMS + cap + bookkeeping
         val kept = nms(cand, 0.50f)
-        val keptCapped =
-            if (kept.size > maxDets) kept.sortedByDescending { it.score }.take(maxDets) else kept
+        val keptCapped = if (kept.size > maxDets) kept.sortedByDescending { it.score }.take(maxDets) else kept
+        lastMaxDets = keptCapped.size
+        Log.i(TAG, "infer() kept=${keptCapped.size} (score≥$scoreThresh)")
 
-        // 7) Save for cooldown + occasional debug log
         lastKept = keptCapped
         coolDown = COOLDOWN_FRAMES
-
-        if (frameCount % 30 == 0) {
-            val top = keptCapped.maxByOrNull { it.score }?.score ?: 0f
-            Log.d(TAG, "Kept ${keptCapped.size} boxes after NMS (score≥$scoreThresh, IoU=0.50), top=${"%.3f".format(top)}")
-        }
-
         return keptCapped
     }
 }

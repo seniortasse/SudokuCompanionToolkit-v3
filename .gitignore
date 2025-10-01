@@ -1,16 +1,44 @@
+# ------------------------------------------------------------------------------------
+# .gitignore — FULLY COMMENTED HANDOVER
+# ------------------------------------------------------------------------------------
+# High-level context:
+# This file prevents build outputs, local settings, and secrets from being tracked.
+# It keeps the repo clean, reduces noise in diffs, and protects sensitive material.
+#
+# Organization:
+# - Android/Gradle: build/, .gradle/, local.properties, .idea noise
+# - NDK/CMake:      cmake-build-*/, obj/, intermediates/
+# - Python:         __pycache__, .venv/, .mypy_cache/
+# - Models:         large generated models if not versioned; prefer artifacts instead
+# - OS files:       .DS_Store, Thumbs.db, etc.
+#
+# How to modify:
+# - Add ignores for new toolchains or outputs (e.g., new /artifacts dir for CI).
+# - Never ignore source files or critical config; be deliberate.
+#
+# Troubleshooting:
+# - If a file is already tracked, updating .gitignore won't remove it. Use:
+#       git rm --cached path/to/file
+#   to untrack it while keeping it locally.
+# ------------------------------------------------------------------------------------
 # --- Android / Gradle (generic)
+# Ignore Gradle state/cache directories.
 .gradle/
 **/build/
 **/.cxx/
 **/.idea/
+# IDE project files; reproducible devs shouldn't rely on these.
 **/*.iml
+# Local SDK path/keystore location; never commit.
 local.properties
 
 # --- Android / Gradle (your tree under python/mobile/android)
+# Ignore Gradle state/cache directories.
 python/mobile/android/.gradle/
 python/mobile/android/**/build/
 python/mobile/android/**/.cxx/
 python/mobile/android/**/.idea/
+# IDE project files; reproducible devs shouldn't rely on these.
 python/mobile/android/**/*.iml
 python/mobile/android/java_pid*.hprof
 python/mobile/android/**/captures/
@@ -40,10 +68,12 @@ checkpoints/
 *.h5
 
 # --- Python caches
+# Python caches/virtualenvs; not source.
 __pycache__/
 *.pyc
 
 # --- Python envs (never commit)
+# Python caches/virtualenvs; not source.
 .venv/
 venv/
 env/
@@ -76,7 +106,9 @@ wandb/
 *.jks
 
 # --- OS/editor
+# OS miscellaneous files.
 .DS_Store
+# OS miscellaneous files.
 Thumbs.db
 .vscode/
 # OpenCV Android SDK fetched by CI
