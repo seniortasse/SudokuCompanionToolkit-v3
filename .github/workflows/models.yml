@@ -1,34 +1,73 @@
+# ------------------------------------------------------------------------------------
+# MODEL CI PIPELINE (GitHub Actions) — FULLY COMMENTED HANDOVER
+# ------------------------------------------------------------------------------------
+# High-level context:
+# This workflow automates model-related tasks: converting/exporting TFLite models,
+# validating shapes/dtypes, and publishing artifacts to the repository (or as build
+# artifacts). It ensures that changes to model code produce consistent, versioned
+# outputs that Android can consume from assets/models/.
+#
+# File organization:
+# - name/on:  Workflow name and triggers for pushes/PRs (and optionally tags).
+# - env:      Shared settings (e.g., Python/TensorFlow versions, model paths).
+# - jobs:     'models' job runs the pipeline: setup Python → install deps → run export
+#             → sanity-check (shapes/dtypes) → upload artifacts.
+#
+# Key points to know:
+# - Pin Python + TF versions for reproducibility.
+# - Ensure your export script prints the same 'sanity' logs we read in Android:
+#   input shape/layout/dtype and output shape/layout/dtype (and quant params if any).
+# - Output .tflite files into a known folder (e.g., artifacts/) and upload them.
+#
+# How to modify:
+# - Change export script path(s) and arguments if you refactor model code.
+# - Add steps that run lightweight checks (e.g., run a saved inference on a test
+#   image and assert expected dimensions).
+#
+# Troubleshooting:
+# - If pip install fails, check pinned versions or wheel availability on ubuntu image.
+# - If the export breaks, run the same script locally to reproduce.
+# ------------------------------------------------------------------------------------
+# Workflow name for model automation.
 name: Models
 
+# Triggers for model jobs (push/PR/tag).
 on:
   push:
     branches: [ main ]
   pull_request:
 
+# Jobs: we typically have one 'models' job to export/verify.
 jobs:
   export-tflite:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
+# Grab the repo so we can access model/export scripts.
         uses: actions/checkout@v4
 
       - name: Set up Python
+# Install Python of the requested version for TensorFlow tooling.
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install Python deps
         run: |
+# Install Python dependencies (TensorFlow, TFLite tools, PIL, etc.).
           python -m pip install --upgrade pip
           # main requirements (adjust if you keep train/api/docs separate)
+# Install Python dependencies (TensorFlow, TFLite tools, PIL, etc.).
           pip install -r python/requirements.txt || true
           # optional extras (safe to skip if missing)
+# Install Python dependencies (TensorFlow, TFLite tools, PIL, etc.).
           if [ -f python/requirements-train.txt ]; then pip install -r python/requirements-train.txt; fi
 
       # Example YOLO→TFLite export (edit paths if needed)
       - name: Export YOLO to TFLite (FP32)
         run: |
+# Run your export/convert script to produce .tflite files.
           python tools/export_tflite.py \
             --pt yolov8n.pt \
             --out python/mobile/android/app/src/main/assets/best_float32.tflite || true
@@ -36,12 +75,16 @@ jobs:
       # Corner heatmap / cell classifier exports (placeholders until Tasks 3 & 6)
       - name: Export corners / cells (stubs)
         run: |
+# Run your export/convert script to produce .tflite files.
           if [ -f python/vision/train/export_corners_tflite.py ]; then python python/vision/train/export_corners_tflite.py; else echo "no corners export yet"; fi
+# Run your export/convert script to produce .tflite files.
           if [ -f python/vision/train/export_cells_tflite.py   ]; then python python/vision/train/export_cells_tflite.py;   else echo "no cells export yet"; fi
 
       - name: Upload artifacts
+# Publish the generated model files for downstream consumption.
         uses: actions/upload-artifact@v4
         with:
+# Workflow name for model automation.
           name: tflite-models
           path: |
             python/mobile/android/app/src/main/assets/*.tflite
