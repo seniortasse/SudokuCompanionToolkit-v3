@@ -1,53 +1,11 @@
-# ------------------------------------------------------------------------------------
-# ANDROID CI PIPELINE (GitHub Actions) — FULLY COMMENTED HANDOVER
-# ------------------------------------------------------------------------------------
-# High-level context:
-# This workflow builds the Android app (arm64-v8a) on every push/PR to main and on tags.
-# It provides a reproducible CI pipeline: checkout → JDK/Android SDK → NDK/CMake → build.
-# It also caches Gradle to speed up subsequent runs and publishes artifacts for download.
-#
-# File organization:
-# - name: Human-friendly workflow name shown in GitHub Actions UI.
-# - on:   Triggers that start this workflow (push, pull_request, tag).
-# - env:  Global environment variables used by multiple steps.
-# - jobs: One "android" job that runs on ubuntu, with a matrix for Java versions (optional).
-#         Steps are ordered; each step's 'name' explains the purpose.
-#
-# Key points to know:
-# - We use actions/setup-java to install JDK (Temurin). Gradle requires a JDK.
-# - Android SDK cmdline-tools are installed via android-actions/setup-android.
-# - We install NDK + CMake for native builds (OpenCV/TFLite). Versions pinned for reproducibility.
-# - Gradle caches (actions/cache) drastically reduce build time.
-# - The final APK/AAB is uploaded as a workflow artifact (actions/upload-artifact).
-#
-# How to run locally:
-#   You don't run this YAML locally. Instead, push or PR changes to GitHub and the
-#   workflow will run there. For local builds use the Gradle CLI:
-#       ./gradlew :app:assembleDebug
-#       ./gradlew :app:assembleRelease
-#
-# How to modify:
-# - Update NDK/CMake versions in 'env' or dedicated install steps if you change native code toolchain.
-# - Add signing steps for Release if you want to build Play-ready artifacts in CI.
-# - Add test steps (unit/instrumentation) when available.
-#
-# Troubleshooting:
-# - If Gradle cache causes odd failures, bump the cache key version (e.g., add '-v2').
-# - If SDK components fail to install, validate sdkmanager channel and package names.
-# - If native build fails, confirm NDK/CMake versions align with local dev.
-# ------------------------------------------------------------------------------------
-# Workflow name shown in the Actions UI.
 name: Android
 
-# Workflow triggers (push, pull_request, tag).
 on:
   push:
   pull_request:
 
-# Jobs define runners and ordered steps. We have one job: 'android'.
 jobs:
   assembleDebug:
-# GitHub-hosted runner type. 'ubuntu-latest' is standard for Android CI.
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -55,11 +13,9 @@ jobs:
 
     steps:
       - name: Checkout
-# Check out repository code so Gradle can build it.
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-# Install Java (Temurin). Gradle requires a compatible JDK.
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -67,14 +23,12 @@ jobs:
           cache: gradle
 
       - name: Set up Android SDK
-# Install Android SDK cmdline-tools and accept licenses.
         uses: android-actions/setup-android@v3
 
       - name: Install Android SDK components (platform/build-tools/CMake/NDK)
         shell: bash
         run: |
           set -e
-# Use sdkmanager to install platform/NDK/CMake components.
           SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses || true
           "$SDKMANAGER" \
@@ -93,7 +47,6 @@ jobs:
           cmake --version
 
       - name: Cache Gradle
-# Cache Gradle directories to speed up builds.
         uses: actions/cache@v4
         with:
           path: |
@@ -147,13 +100,10 @@ jobs:
 
       - name: Assemble Debug
         shell: bash
-# Build the app via Gradle. Adjust tasks as needed (assembleDebug/Release).
         run: ./gradlew :app:assembleDebug --stacktrace --no-daemon --build-cache
 
       - name: Upload APK artifact
-# Upload build outputs (APKs, AABs, mapping files) for download from the Actions UI.
         uses: actions/upload-artifact@v4
         with:
-# Workflow name shown in the Actions UI.
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
