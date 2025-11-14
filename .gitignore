@@ -120,3 +120,7 @@ Thumbs.db
 # OpenCV Android SDK fetched by CI
 python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
 
+python/demo_export/
+python/vision/data/
+python/vision/export/
+
