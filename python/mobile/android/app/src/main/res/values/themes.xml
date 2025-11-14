@@ -1,8 +1,22 @@
 <resources>
-    <!-- App theme -->
+
+    <!-- App-wide theme (MainActivity etc.) -->
     <style name="Theme.App" parent="Theme.Material3.DayNight.NoActionBar">
-        <!-- You can keep this minimal; add colors only if you want -->
+        <!-- Transparent status bar over camera -->
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">true</item>
+
+        <!-- IMPORTANT: keep the window black so there’s no white flash while SurfaceView warms up -->
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
     </style>
+
+    <!-- Full-black results screen -->
+    <style name="Theme.SudokuCompanion.Results" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:navigationBarColor">@android:color/black</item>
+    </style>
+
 </resources>

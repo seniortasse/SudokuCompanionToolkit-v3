@@ -29,7 +29,8 @@ class OverlayView @JvmOverloads constructor(
     private var lockedHud: Boolean = false
 
     // Refined corners + peaks (TL, TR, BR, BL)
-    @Volatile private var corners: CornerRefiner.Corners? = null
+    // (Legacy) Corner-based HUD is retired. Keep placeholders to avoid call-site errors.
+    @Volatile private var corners: List<PointF>? = null
     @Volatile private var cornerPeaks: FloatArray? = null
 
     // Model input crop (expanded ROI) to overlay (in source/bitmap coords)
@@ -56,6 +57,52 @@ class OverlayView @JvmOverloads constructor(
     private var flashAlpha: Float = 0f
     private val flashPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private var shutterSound: MediaActionSound? = null
+
+    // --- Begin: digits HUD STUB (no drawing here) ---
+
+    @Suppress("UNUSED_VARIABLE")
+    private var digits: Array<IntArray>? = null
+    @Suppress("UNUSED_VARIABLE")
+    private var probs: Array<FloatArray>? = null
+
+    // === Intersections HUD ===
+    @Volatile private var intersectionsSrc: List<PointF>? = null
+    var showIntersections: Boolean = true
+        set(v) { field = v; invalidate() }
+    fun updateIntersections(pointsSrc: List<PointF>?) {
+        intersectionsSrc = pointsSrc
+        invalidate()
+    }
+
+
+    // Whether to draw refined corner dots/peaks on the HUD
+    var showCornerDots: Boolean = true
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+
+    // ===== HUD toggles expected by MainActivity =====
+    var showBoxLabels: Boolean = true
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    var showHudText: Boolean = true
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    // Gate state display (NONE/L1/L2/L3)
+    private var gateState: GateState = GateState.NONE
+    fun setGateState(state: GateState) {
+        gateState = state
+        invalidate()
+    }
+
 
     // Paints
     private val redFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -102,6 +149,14 @@ class OverlayView @JvmOverloads constructor(
         strokeWidth = 2f
         pathEffect = DashPathEffect(floatArrayOf(10f, 8f), 0f)
     }
+
+
+    fun updateDigits(d: Array<IntArray>?, p: Array<FloatArray>?, lowThresh: Float = 0.85f) {
+        digits = d
+        probs = p
+        // Intentionally not drawing digits here anymore.
+    }
+
 
     fun setLocked(v: Boolean) {
         lockedHud = v
@@ -157,7 +212,7 @@ class OverlayView @JvmOverloads constructor(
         invalidate()
     }
 
-    fun updateCorners(c: CornerRefiner.Corners?, peaks: FloatArray? = null) {
+    fun updateCorners(c: List<PointF>?, peaks: FloatArray? = null) {
         corners = c
         cornerPeaks = peaks
         invalidate()
@@ -223,25 +278,28 @@ class OverlayView @JvmOverloads constructor(
         fun unmapX(xView: Float) = (xView - offX) / s
         fun unmapY(yView: Float) = (yView - offY) / s
 
-        // HUD
-        val lines = listOf(
-            "bitmap: ${srcW}×${srcH}",
-            "boxes (≥${"%.2f".format(hudThresh)}): ${boxes.size}",
-            "max dets: $hudMaxDets"
-        )
-        val pad = hudPadPx
-        val lineGap = 0.35f * textPx
-        val hudW = lines.maxOf { hudText.measureText(it) } + pad * 2
-        val hudH = lines.size * (hudText.textSize + lineGap) + pad
-        var ty = 12f + textPx
-        val hudRect = RectF(12f, 12f, 12f + hudW, 12f + hudH)
-        canvas.drawRoundRect(hudRect, cornerRadiusPx, cornerRadiusPx, hudBg)
-        lines.forEach {
-            canvas.drawText(it, hudRect.left + pad, ty + 4f, hudText)
-            ty += hudText.textSize + lineGap
+        // ===== Top-left HUD panel (honor showHudText) =====
+        if (showHudText) {
+            val lines = buildList {
+                add("bitmap: ${srcW}×${srcH}")
+                add("boxes (≥${"%.2f".format(hudThresh)}): ${boxes.size}")
+                add("max dets: $hudMaxDets")
+                add("Gate: $gateState")
+            }
+            val pad = hudPadPx
+            val lineGap = 0.35f * textPx
+            val hudW = lines.maxOf { hudText.measureText(it) } + pad * 2
+            val hudH = lines.size * (hudText.textSize + lineGap) + pad
+            var ty = 12f + textPx
+            val hudRect = RectF(12f, 12f, 12f + hudW, 12f + hudH)
+            canvas.drawRoundRect(hudRect, cornerRadiusPx, cornerRadiusPx, hudBg)
+            lines.forEach {
+                canvas.drawText(it, hudRect.left + pad, ty + 4f, hudText)
+                ty += hudText.textSize + lineGap
+            }
         }
 
-        // Red detection boxes
+        // ===== Red detection boxes (+ optional labels) =====
         val labelBg = Paint(hudBg)
         val labelPadX = 0.6f * hudPadPx
         val labelPadY = 0.4f * hudPadPx
@@ -255,16 +313,18 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawRect(l, t, rr, bb, redFill)
             canvas.drawRect(l, t, rr, bb, redStroke)
 
-            val label = "s=${"%.2f".format(d.score)}"
-            val tw = hudText.measureText(label)
-            val th = hudText.textSize + labelPadY * 2
-            val boxTop = (t - th - 4f).coerceAtLeast(0f)
-            val bgRect = RectF(l, boxTop, l + tw + labelPadX * 2, boxTop + th)
-            canvas.drawRoundRect(bgRect, cornerRadiusPx, cornerRadiusPx, labelBg)
-            canvas.drawText(label, l + labelPadX, boxTop + hudText.textSize + (labelPadY / 2f), hudText)
+            if (showBoxLabels) {
+                val label = "s=${"%.2f".format(d.score)}"
+                val tw = hudText.measureText(label)
+                val th = hudText.textSize + labelPadY * 2
+                val boxTop = (t - th - 4f).coerceAtLeast(0f)
+                val bgRect = RectF(l, boxTop, l + tw + labelPadX * 2, boxTop + th)
+                canvas.drawRoundRect(bgRect, cornerRadiusPx, cornerRadiusPx, labelBg)
+                canvas.drawText(label, l + labelPadX, boxTop + hudText.textSize + (labelPadY / 2f), hudText)
+            }
         }
 
-        // Cyan square guide (in view-space), plus keep a source-space copy for gating
+        // ===== Cyan square guide (view space) + keep a source-space copy for gating =====
         val mapped = RectF(offX, offY, offX + dw, offY + dh)
         val side = min(mapped.width(), mapped.height())
         val guide = if (mapped.width() <= mapped.height()) {
@@ -275,8 +335,6 @@ class OverlayView @JvmOverloads constructor(
             RectF(left, mapped.top, left + side, mapped.top + side)
         }
         canvas.drawRect(guide, guideStroke)
-
-        // Update guardRectSrc (source coords) so MainActivity can use it for gating
         guardRectSrc = RectF(
             unmapX(guide.left),
             unmapY(guide.top),
@@ -284,7 +342,7 @@ class OverlayView @JvmOverloads constructor(
             unmapY(guide.bottom)
         )
 
-        // Green overlay for the model's expanded ROI crop (optional)
+        // ===== Green overlay for model crop (optional) =====
         cornerCropRect?.let { r ->
             val l = mapX(r.left.toFloat())
             val t = mapY(r.top.toFloat())
@@ -294,50 +352,22 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawRect(l, t, rr, bb, cropStroke)
         }
 
-        // Corner dots + labels (all-or-nothing; show only if all peaks pass threshold)
-        corners?.let { co ->
-            val peaks = cornerPeaks
-            val canShowAll = peaks != null &&
-                    peaks.size >= 4 &&
-                    peaks.minOrNull() != null &&
-                    peaks.minOrNull()!! >= cornerPeakThresh
 
-            if (canShowAll) {
-                val pts = listOf(co.tl, co.tr, co.br, co.bl)
-                val names = listOf("TL", "TR", "BR", "BL")
-                val dotPad = 4f
-
-                for ((idx, p) in pts.withIndex()) {
+        // ===== 100 intersection dots (no labels) =====
+        intersectionsSrc?.let { pts ->
+            if (showIntersections) {
+                for (p in pts) {
                     val vx = mapX(p.x)
                     val vy = mapY(p.y)
-
-                    // dot
                     canvas.drawCircle(vx, vy, cornerDotRadiusPx + 1.2f, cornerOutline)
                     canvas.drawCircle(vx, vy, cornerDotRadiusPx, cornerFill)
-
-                    // label (we know peaks != null here)
-                    val peak = peaks!![idx]
-                    val text = "${names[idx]} p=${"%.2f".format(peak)}"
-                    val tw = hudText.measureText(text)
-                    val th = hudText.textSize + (0.3f * hudPadPx)
-                    val bg = RectF(
-                        vx + dotPad,
-                        vy - th - dotPad,
-                        vx + dotPad + tw + (0.6f * hudPadPx),
-                        vy - dotPad
-                    )
-                    canvas.drawRoundRect(bg, cornerRadiusPx, cornerRadiusPx, hudBg)
-                    canvas.drawText(
-                        text,
-                        bg.left + (0.3f * hudPadPx),
-                        bg.bottom - (0.2f * hudPadPx),
-                        hudText
-                    )
                 }
             }
         }
 
-        // Optional "LOCKED" tag
+
+
+        // ===== Optional "LOCKED" tag =====
         if (lockedHud) {
             val p = Paint().apply {
                 color = Color.GREEN
@@ -354,16 +384,15 @@ class OverlayView @JvmOverloads constructor(
             canvas.drawText(text, x, y, p)
         }
 
-        // --- Capture pulse animation (drawn over the captured grid) ---
+        // ===== Capture pulse animation =====
         capturePulseRect?.let { rSrc ->
             val elapsed = System.currentTimeMillis() - capturePulseStartMs
-            val dur = 200L // total animation duration ~200ms
+            val dur = 200L
             if (elapsed <= dur) {
-                val t = elapsed.toFloat() / dur.toFloat() // 0..1
-                val grow = 1f + 0.10f * t                  // expand up to +10%
+                val t = elapsed.toFloat() / dur.toFloat()      // 0..1
+                val grow = 1f + 0.10f * t                      // expand up to +10%
                 val alpha = (255 * (1f - t)).toInt().coerceIn(0, 255)
 
-                // Map source->view for drawing
                 val cx = mapX(rSrc.centerX())
                 val cy = mapY(rSrc.centerY())
                 val hw = (rSrc.width()  * 0.5f * grow) * s
@@ -392,12 +421,14 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // White flash overlay for shutter feedback
+        // ===== White flash overlay (shutter feedback) =====
         if (flashAlpha > 0f) {
             val oldAlpha = flashPaint.alpha
             flashPaint.alpha = (flashAlpha * 255f).toInt().coerceIn(0, 255)
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), flashPaint)
             flashPaint.alpha = oldAlpha
         }
+
+        // (Digits HUD intentionally omitted; leave as-is or wire to your own preview space)
     }
 }

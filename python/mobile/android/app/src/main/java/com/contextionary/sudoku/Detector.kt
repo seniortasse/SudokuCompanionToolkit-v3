@@ -1,3 +1,40 @@
+// ==============================================================================
+// Detector — YOLO-style grid finder (TFLite) with letterboxing and NMS
+// ==============================================================================
+// WHY
+// ------------------------------------------------------------------------------
+// We need a fast on-device way to locate Sudoku-like grids in live camera frames. Detector wraps a TFLite model, handles letterboxing and quantization, and returns stable boxes for the HUD and downstream corner refinement.
+//
+// WHAT
+// ------------------------------------------------------------------------------
+// Loads a .tflite model, infers input/output layouts, preprocesses Bitmap → model tensor, runs inference, parses a YOLO-ish head, applies geometry gates and NMS, and unletterboxes back to bitmap coordinates. Public result is a list of Det(box, score, cx/cy/w/h in model plane).
+//
+// HOW (high-level)
+// ------------------------------------------------------------------------------
+// 1) Inspect the model to determine NHWC vs NCHW, quantization, and output shapes.
+// 2) Preprocess with standard letterboxing (scale+pad) and write NHWC float32 or quantized.
+// 3) Run inference, allocate outputs to match the model exactly.
+// 4) Parse detections in a YOLO-ish format [cx,cy,w,h, obj, classes...].
+// 5) Apply simple geometry gates (size, aspect, area fraction), then greedy NMS.
+// 6) Map model-plane boxes back to the original bitmap using the recorded letterbox transform.
+//
+// FILE ORGANIZATION
+// ------------------------------------------------------------------------------
+// • Data classes: LbTransform (letterbox metadata), Det (public detection record)
+// • TFLite runtime: openInterpreter(), inspectModelIO(), logModelSummary()
+// • Preprocess: preprocessLetterbox() -> NHWC float32 and a letterboxed Bitmap for reference
+// • Geometry helpers: unletterboxRect(), iou(), nms(), rotateModelBox90CW() (if needed)
+// • Inference entry: infer(Bitmap, scoreThresh, maxDets) -> List<Det>
+//
+// RUNTIME FLOW / HOW THIS FILE IS USED
+// ------------------------------------------------------------------------------
+// MainActivity passes each RGBA frame as a Bitmap to infer(); Detector returns top boxes. OverlayView draws those boxes; MainActivity chooses the most centered and sends that ROI to the corner refiner.
+//
+// NOTES
+// ------------------------------------------------------------------------------
+// Comments are ASCII-only. Original code untouched; only comment lines were inserted. If your model uses a non-standard head, adjust the parser where marked.
+//
+// ==============================================================================
 package com.contextionary.sudoku
 
 import android.content.Context
@@ -22,6 +59,7 @@ import kotlin.math.round
  *   xBmp = (xModel - padX) / scale
  *   yBmp = (yModel - padY) / scale
  */
+// Records the exact scale and padding used during letterboxing so we can faithfully map detections back to bitmap space.
 data class LbTransform(
     val scale: Float,
     val padX: Int,
@@ -40,6 +78,7 @@ data class LbTransform(
  * 5) Unletterbox boxes back to bitmap space.
  * 6) Geometric gates + NMS + small cooldown reuse for stability.
  */
+// Owns a TFLite Interpreter and provides a single 'infer' method for YOLO-like models. Hides NHWC/NCHW and quantization details from callers. Maintains a small cooldown and last-kept list if you add temporal stability later.
 class Detector(
     ctx: Context,
     modelAsset: String,
@@ -79,6 +118,7 @@ class Detector(
     // -------------------------------------------------------------------------
     //  TFLite interpreter setup
     // -------------------------------------------------------------------------
+    // Load the TFLite model from assets via a memory-mapped buffer; configure threads; optionally attach NNAPI delegate for acceleration.
     private fun openInterpreter(ctx: Context, modelAssetPath: String, threads: Int): Interpreter {
         val options = Interpreter.Options().apply {
             setNumThreads(threads)
@@ -98,6 +138,7 @@ class Detector(
     /**
      * Read the *actual* model IO and allocate tensors up front.
      */
+    // Discover input layout (NCHW vs NHWC), channel count, and requested size straight from the tensor. Resize+allocate tensors accordingly and capture output shapes for later parsing.
     private fun inspectModelIO() {
         val it = interpreter
 
@@ -147,6 +188,7 @@ class Detector(
         outShapes = outs
     }
 
+    // Print a concise I/O summary with shapes, types, and quantization parameters — helpful during bring-up.
     fun logModelSummary() {
         if (printedModelInfo) return
         printedModelInfo = true
@@ -167,6 +209,7 @@ class Detector(
     // -------------------------------------------------------------------------
     //  Pre-processing (letterbox) : Bitmap -> NHWC float32 [1,H,W,C] + transform
     // -------------------------------------------------------------------------
+    // Scale the bitmap to fit within the model input, pad with YOLO gray, and produce NHWC float32 tensor in [0,1]. Returns NHWC array, the letterbox transform, and the letterboxed Bitmap used.
     private fun preprocessLetterbox(src: Bitmap): Triple<Array<Array<Array<FloatArray>>>, LbTransform, Bitmap> {
         val sizeW = inputW
         val sizeH = inputH
@@ -217,6 +260,7 @@ class Detector(
     //  Geometry helpers
     // -------------------------------------------------------------------------
     /** Map a model/letterbox-space rect back to ORIGINAL BITMAP space. */
+    // Map a box from model plane back to original bitmap plane using the recorded transform.
     private fun unletterboxRect(
         cx640: Float, cy640: Float, w640: Float, h640: Float,
         lb: LbTransform, origW: Int, origH: Int
@@ -234,6 +278,7 @@ class Detector(
     }
 
     /** IoU for NMS. */
+    // Axis-aligned intersection-over-union used by greedy NMS.
     private fun iou(a: RectF, b: RectF): Float {
         val x1 = max(a.left, b.left)
         val y1 = max(a.top, b.top)
@@ -245,6 +290,7 @@ class Detector(
     }
 
     /** Simple greedy NMS. */
+    // Greedy non-max suppression over candidate boxes, highest score first.
     private fun nms(dets: List<Det>, thr: Float): List<Det> {
         val sorted = dets.sortedByDescending { it.score }.toMutableList()
         val keep = mutableListOf<Det>()
@@ -277,6 +323,7 @@ class Detector(
     // -------------------------------------------------------------------------
     //  Public data model for UI
     // -------------------------------------------------------------------------
+    // Public record of one detection with both bitmap-space RectF and model-plane values (cx,cy,w,h).
     data class Det(
         val box: RectF,
         val score: Float,
@@ -290,6 +337,8 @@ class Detector(
     // -------------------------------------------------------------------------
     //  Inference entry point
     // -------------------------------------------------------------------------
+    // The hot path: preprocess -> prepare runtime input (float32 or quantized) -> run -> parse -> gate -> NMS -> unletterbox.
+    // Returns up to 'maxDets' boxes meeting 'scoreThresh' and geometry filters.
     fun infer(
         bmp: Bitmap,
         scoreThresh: Float = 0.55f,

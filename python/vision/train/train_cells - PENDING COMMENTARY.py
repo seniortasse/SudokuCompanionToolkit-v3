@@ -1,55 +1,3 @@
-# Digit Classifier Trainer — Sudoku Companion (annotated)
-# ------------------------------------------------------------------------
-#
-# WHY
-# ------------------------------------------------------------------------
-# We need a compact, reliable CNN that reads a single Sudoku cell (0–9) from a centered square crop. It must be robust to printed fonts, pseudo-handwritten fonts, and camera artifacts (tilt, shadows, blur). Training must blend synthetic diversity with real phone photos while staying reproducible.
-# WHAT
-# ------------------------------------------------------------------------
-# This module trains and evaluates that classifier. It supports two data worlds:
-#  - synth: procedurally generated digits (many fonts/variants)
-#  - real : cell crops from photographed boards
-# It mixes them via JSONL manifests and optional sampling ratios, applies a consistent grayscale→center-square→(optional inner-crop)→resize→normalize pipeline, and logs per-class accuracy. Checkpoints are saved in an output folder.
-# HOW (high-level)
-# ------------------------------------------------------------------------
-# 1) Deterministic seeding for reproducibility.
-# 2) JSONL-backed datasets that keep provenance explicit.
-# 3) Optional mixing across multiple train sources using ratios.
-# 4) Torch DataLoader fed to a small CNN (CNN28) for 28×28 inputs.
-# 5) Optional class-imbalance weighting and warm-starting from a checkpoint.
-# 6) Validation with overall and per-class accuracy to reveal weak digits.
-# FILE ORGANIZATION
-# ------------------------------------------------------------------------
-# • Imports & small helpers (set_seed, ensure_abs)
-# • Transforms: CenterSquare, CenterFrac (inner crop to keep grid ink out)
-# • Datasets: JsonlList, ImageDataset, MixedDataset, ConcatDS
-# • Metrics: per_class_metrics, compute_class_weights
-# • I/O: save_ckpt
-# • Main: argument parsing, dataset/model assembly, training loop, validation
-# CLI USAGE (examples)
-# ------------------------------------------------------------------------
-# python train_cells.py \
-#   --train-manifests vision/data/real/meta/train.jsonl,vision/data/synth/meta/train.jsonl \
-#   --train-mix 0.6,0.4 \
-#   --val-manifest vision/data/real/meta/val.jsonl \
-#   --img 28 --inner-crop 0.92 --epochs 12 --batch 256 --lr 3e-4 \
-#   --save-dir runs/cells_cnn28_v1 --class-weights auto --warm-start checkpoints/best.pt
-# Notes:
-#  - '--train-manifests' may contain one or more JSONL files (comma-separated).
-#  - '--train-mix' gives sampling ratios for those manifests (same length).
-#  - '--inner-crop' trims the center to avoid thick grid lines.
-#  - On Windows, workers default to 0 for stability.
-#  - Checkpoints: best.pt is saved when validation improves.
-# OUTPUTS
-# ------------------------------------------------------------------------
-# • checkpoints/best.pt — best validation accuracy
-# • checkpoints/epochXX.pt — optional intermediate snapshots
-# • console logs with per-class accuracy (for quick audits)
-# NOTES
-# ------------------------------------------------------------------------
-# All comments are ASCII and start with '#'. No code was modified — only comments were inserted above functions/classes and at section boundaries.
-# ========================================================================
-
 
 # vision/train/train_cells.py
 from __future__ import annotations
@@ -65,23 +13,13 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from vision.models.cnn_small import CNN28
 
-# Purpose: seed Python, NumPy, and PyTorch so runs are repeatable.
-# Why: makes metrics comparable and helps catch regressions.
-# Inputs: seed (int). Effects: sets global RNG states.
-# Output: none.
 def set_seed(seed: int = 1337):
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-# Purpose: normalize a path to an absolute string path.
-# Why: JSONL lines may include relative or user-home paths.
-# Output: absolute path string.
 def ensure_abs(path: str | Path) -> str:
     return str(Path(path).expanduser().resolve())
 
-# Transform class — crops the largest centered square from a rectangular image.
-# Why: classifier expects square inputs; avoids aspect skew.
-# How: uses PIL crop around center with the minimal side.
 class CenterSquare:
     def __call__(self, im: Image.Image) -> Image.Image:
         w, h = im.size
@@ -90,9 +28,6 @@ class CenterSquare:
         l = (w - side)//2; t = (h - side)//2
         return im.crop((l, t, l+side, t+side))
 
-# Transform class — optionally crops a centered fraction (0<frac<=1) of the square.
-# Why: trimming reduces border ink (bold grid lines) from reaching the CNN.
-# How: chooses a centered square of side frac*side.
 class CenterFrac:
     def __init__(self, frac: float = 1.0):
         self.frac = float(frac)
@@ -107,9 +42,6 @@ class CenterFrac:
 
 # ---------------- JSONL-backed datasets ----------------
 
-# Container for (path, label, source) triplets read from a JSONL manifest.
-# Why: keeps provenance and lets you mix multiple datasets cleanly.
-# Usage: each line is a JSON object with fields 'path', 'label', optional 'source'.
 class JsonlList:
     """Holds (path, label, source) triplets loaded from a JSONL file."""
     def __init__(self, jsonl_path: Path):
@@ -129,9 +61,6 @@ class JsonlList:
     def __len__(self): return len(self.items)
     def __getitem__(self, idx): return self.items[idx]
 
-# Dataset for a single JSONL list.
-# Pipeline: grayscale → CenterSquare → CenterFrac(inner_crop) → Resize(img_size) → RandomAffine(if train) → ToTensor → Normalize(mean=0.5, std=0.5).
-# Output: (tensor [1,H,W], label).
 class ImageDataset(Dataset):
     """Basic image classification dataset from a JsonlList."""
     def __init__(self, listing: JsonlList, img_size: int = 28, train: bool = False, inner_crop: float = 1.0):
@@ -158,10 +87,6 @@ class ImageDataset(Dataset):
         y = torch.tensor(lab, dtype=torch.long)
         return x, y
 
-# Dataset that samples from multiple ImageDataset instances according to ratios.
-# Why: blend real and synthetic in a controlled proportion each epoch.
-# How: pick a dataset via cumulative ratios, then pick a random index within it.
-# Epoch size: defaults to the sum of lengths of all component datasets.
 class MixedDataset(Dataset):
     """
     Draws samples on-the-fly from multiple datasets according to a ratio.
@@ -188,9 +113,6 @@ class MixedDataset(Dataset):
 
 # ---------------- Metrics & saving ----------------
 
-# Compute accuracy per digit 0..9 on a DataLoader.
-# Why: reveals if any digits are systematically weaker.
-# How: argmax over logits → count correct per class.
 def per_class_metrics(model: nn.Module, loader: DataLoader, device: str) -> Dict[int, float]:
     model.eval()
     correct = {i: 0 for i in range(10)}
@@ -206,9 +128,6 @@ def per_class_metrics(model: nn.Module, loader: DataLoader, device: str) -> Dict
     acc = {i: (correct[i] / total[i] * 100.0) if total[i] > 0 else 0.0 for i in range(10)}
     return acc
 
-# Compute inverse-frequency class weights across one or more JsonlList.
-# Why: to mitigate imbalance in digits during training (optional).
-# Output: a 10-long tensor of weights for CrossEntropyLoss.
 def compute_class_weights(listings: List[JsonlList]) -> torch.Tensor:
     counts = np.zeros(10, dtype=np.int64)
     for lst in listings:
@@ -219,8 +138,6 @@ def compute_class_weights(listings: List[JsonlList]) -> torch.Tensor:
     weights = inv / inv.sum() * 10.0
     return torch.tensor(weights, dtype=torch.float32)
 
-# Save model parameters to the output directory under the provided tag.
-# Why: keep the best model as 'best.pt' and enable warm-starts.
 def save_ckpt(model: nn.Module, out_dir: Path, tag: str = "best.pt"):
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt = out_dir / tag
@@ -229,12 +146,6 @@ def save_ckpt(model: nn.Module, out_dir: Path, tag: str = "best.pt"):
 
 # ---------------- Main ----------------
 
-# CLI entrypoint — parses arguments, builds datasets/loaders, constructs CNN28, handles optional warm-start and class weights, then runs the training loop.
-# Training loop highlights:
-#  - forward/backward on batches, accumulate loss and accuracy
-#  - evaluate on validation (if provided)
-#  - compute per-class metrics to spot weak digits
-#  - save best checkpoint when val accuracy improves
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-manifests", type=str, default="", help="Comma-separated JSONL paths for training")
@@ -281,7 +192,6 @@ def main():
 
     if val_listings:
         ds_vals = [ImageDataset(lst, img_size=args.img, train=False, inner_crop=args.inner_crop) for lst in val_listings]
-        # Simple concatenation dataset used for validation when multiple manifests are provided. It flattens indices across parts by offsets.
         class ConcatDS(Dataset):
             def __init__(self, parts: List[ImageDataset]):
                 self.parts = parts

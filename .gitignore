@@ -101,6 +101,12 @@ wandb/
 *.jpeg
 *.png
 
+# Allow Android resource images
+!python/mobile/android/app/src/main/res/**/*.png
+!python/mobile/android/app/src/main/res/**/*.jpg
+!python/mobile/android/app/src/main/res/**/*.jpeg
+!python/mobile/android/app/src/main/res/**/*.webp
+
 # --- Signing/keystore (never commit real keys)
 *.keystore
 *.jks

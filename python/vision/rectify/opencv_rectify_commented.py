@@ -1,106 +1,47 @@
-"""
-===============================================================================
-Sudoku Photo → 81 Clean Tiles — Internal-Lines Rectifier (Production-ready)
-===============================================================================
-
-WHY (the problem)
------------------
-A phone snapshot of a printed Sudoku is messy: perspective skew, bowed lines from
-lens curvature, headers/footers that compete with the grid, uneven lighting, and
-thick borders that can confuse “biggest quadrilateral” approaches. We need a
-robust, *explainable* rectifier that returns 81 correctly ordered tiles (64×64)
-and rich debug artifacts so failures are obvious and fixable.
-
-WHAT (this module does)
------------------------
-Given an image path, we:
-  1) Find the Sudoku board region of interest (ROI) without trusting outer borders.
-  2) Detect oriented masks (H/V) and select exactly 8 internal horizontal and
-     8 internal vertical rails (ignoring page frames and headers).
-  3) Repair short/broken rails, then compute the 8×8 intersection lattice.
-  4) Extrapolate an accurate outer ring (10×10 lattice) with fitted borders
-     and corner locking to prevent drift.
-  5) Warp each cell to a fixed square tile, with a configurable “shrink” to
-     keep inked grid lines away from tile edges.
-  6) Emit clear debug images (S1/S2) and reproducible outputs for QA.
-
-HOW (core ideas & guarantees)
------------------------------
-• Internal-lines strategy — We detect and rank only *internal* rails by span,
-  thickness, crossings and central coverage. This avoids depending on page
-  borders and tolerates headers/footers.
-
-• Collinear fragment merging — Repairs broken lines before selection.
-
-• Adaptive ring extrapolation — From the 8×8 intersection grid, we fit border
-  lines and clamp the 10×10 ring to those fitted borders. Corners are computed
-  from border intersections to stop edge drift.
-
-• Scale-aware rendering — Debug overlays draw with thickness/radius scaled to
-  image size so artifacts are readable at any resolution.
-
-WHERE (intended deployment)
----------------------------
-Works on device or server. Optional pre-compression keeps processing snappy
-on mobile. All steps are deterministic and log their artifacts for debugging.
-
-WHEN (use and extend)
----------------------
-Use for production rectification now. Extend with optional inpainting/grid
-removal *after* lattice construction if you want fully border-free tiles.
-
-FILE NAVIGATION (sections)
---------------------------
-  1. Basic helpers
-  2. Optional precompression / downscale
-  3. Oriented masks (H/V)
-  4. Sudoku ROI from masks
-  5. Components & utilities
-  6. Crossings & central-coverage tests
-  7. Collinear grouping (rail repairs)
-  8. Select exactly 8 internal lines
-  9. Refit/extend short selected lines
- 10. Intersections (8×8)
- 11. Adaptive outer ring & corners (10×10)
- 12. Overlay / warp helpers
- 13. Main entry: process()
-
-OUTPUTS (by default)
---------------------
-out/
-  board_warped.png   – the working ROI used for cropping
-  board_clean.png    – identical to warped (reserved for future “cleaning” step)
-  cells/ r{1..9}c{1..9}.png  – 81 tiles (top-left r1c1 … bottom-right r9c9)
-  cells.json         – tile paths + ROI box in the original image
-  rectify_debug/
-    S1_lines_h.png   – horizontal mask (full image)
-    S1_lines_v.png   – vertical mask (full image)
-    S1_grid_mask.png – H|V fused mask (full image)
-    S1_roi_rect.png  – ROI box over the original image
-    S1_gray_roi.png  – grayscale ROI crop
-    S2_lines_and_points.png – selected rails + 10×10 lattice points overlay
-
-TUNABLES (high-level)
----------------------
-• tile_size (default 64)          – square tile output dimension
-• shrink (default 0.14)           – inward shrink before warping to keep rails off edges
-• angle sweep range               – coarse rotation search to stabilize rail selection
-• morphological kernel sizes      – scale with approx_cell for robust masks
-
-USAGE (CLI)
------------
-$ python opencv_rectify.py <image_path> <export_dir>
-
-RETURN (programmatic)
----------------------
-process(...) → dict with paths, rotation_deg, precompressed flag.
-
-Design note
------------
-The code favors *explainability*: every decision (line selection, lattice points)
-can be inspected via S1/S2 artifacts. Where possible, thresholds are tied to
-“approx_cell” (min(ROI.height, ROI.width) / 9) for scale invariance.
-"""
+# Sudoku Photo → 81 Clean Tiles — Internal-Lines Rectifier (annotated)
+# ------------------------------------------------------------------------
+#
+# WHY
+# ------------------------------------------------------------------------
+# A phone snapshot of a printed Sudoku includes skew, bowed lines, headers, and thick page borders. A naive 'largest quadrilateral' can drift. We need a robust and explainable rectifier that yields 81 correctly ordered tiles and clear debug artifacts.
+# WHAT
+# ------------------------------------------------------------------------
+# Given an image, detect the 8 internal horizontal and 8 internal vertical rails; compute the 8×8 lattice; adaptively extrapolate the outer ring to a 10×10 grid; warp each cell to a square tile; emit debug overlays and manifests (cells.json).
+# HOW (high-level)
+# ------------------------------------------------------------------------
+# • Oriented morphology to extract H/V ink with scale-aware kernels.
+# • ROI by fused mask and largest component, ignoring headers/footers.
+# • Group collinear fragments, select exactly 8 rails per axis with coverage and crossings gates; optionally refit short rails (polyline).
+# • Intersections → adaptive outer ring with border fitting and corner locking.
+# • Per-cell perspective warp with a shrink guard to keep rail ink off edges.
+# FILE ORGANIZATION
+# ------------------------------------------------------------------------
+# 1) Basic helpers
+# 2) Optional precompression/downscale
+# 3) Oriented masks (H/V)
+# 4) Sudoku ROI from masks
+# 5) Components & utilities
+# 6) Crossings & central-coverage tests
+# 7) Collinear grouping (rail repairs)
+# 8) Select exactly 8 internal lines
+# 9) Refit/extend short selected lines
+# 10) Intersections (8×8)
+# 11) Adaptive outer ring & corners (10×10)
+# 12) Overlay / warp helpers
+# 13) Main entry: process()
+# CLI USAGE (examples)
+# ------------------------------------------------------------------------
+# python opencv_rectify.py path/to/photo.jpg python/demo_export/l-1-149
+# Outputs board_warped.png, board_clean.png, rectify_debug/*, and cells/r1c1..r9c9.png
+# OUTPUTS
+# ------------------------------------------------------------------------
+# • board_warped.png / board_clean.png
+# • rectify_debug/S1_*.png and S2_lines_and_points.png
+# • cells/ (81 tiles) and cells.json
+# NOTES
+# ------------------------------------------------------------------------
+# All comments are ASCII-only and start with '#'. Original code is unchanged. We only added commentary above functions and sections.
+# ========================================================================
 
 from __future__ import annotations
 from typing import Any, List, Tuple
@@ -114,24 +55,29 @@ import cv2
 #    Small utilities for filesystem, color conversions, saving, rotation, resize.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Filesystem helper: create directory (parents=True) if missing.
 def _ensure_dir(p: Path):
     """Create directory p (parents too) if it does not exist."""
     p.mkdir(parents=True, exist_ok=True)
 
+# Convert BGR→grayscale if needed; keep single-channel images as-is.
 def _to_gray(img: np.ndarray) -> np.ndarray:
     """Return a single-channel grayscale image (no copy if already gray)."""
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
+# OpenCV imwrite wrapper for clarity and single responsibility.
 def _save(p: Path, im: np.ndarray):
     """Write image to disk (path → OpenCV)."""
     cv2.imwrite(str(p), im)
 
+# Rotate around image center by angle (deg). Border replicate to avoid black corners.
 def _rotate_image(img: np.ndarray, angle_deg: float) -> np.ndarray:
     """Rotate image about center by angle_deg (deg). Border is replicated."""
     H, W = img.shape[:2]
     M = cv2.getRotationMatrix2D((W/2.0, H/2.0), angle_deg, 1.0)
     return cv2.warpAffine(img, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
+# Resize such that max(H,W) <= long_side; return resized image and scale factor.
 def _resize_longside(img: np.ndarray, long_side: int = 1280) -> Tuple[np.ndarray, float]:
     """
     Resize image so max(H, W) <= long_side.
@@ -150,6 +96,7 @@ def _resize_longside(img: np.ndarray, long_side: int = 1280) -> Tuple[np.ndarray
 #    Keep mobile latency low by bounding input size and JPEG budget.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Optional downscale to bound long side for mobile latency.
 def downscale_for_work(img: np.ndarray, max_long_side: int = 1600) -> np.ndarray:
     """Resize so max(H, W) <= max_long_side; returns the resized image."""
     h, w = img.shape[:2]
@@ -159,6 +106,7 @@ def downscale_for_work(img: np.ndarray, max_long_side: int = 1600) -> np.ndarray
     s = max_long_side / float(m)
     return cv2.resize(img, (int(w*s), int(h*s)), interpolation=cv2.INTER_AREA)
 
+# Downscale then JPEG-encode to hit a size budget via binary search over quality. Returns decoded image and the encoded bytes; useful to persist the exact input used.
 def compress_to_budget(img_bgr: np.ndarray,
                        target_kb: int = 100,
                        max_long_side: int = 1600,
@@ -199,6 +147,7 @@ def compress_to_budget(img_bgr: np.ndarray,
 #      mask_all: union of both
 # ──────────────────────────────────────────────────────────────────────────────
 
+# CLAHE equalization + adaptive threshold + direction-specific morphology. Outputs horizontal mask, vertical mask, and their union.
 def build_oriented_masks(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     CLAHE equalization → adaptive threshold → oriented morphology with
@@ -245,6 +194,7 @@ def build_oriented_masks(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.n
 #    Fuse H|V masks, dilate to bridge gaps, select largest connected component.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Fuse H/V masks, dilate to bridge gaps, take largest connected component as ROI. Return cropped masks and the ROI box indices into the original image.
 def sudoku_roi_from_masks(mask_h: np.ndarray, mask_v: np.ndarray):
     """
     Return ((mask_h_roi, mask_v_roi), (y0,y1,x0,x1)) where the ROI is the
@@ -276,6 +226,7 @@ def sudoku_roi_from_masks(mask_h: np.ndarray, mask_v: np.ndarray):
 #    Connected components; median centers for spacing/cv; small helpers.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Connected components over a binary mask; returns component ids and bounding boxes.
 def _components_from_mask(mask: np.ndarray):
     """Return (components, labels) where components = [(id, bbox), ...]."""
     num, lab = cv2.connectedComponents((mask > 0).astype(np.uint8))
@@ -288,6 +239,7 @@ def _components_from_mask(mask: np.ndarray):
         comps.append((k, (x0, y0, x1, y1)))
     return comps, lab
 
+# Compute median coordinate for each candidate rail along the orthogonal axis; sorted.
 def _line_centers(line_masks: List[np.ndarray], axis: str) -> np.ndarray:
     """Median coordinate per mask along the *orthogonal* axis; sorted list."""
     coords = []
@@ -297,6 +249,7 @@ def _line_centers(line_masks: List[np.ndarray], axis: str) -> np.ndarray:
         coords.append(coord)
     return np.array(sorted(coords))
 
+# Coefficient of variation for consecutive gaps; lower means more even spacing (grid-like).
 def _cv_gaps(coords: np.ndarray) -> float:
     """Coefficient of variation of consecutive gaps (spacing regularity metric)."""
     if len(coords) < 2: return 1e6
@@ -310,6 +263,7 @@ def _cv_gaps(coords: np.ndarray) -> float:
 #    crossings in a central band; margins near ROI edges are ignored.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Count crossings between a rail and the orthogonal mask inside a central band; helps reject headers/footers and edge clutter.
 def _count_crossings_central_band(line_mask: np.ndarray, other_mask: np.ndarray,
                                   axis: str, dilate_px: int, ignore_margin_px: int, band_frac: float) -> int:
     """Count connected crossings with the other axis inside a central band."""
@@ -334,6 +288,7 @@ def _count_crossings_central_band(line_mask: np.ndarray, other_mask: np.ndarray,
     num, _ = cv2.connectedComponents((inter > 0).astype(np.uint8))
     return max(0, num - 1)
 
+# Measure how much of the central band shows ink for a rail; rejects partial/noisy lines.
 def _central_coverage(line_mask: np.ndarray, axis: str, band_frac: float) -> float:
     """Fraction of columns/rows showing ink inside the central band."""
     H, W = line_mask.shape[:2]
@@ -355,6 +310,7 @@ def _central_coverage(line_mask: np.ndarray, axis: str, band_frac: float) -> flo
 #    orthogonal coordinate; return merged masks + bbox + median coord.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Merge near-collinear components into candidate rails using a tolerance tied to approx_cell. Returns merged masks with bbox and median coord.
 def _group_collinear_components(mask: np.ndarray, axis: str, approx_cell: float):
     """Group near-collinear components and return merged rail candidates."""
     comps, lab = _components_from_mask(mask)
@@ -395,6 +351,7 @@ def _group_collinear_components(mask: np.ndarray, axis: str, approx_cell: float)
 #    spacing regularity, with a “best window of 8” selector if more survive.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Select exactly 8 rails for one axis. Multi-stage: span/thickness → coverage → crossings → spacing regularity. Includes a fallback window selector with center bias.
 def _select_8_lines(mask: np.ndarray, axis: str, approx_cell: float, other_mask: np.ndarray) -> List[np.ndarray]:
     """
     Select precisely 8 rails along one axis.
@@ -481,6 +438,7 @@ def _select_8_lines(mask: np.ndarray, axis: str, approx_cell: float, other_mask:
 #    and redraw with scale-aware thickness to follow bow/tilt.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# For short-span rails, refit using polyfit (1st/2nd order) and redraw across ROI with thickness tied to scale.
 def _refit_mask_line(m: np.ndarray, axis: str, W: int, H: int, approx_cell: float) -> np.ndarray:
     """Refit a line mask with a 1st/2nd-order poly model (axis-aware), extend to ROI."""
     pts = cv2.findNonZero(m)
@@ -510,6 +468,7 @@ def _refit_mask_line(m: np.ndarray, axis: str, W: int, H: int, approx_cell: floa
         cv2.polylines(newm, [pts_poly], False, 255, thickness)
         return newm
 
+# Apply refit selectively to the chosen rails; preserve long-span rails as-is.
 def _refine_selected_masks(masks: List[np.ndarray], axis: str, W: int, H: int, approx_cell: float) -> List[np.ndarray]:
     """Refit each selected rail iff its span is short vs ROI; preserves long rails."""
     refined = []
@@ -532,6 +491,7 @@ def _refine_selected_masks(masks: List[np.ndarray], axis: str, W: int, H: int, a
 #     Compute median intersection points between each selected H/V pair.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Compute 8×8 lattice points from dilated overlaps between H and V rails.
 def _intersections_from_masks(h_masks: List[np.ndarray], v_masks: List[np.ndarray], dilate_px: int = 3) -> np.ndarray:
     """Return P8[8,8,2] = (x,y) lattice from dilated rail overlaps."""
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*dilate_px+1, 2*dilate_px+1))
@@ -558,6 +518,7 @@ def _intersections_from_masks(h_masks: List[np.ndarray], v_masks: List[np.ndarra
 #     compute corners from fitted border intersections.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Fit polynomial to index→value and return (poly, mse); used for adaptive borders.
 def _fit_mse(values: np.ndarray, deg: int) -> Tuple[np.poly1d, float]:
     """Fit polynomial of degree 'deg' to index→value and return (poly, mse)."""
     idx = np.arange(1, 9, dtype=np.float64)
@@ -566,6 +527,7 @@ def _fit_mse(values: np.ndarray, deg: int) -> Tuple[np.poly1d, float]:
     mse = float(np.mean((f(idx) - values.astype(np.float64))**2))
     return f, mse
 
+# Choose linear vs quadratic border extrapolation per column/row based on MSE.
 def _extrap_adaptive_xy(xs: np.ndarray, ys: np.ndarray, improve_ratio: float = 0.85) -> Tuple[float,float,float,float]:
     """Pick linear vs quadratic extrapolation column/row-wise based on MSE."""
     f1x, m1x = _fit_mse(xs, 1); f2x, m2x = _fit_mse(xs, 2)
@@ -574,6 +536,7 @@ def _extrap_adaptive_xy(xs: np.ndarray, ys: np.ndarray, improve_ratio: float = 0
     fx, fy = (f2x, f2y) if use_quad else (f1x, f1y)
     return float(fx(0.0)), float(fx(9.0)), float(fy(0.0)), float(fy(9.0))
 
+# Limit extrapolation step vs previous step to curb runaway outer edges.
 def _clamp_extrap(p_ref: np.ndarray, p_next: np.ndarray, p_pred: np.ndarray, factor: float = 1.6) -> np.ndarray:
     """Limit extrapolation step vs preceding step length to curb runaway edges."""
     step = p_ref - p_next
@@ -584,6 +547,7 @@ def _clamp_extrap(p_ref: np.ndarray, p_next: np.ndarray, p_pred: np.ndarray, fac
         ref_to_pred = ref_to_pred * (factor * nstep / nref)
     return p_ref + ref_to_pred
 
+# Build a 10×10 lattice from the 8×8 internal grid by extrapolating borders and computing corners via line fits.
 def _complete_lattice_adaptive(P8: np.ndarray) -> np.ndarray:
     """Complete 8×8 internal lattice to a 10×10 ring with fitted borders & corners."""
     G = np.zeros((10,10,2), np.float32)
@@ -646,6 +610,7 @@ def _complete_lattice_adaptive(P8: np.ndarray) -> np.ndarray:
 #     Visualization and per-cell perspective warps (with “shrink” guard).
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Visualization helper to draw rails and lattice points with scale-aware styling.
 def _overlay_masks_and_points(gray_roi: np.ndarray, h_masks: List[np.ndarray], v_masks: List[np.ndarray], G: np.ndarray) -> np.ndarray:
     """Draw rails (green/orange) and 10×10 lattice points (red) over ROI."""
     vis = cv2.cvtColor(gray_roi, cv2.COLOR_GRAY2BGR)
@@ -665,11 +630,13 @@ def _overlay_masks_and_points(gray_roi: np.ndarray, h_masks: List[np.ndarray], v
             cv2.circle(vis, (x,y), radius, (0,0,255), -1)
     return vis
 
+# Clamp lattice to ROI bounds to avoid out-of-bounds warps.
 def _clip_grid_inplace(G: np.ndarray, H: int, W: int):
     """Clamp lattice coordinates to ROI bounds (safety against extrap overshoot)."""
     G[:,:,0] = np.clip(G[:,:,0], 0, W-1)
     G[:,:,1] = np.clip(G[:,:,1], 0, H-1)
 
+# Perspective warp of one cell quad to a square tile. Applies 'shrink' toward cell center to keep ink off edges.
 def _warp_cell(gray_img: np.ndarray, P: np.ndarray, r: int, c: int, out: int = 64, shrink: float = 0.14) -> np.ndarray:
     """
     Warp a cell quad [P[r,c] ... P[r+1,c]] → out×out tile.
@@ -686,6 +653,7 @@ def _warp_cell(gray_img: np.ndarray, P: np.ndarray, r: int, c: int, out: int = 6
 #     Run the whole pipeline, save artifacts, return useful paths & metadata.
 # ──────────────────────────────────────────────────────────────────────────────
 
+# End-to-end pipeline driver. Steps: (1) optional precompress; (2) angle sweep on a small image; (3) full-res masks & ROI; (4) rail selection and refinement; (5) intersections + outer ring; (6) per-cell warps; (7) save artifacts and manifest.
 def process(image_path: str,
             out_dir: str,
             tile_size: int = 64,
@@ -798,20 +766,6 @@ def process(image_path: str,
     # S2 overlay (scale-aware)
     overlay = _overlay_masks_and_points(gray_roi, h_masks_ref, v_masks_ref, G)
     _save(debug/"S2_lines_and_points.png", overlay)
-
-    # --- NEW: save the 10x10 lattice points for training ---
-    # G is in ROI coordinates (gray_roi). We’ll export both 10x10 and a flattened 100 list.
-    pts10x10 = G.astype(np.float32).tolist()
-    flat_pts = [[float(G[r, c, 1]), float(G[r, c, 0])]  # [y, x]
-                for r in range(10) for c in range(10)]
-    pts_json = {
-        "points": flat_pts,               # 100 points as [y, x] in ROI space (board_clean.png)
-        "grid_shape": [10, 10],
-        "coord_space": "roi",             # coordinates match board_clean.png
-        "roi": {"y0": int(y0), "y1": int(y1), "x0": int(x0), "x1": int(x1)},
-    }
-    (out/"points_10x10.json").write_text(json.dumps(pts_json, indent=2), encoding="utf-8")
-
 
     inside = int(np.sum((G[:,:,0] >= 0) & (G[:,:,0] < Wroi2) & (G[:,:,1] >= 0) & (G[:,:,1] < Hroi2)))
     print(f"[adaptive-grid] angle={ang:+.1f}° | lattice_points={inside}/100")
