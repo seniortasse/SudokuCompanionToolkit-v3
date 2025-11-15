@@ -28,6 +28,13 @@ class OverlayView @JvmOverloads constructor(
     // LOCK state text (optional)
     private var lockedHud: Boolean = false
 
+
+    var showCropRect: Boolean = true
+
+
+
+
+
     // Refined corners + peaks (TL, TR, BR, BL)
     // (Legacy) Corner-based HUD is retired. Keep placeholders to avoid call-site errors.
     @Volatile private var corners: List<PointF>? = null
@@ -99,8 +106,11 @@ class OverlayView @JvmOverloads constructor(
     // Gate state display (NONE/L1/L2/L3)
     private var gateState: GateState = GateState.NONE
     fun setGateState(state: GateState) {
-        gateState = state
-        invalidate()
+        if (gateState != state) {
+            gateState = state
+            // redraw so box color matches the new traffic light state
+            postInvalidateOnAnimation()
+        }
     }
 
 
@@ -125,8 +135,9 @@ class OverlayView @JvmOverloads constructor(
     }
     private val guideStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        color = Color.CYAN
-        strokeWidth = strokePx
+        strokeWidth = 2f * resources.displayMetrics.density  // thin ~2dp
+        color = Color.parseColor("#FFFFFF") // white
+        //color = Color.parseColor("#A34FFF") // button purple
     }
     private val cornerFill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -212,6 +223,10 @@ class OverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+
+
+
+
     fun updateCorners(c: List<PointF>?, peaks: FloatArray? = null) {
         corners = c
         cornerPeaks = peaks
@@ -249,6 +264,15 @@ class OverlayView @JvmOverloads constructor(
         cropStroke.strokeWidth = max(2f, 1.2f * base)
     }
 
+
+
+
+
+
+
+
+
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (srcW <= 0 || srcH <= 0) return
@@ -264,11 +288,11 @@ class OverlayView @JvmOverloads constructor(
         val offX: Float
         val offY: Float
         if (useFillCenter) {
-            s = max(sx, sy)
+            s = kotlin.math.max(sx, sy)
             dw = srcW * s; dh = srcH * s
             offX = (vw - dw) / 2f; offY = (vh - dh) / 2f
         } else {
-            s = min(sx, sy)
+            s = kotlin.math.min(sx, sy)
             dw = srcW * s; dh = srcH * s
             offX = (vw - dw) / 2f; offY = (vh - dh) / 2f
         }
@@ -278,7 +302,7 @@ class OverlayView @JvmOverloads constructor(
         fun unmapX(xView: Float) = (xView - offX) / s
         fun unmapY(yView: Float) = (yView - offY) / s
 
-        // ===== Top-left HUD panel (honor showHudText) =====
+        // ===== HUD panel =====
         if (showHudText) {
             val lines = buildList {
                 add("bitmap: ${srcW}×${srcH}")
@@ -290,7 +314,7 @@ class OverlayView @JvmOverloads constructor(
             val lineGap = 0.35f * textPx
             val hudW = lines.maxOf { hudText.measureText(it) } + pad * 2
             val hudH = lines.size * (hudText.textSize + lineGap) + pad
-            var ty = 12f + textPx
+            var ty = 12f + hudText.textSize
             val hudRect = RectF(12f, 12f, 12f + hudW, 12f + hudH)
             canvas.drawRoundRect(hudRect, cornerRadiusPx, cornerRadiusPx, hudBg)
             lines.forEach {
@@ -299,7 +323,34 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // ===== Red detection boxes (+ optional labels) =====
+        // ===== Detection boxes (color driven by gateState) =====
+        // Reuse your existing redFill / redStroke but retint them depending on gateState.
+        run {
+            val baseFillAlpha = redFill.alpha
+            val baseStrokeAlpha = redStroke.alpha
+
+            val (fillColor, strokeColor) = when (gateState) {
+                GateState.L3 -> {
+                    // Green
+                    Color.argb(255, 0, 200, 0) to Color.rgb(0, 220, 0)
+                }
+                GateState.L2 -> {
+                    // Amber / orange
+                    Color.argb(255, 255, 180, 0) to Color.rgb(255, 190, 0)
+                }
+                GateState.L1, GateState.NONE -> {
+                    // Red
+                    Color.argb(255, 220, 0, 0) to Color.RED
+                }
+            }
+
+            redFill.color = fillColor
+            redFill.alpha = baseFillAlpha
+
+            redStroke.color = strokeColor
+            redStroke.alpha = baseStrokeAlpha
+        }
+
         val labelBg = Paint(hudBg)
         val labelPadX = 0.6f * hudPadPx
         val labelPadY = 0.4f * hudPadPx
@@ -309,10 +360,8 @@ class OverlayView @JvmOverloads constructor(
             val t = mapY(r.top)
             val rr = mapX(r.right)
             val bb = mapY(r.bottom)
-
             canvas.drawRect(l, t, rr, bb, redFill)
             canvas.drawRect(l, t, rr, bb, redStroke)
-
             if (showBoxLabels) {
                 val label = "s=${"%.2f".format(d.score)}"
                 val tw = hudText.measureText(label)
@@ -320,13 +369,18 @@ class OverlayView @JvmOverloads constructor(
                 val boxTop = (t - th - 4f).coerceAtLeast(0f)
                 val bgRect = RectF(l, boxTop, l + tw + labelPadX * 2, boxTop + th)
                 canvas.drawRoundRect(bgRect, cornerRadiusPx, cornerRadiusPx, labelBg)
-                canvas.drawText(label, l + labelPadX, boxTop + hudText.textSize + (labelPadY / 2f), hudText)
+                canvas.drawText(
+                    label,
+                    l + labelPadX,
+                    boxTop + hudText.textSize + (labelPadY / 2f),
+                    hudText
+                )
             }
         }
 
-        // ===== Cyan square guide (view space) + keep a source-space copy for gating =====
+        // ===== Cyan square guide =====
         val mapped = RectF(offX, offY, offX + dw, offY + dh)
-        val side = min(mapped.width(), mapped.height())
+        val side = kotlin.math.min(mapped.width(), mapped.height())
         val guide = if (mapped.width() <= mapped.height()) {
             val top = mapped.centerY() - side / 2f
             RectF(mapped.left, top, mapped.left + side, top + side)
@@ -342,18 +396,19 @@ class OverlayView @JvmOverloads constructor(
             unmapY(guide.bottom)
         )
 
-        // ===== Green overlay for model crop (optional) =====
-        cornerCropRect?.let { r ->
-            val l = mapX(r.left.toFloat())
-            val t = mapY(r.top.toFloat())
-            val rr = mapX(r.right.toFloat())
-            val bb = mapY(r.bottom.toFloat())
-            canvas.drawRect(l, t, rr, bb, cropFill)
-            canvas.drawRect(l, t, rr, bb, cropStroke)
+        // ===== Green overlay for model crop =====
+        if (showCropRect) {
+            cornerCropRect?.let { r ->
+                val l = mapX(r.left.toFloat())
+                val t = mapY(r.top.toFloat())
+                val rr = mapX(r.right.toFloat())
+                val bb = mapY(r.bottom.toFloat())
+                canvas.drawRect(l, t, rr, bb, cropFill)
+                canvas.drawRect(l, t, rr, bb, cropStroke)
+            }
         }
 
-
-        // ===== 100 intersection dots (no labels) =====
+        // ===== Intersections =====
         intersectionsSrc?.let { pts ->
             if (showIntersections) {
                 for (p in pts) {
@@ -364,8 +419,6 @@ class OverlayView @JvmOverloads constructor(
                 }
             }
         }
-
-
 
         // ===== Optional "LOCKED" tag =====
         if (lockedHud) {
@@ -389,17 +442,16 @@ class OverlayView @JvmOverloads constructor(
             val elapsed = System.currentTimeMillis() - capturePulseStartMs
             val dur = 200L
             if (elapsed <= dur) {
-                val t = elapsed.toFloat() / dur.toFloat()      // 0..1
-                val grow = 1f + 0.10f * t                      // expand up to +10%
+                val t = elapsed.toFloat() / dur.toFloat()
+                val grow = 1f + 0.10f * t
                 val alpha = (255 * (1f - t)).toInt().coerceIn(0, 255)
 
                 val cx = mapX(rSrc.centerX())
                 val cy = mapY(rSrc.centerY())
-                val hw = (rSrc.width()  * 0.5f * grow) * s
+                val hw = (rSrc.width() * 0.5f * grow) * s
                 val hh = (rSrc.height() * 0.5f * grow) * s
 
                 val ring = RectF(cx - hw, cy - hh, cx + hw, cy + hh)
-
                 val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     style = Paint.Style.STROKE
                     strokeWidth = 6f
@@ -421,7 +473,7 @@ class OverlayView @JvmOverloads constructor(
             }
         }
 
-        // ===== White flash overlay (shutter feedback) =====
+        // ===== White flash overlay =====
         if (flashAlpha > 0f) {
             val oldAlpha = flashPaint.alpha
             flashPaint.alpha = (flashAlpha * 255f).toInt().coerceIn(0, 255)
@@ -429,6 +481,84 @@ class OverlayView @JvmOverloads constructor(
             flashPaint.alpha = oldAlpha
         }
 
-        // (Digits HUD intentionally omitted; leave as-is or wire to your own preview space)
+        // ===== Traffic light =====
+        drawTrafficLight(canvas)
     }
+
+
+    // --- Traffic light rendering (layered bulbs; lit based on gateState) ---
+    private fun drawTrafficLight(canvas: Canvas) {
+        // Colors for bulbs
+        val colorRed   = Color.parseColor("#F44336")
+        val colorAmber = Color.parseColor("#FFC107")
+        val colorGreen = Color.parseColor("#4CAF50")
+
+        // Paints (scoped; simple and safe)
+        val paintTraffic = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        val paintTrafficDim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = 1.5f
+        }
+        val paintTrafficHalo = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+        val paintTrafficHighlight = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.WHITE
+        }
+
+        // Radius & positions
+        val r = (kotlin.math.min(width, height) * 0.022f).coerceAtLeast(dp(8f))
+        val cy = r * 1.8f
+        val gap = r * 2.2f
+        val cxMid = width * 0.5f
+
+        // Bulb definitions: (centerX, state, color)
+        val bulbs = listOf(
+            Triple(cxMid - gap, GateState.L1, colorRed),
+            Triple(cxMid,        GateState.L2, colorAmber),
+            Triple(cxMid + gap, GateState.L3, colorGreen),
+        )
+
+        for ((cx, state, col) in bulbs) {
+            val lit = (gateState == state)
+
+            // 1) Base bulb: always visible in its hue, dimmer when not lit.
+            // Off = ~35% opacity fill + ~60% rim; On = ~55% base so rim is still readable under core.
+            paintTraffic.color = withAlpha(col, if (lit) 140 else 90)
+            canvas.drawCircle(cx, cy, r, paintTraffic)
+
+            paintTrafficDim.color = withAlpha(col, if (lit) 220 else 150)
+            canvas.drawCircle(cx, cy, r, paintTrafficDim)
+
+            if (lit) {
+                // 2) Gentle halo
+                paintTrafficHalo.color = withAlpha(col, 90)
+                canvas.drawCircle(cx, cy, r * 1.25f, paintTrafficHalo)
+
+                // 3) Bright core (slightly smaller than rim so rim stays crisp)
+                paintTraffic.color = col
+                canvas.drawCircle(cx, cy, r * 0.92f, paintTraffic)
+
+                // 4) Tiny white specular highlight (top-left) to simulate lens/reflector
+                paintTrafficHighlight.alpha = 80
+                canvas.drawCircle(cx - r * 0.35f, cy - r * 0.35f, r * 0.28f, paintTrafficHighlight)
+            }
+        }
+    }
+
+    private fun withAlpha(color: Int, alpha: Int): Int {
+        val a = alpha.coerceIn(0, 255)
+        return Color.argb(a, Color.red(color), Color.green(color), Color.blue(color))
+    }
+
+    private fun dp(x: Float): Float = x * resources.displayMetrics.density
+
+
+
+
+
+
+
+
+
+
 }

@@ -99,6 +99,8 @@ import android.app.Activity
 
 import androidx.appcompat.view.ContextThemeWrapper
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 
 // The central orchestrator for camera preview, analysis, HUD, detection, corner refinement, gating, and the final capture/rectify/classify path.
 class MainActivity : ComponentActivity() {
@@ -127,6 +129,8 @@ class MainActivity : ComponentActivity() {
 
 
     private var gateState: GateState = GateState.NONE
+
+    private val gate = GateController()
 
 
     // === MM4: results overlay state ===
@@ -188,6 +192,9 @@ class MainActivity : ComponentActivity() {
 
 
 
+
+
+
     private lateinit var intersections: IntersectionsFinder
 
     // New gates
@@ -201,12 +208,140 @@ class MainActivity : ComponentActivity() {
 
     // Keep last passing frame for best-of-N
     private data class PassingFrame(
-        val ptsSrc: List<PointF>,   // 100 src-space points (row-major)
+        val ptsSrc: List<PointF>,
         val roi: RectF,
         val minPeak: Float,
         val tsMs: Long,
-        val expandedRoi: Rect       // for overlays / mapping
+        val expandedRoi: Rect,
+        val roiBmp: Bitmap,            // cropped ROI bitmap for this frame (used for debug overlay)
+        val jitterPx128: Float,        // <-- non-default must come before defaulted params
+        var score: ScoreBreakdown? = null   // optional cache of the computed breakdown
     )
+
+    // Detailed per-frame scoring used for CSV debug.
+    private data class ScoreBreakdown(
+        val total: Float,
+        val confPct: Float,
+        val lineStraightness: Float,
+        val orthogonality: Float,
+        val cellUniformity: Float,
+        val clearance: Float,
+        val jitterScore: Float
+    )
+
+    private data class GateSnapshot(
+        val hasDetectorLock: Boolean,
+        val gridizedOk: Boolean,
+        val validPoints: Int,
+        val jitterPx128: Float,
+        val rectifyOk: Boolean,
+        val avgConf: Float,
+        val lowConfCells: Int
+    )
+
+
+
+
+    // -------------------------------------------------------------------------
+    // Drop-in replacement: GateController
+    //  - Amber only after "dots appeared" dwell (RED_TO_AMBER_MS)
+    //  - Gentle amber-loss grace (AMBER_LOSS_GRACE_MS)
+    //  - L3 (green) is set externally at lock time (provisional green)
+    //  - Demote from L3 if post checks fail (GREEN_FAIL_GRACE_MS)
+    // -------------------------------------------------------------------------
+    private class GateController {
+        var state: GateState = GateState.NONE; private set
+        private var enteredAt = System.currentTimeMillis()
+
+        // dwell for "dots visible" before we can enter Amber
+        private var firstSeenGridizedAt: Long? = null
+        // grace before dropping Amber when dots disappear
+        private var amberLossSince: Long? = null
+        // grace before dropping Green if post checks fail
+        private var greenFailSince: Long? = null
+
+        // local tunables (keep decoupled from companion constants)
+        private val RED_TO_AMBER_MS       = 300L   // dwell after dots appear
+        private val AMBER_LOSS_GRACE_MS   = 180L   // avoid flicker
+        private val GREEN_FAIL_GRACE_MS   = 120L   // gentle demotion
+
+        private fun now() = System.currentTimeMillis()
+
+        fun update(s: GateSnapshot): GateState {
+            val t = now()
+            val prev = state
+
+            // NONE: idle until we have any detector lock
+            if (state == GateState.NONE) {
+                if (s.hasDetectorLock) {
+                    state = GateState.L1; enteredAt = t
+                }
+                return state
+            }
+
+            // keep internal timers in sync with gridized visibility
+            if (s.gridizedOk) {
+                if (firstSeenGridizedAt == null) firstSeenGridizedAt = t
+                amberLossSince = null
+            } else {
+                firstSeenGridizedAt = null
+                if (state == GateState.L2) {
+                    if (amberLossSince == null) amberLossSince = t
+                } else {
+                    amberLossSince = null
+                }
+            }
+
+            when (state) {
+                GateState.L1 -> {
+                    // promote only if dots have been visible long enough
+                    val dwell = firstSeenGridizedAt?.let { t - it } ?: 0L
+                    if (dwell >= RED_TO_AMBER_MS && s.hasDetectorLock && s.validPoints >= 90) {
+                        state = GateState.L2; enteredAt = t
+                    }
+                    // lose detector completely → back to NONE
+                    if (!s.hasDetectorLock) {
+                        state = GateState.NONE; enteredAt = t
+                        firstSeenGridizedAt = null
+                        amberLossSince = null
+                        greenFailSince = null
+                    }
+                }
+                GateState.L2 -> {
+                    // demote if dots vanished and grace window elapsed
+                    if (!s.gridizedOk) {
+                        val loss = amberLossSince?.let { t - it } ?: 0L
+                        if (loss >= AMBER_LOSS_GRACE_MS) {
+                            state = if (s.hasDetectorLock) GateState.L1 else GateState.NONE
+                            enteredAt = t
+                            firstSeenGridizedAt = null
+                            amberLossSince = null
+                        }
+                    }
+                    // promotion to L3 is driven externally at lock time
+                }
+                GateState.L3 -> {
+                    // in green, if post checks fail, wait a bit then drop to Amber/Red
+                    val postOk = (s.rectifyOk && s.avgConf >= 0.75f && s.lowConfCells <= 6)
+                    if (!postOk) {
+                        if (greenFailSince == null) greenFailSince = t
+                        if ((t - greenFailSince!!) >= GREEN_FAIL_GRACE_MS) {
+                            state = if (s.gridizedOk && s.hasDetectorLock) GateState.L2 else if (s.hasDetectorLock) GateState.L1 else GateState.NONE
+                            enteredAt = t
+                            greenFailSince = null
+                        }
+                    } else {
+                        greenFailSince = null
+                    }
+                }
+                else -> { /* NONE handled above */ }
+            }
+            return state
+        }
+    }
+
+
+
 
     private val passing = ArrayDeque<PassingFrame>()
 
@@ -221,7 +356,7 @@ class MainActivity : ComponentActivity() {
 
     // === Best-of-N locking ===
     companion object {
-        private const val STREAK_N = 2
+        private const val STREAK_N = 4
         private const val SHOW_CROP_OVERLAY = false
         private const val ROI_PAD_FRAC = 0.08f   // 8% on each side (tweak: 0.06–0.12)
 
@@ -232,6 +367,20 @@ class MainActivity : ComponentActivity() {
         private const val MAX_LOWCONF = 6           // how many cells may be low-confidence
         private const val LOWCONF_THR = 0.60f       // what "low" means, per cell
         //private const val GRID_SIZE = 450  // square pixels for our “rough” board render
+
+        private const val DUMP_LOCKED_INTERSECTIONS = false
+
+        // TRAFFIC-LIGHT SIGNALING
+
+        private const val RED_TO_AMBER_MS   = 150L
+        private const val AMBER_TO_GREEN_MS = 250L
+        private const val DEMOTE_GRACE_MS   = 200L
+
+        private const val MIN_VALID_PTS         = 90         // intersections ≥90/100
+        // private const val MAX_JITTER_PX128      = 7f         // already used in your flow
+        private const val MIN_AVG_CELL_CONF     = 0.75f
+        private const val LOWCONF_CELL_THR      = 0.60f
+        private const val MAX_LOWCONF_CELLS     = 6
     }
 
 
@@ -266,9 +415,10 @@ class MainActivity : ComponentActivity() {
         overlay.setUseFillCenter(previewView.scaleType == PreviewView.ScaleType.FILL_CENTER)
         overlay.setCornerPeakThreshold(CORNER_PEAK_THR)
 
-        overlay.showCornerDots = true
+        overlay.showCornerDots = false
         overlay.showBoxLabels = false
         overlay.showHudText   = false
+        overlay.showCropRect = false
 
         // Detector
         try {
@@ -299,7 +449,7 @@ class MainActivity : ComponentActivity() {
 
         // HUD: show intersections, hide corner UI
         overlay.showCornerDots = false
-        overlay.showIntersections = true
+        overlay.showIntersections = false
 
 
         analyzerExecutor = Executors.newSingleThreadExecutor()
@@ -650,6 +800,18 @@ class MainActivity : ComponentActivity() {
     //  - Enforce all gates (peaks≥thr, convexity, side ratios, area vs red box, aspect tolerance, jitter in 128-space, cyan-guard border). If a frame passes, add to the passing deque; once N frames pass, attempt rectification + classification.
 
 
+
+
+
+
+
+    // -------------------------------------------------------------------------
+    // Drop-in replacement: startCamera()
+    //  - Amber after "dots appear" dwell (delegated to GateController via gridizedOk)
+    //  - Best-of-N: score the last 4 passing frames; lock the best (uses current bmp for work)
+    //  - Provisional Green at lock; heavy work happens in attemptRectifyAndClassify()
+    //  - Demotions: NONE when no pick; L1 when intersections/gates break
+    // -------------------------------------------------------------------------
     private fun startCamera() {
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
@@ -669,7 +831,6 @@ class MainActivity : ComponentActivity() {
 
             analysis.setAnalyzer(analyzerExecutor) { proxy ->
                 try {
-                    // Hold analyzer while rectifying/classifying or when locked.
                     if (locked || handoffInProgress) { proxy.close(); return@setAnalyzer }
 
                     frameIndex++
@@ -684,10 +845,8 @@ class MainActivity : ComponentActivity() {
                         proxy.close(); return@setAnalyzer
                     }
 
-                    // 1) Grid detection
+                    // 1) Detection
                     val dets = detector.infer(bmp, scoreThresh = HUD_DET_THRESH, maxDets = HUD_MAX_DETS)
-
-                    // Choose the most centered detection (if any)
                     val cxImg = bmp.width / 2f
                     val cyImg = bmp.height / 2f
                     val picked = dets.minByOrNull { det ->
@@ -695,147 +854,215 @@ class MainActivity : ComponentActivity() {
                         val dy = det.box.centerY() - cyImg
                         dx * dx + dy * dy
                     }
-                    val toShow = if (picked != null) listOf(picked) else emptyList()
 
-                    changeGate(if (picked != null) GateState.L1 else GateState.NONE,
-                        if (picked != null) "detected" else "no_detection")
-
-                    // 2) Intersections on chosen ROI (NO DUMP on normal frames)
-                    val result = if (picked != null) {
-                        try {
-                            intersections.infer(
-                                src = bmp,
-                                roiSrc = picked.box,
-                                padFrac = ROI_PAD_FRAC,
-                                thrPred = INT_PEAK_THR,
-                                topK = 140,
-                                requireGridize = true,
-                                dumpDebug = false,
-                                dumpTag = null
-                            )
-                        } catch (t: Throwable) {
-                            Log.w("MainActivity", "Intersections infer failed", t); null
-                        }
-                    } else null
-
-                    // HUD update
+                    // HUD: boxes
                     runOnUiThread {
                         overlay.setSourceSize(bmp.width, bmp.height)
-                        overlay.updateBoxes(toShow, HUD_DET_THRESH, HUD_MAX_DETS)
-                        overlay.updateCornerCropRect(result?.expandedRoiSrc)
-                        overlay.updateIntersections(result?.points)
+                        overlay.updateBoxes(if (picked != null) listOf(picked) else emptyList(), HUD_DET_THRESH, HUD_MAX_DETS)
                     }
 
-                    // 3) Gating on intersections
-                    if (picked != null && result != null && result.points.size >= 91) {
-                        val roi = picked.box
-                        val ptsSrc = result.points
-
-                        // Jitter in 128-space using expanded ROI from intersections
-                        val ex = result.expandedRoiSrc
-                        fun to128(p: PointF): Pair<Float, Float> {
-                            val x128 = (p.x - ex.left) * 128f / max(1, ex.width()).toFloat()
-                            val y128 = (p.y - ex.top)  * 128f / max(1, ex.height()).toFloat()
-                            return x128 to y128
+                    if (picked == null) {
+                        // No detection → NONE, clear histories
+                        passing.clear()
+                        jitterHistory.clear()
+                        runOnUiThread {
+                            overlay.updateCornerCropRect(null)
+                            overlay.updateIntersections(null)
                         }
-                        val xs = FloatArray(ptsSrc.size) { i -> to128(ptsSrc[i]).first }
-                        val ys = FloatArray(ptsSrc.size) { i -> to128(ptsSrc[i]).second }
-                        val grid128 = Grid128(xs, ys)
-                        val jitterOk = avgJitterPx128(grid128) <= MAX_JITTER_PX128
+                        changeGate(GateState.NONE, "no_detection")
+                        proxy.close(); return@setAnalyzer
+                    }
 
-                        // Geometry from outer intersections
+                    // 2) Intersections (no dump on live frames)
+                    val inter = try {
+                        intersections.infer(
+                            src = bmp,
+                            roiSrc = picked.box,
+                            padFrac = ROI_PAD_FRAC,
+                            thrPred = INT_PEAK_THR,
+                            topK = 140,
+                            requireGridize = true,
+                            dumpDebug = false,
+                            dumpTag = null
+                        )
+                    } catch (t: Throwable) {
+                        Log.w("MainActivity", "Intersections infer failed", t); null
+                    }
+
+                    // HUD: crop overlay + dots
+                    runOnUiThread {
+                        overlay.updateCornerCropRect(inter?.expandedRoiSrc)
+                        overlay.updateIntersections(inter?.points)
+                    }
+
+                    // 3) Gating snapshot for SM (pre-rectify)
+                    val haveGrid = (inter != null && inter.points.size >= 90)
+                    val ptsSrc = inter?.points ?: emptyList()
+
+                    // Jitter in 128-space
+                    val ex = inter?.expandedRoiSrc
+                    val jitterPx = if (haveGrid && ex != null) {
+                        val xs = FloatArray(ptsSrc.size) { i -> ((ptsSrc[i].x - ex.left) * 128f / max(1, ex.width())) }
+                        val ys = FloatArray(ptsSrc.size) { i -> ((ptsSrc[i].y - ex.top)  * 128f / max(1, ex.height())) }
+                        val grid128 = Grid128(xs, ys)
+                        val v = avgJitterPx128(grid128)
+                        jitterHistory.addLast(grid128)
+                        while (jitterHistory.size > JITTER_WINDOW) jitterHistory.removeFirst()
+                        v
+                    } else {
+                        jitterHistory.clear(); 999f
+                    }
+
+                    val jitterOk = jitterPx <= 7f
+
+                    // Geometry from outer intersections if we have them
+                    val geomOk = if (haveGrid) run {
                         val tl = ptsSrc.minByOrNull { it.x + it.y }!!
                         val br = ptsSrc.maxByOrNull { it.x + it.y }!!
                         val tr = ptsSrc.minByOrNull { (bmp.width - it.x) + it.y }!!
                         val bl = ptsSrc.minByOrNull { it.x + (bmp.height - it.y) }!!
-
-                        val geomOk = isConvexAndPositiveTLTRBRBL(tl, tr, br, bl) &&
-                                sideLenRatio(tl, tr, br, bl) <= SIDE_RATIO_MAX
-
-                        // Area/aspect vs detector box
+                        val roi = picked.box
                         val areaQuad = quadArea(tl, tr, br, bl)
                         val areaRed  = (roi.width() * roi.height()).coerceAtLeast(1f)
                         val areaRatio = areaQuad / areaRed
                         val areaOk = areaRatio >= AREA_RATIO_MIN && areaRatio <= AREA_RATIO_MAX
-
                         val aspectQuad = quadAspectApprox(tl, tr, br, bl)
-                        val aspectRed  = aspect(roi)
+                        val aspectRed  = aspect(RectF(roi))
                         val aspectOk = kotlin.math.abs(ln((aspectQuad / aspectRed).toDouble())) <= ln(ASPECT_TOL.toDouble())
+                        val shapeOk = isConvexAndPositiveTLTRBRBL(tl, tr, br, bl) && sideLenRatio(tl, tr, br, bl) <= SIDE_RATIO_MAX
+                        areaOk && aspectOk && shapeOk
+                    } else false
 
-                        // Cyan guard
-                        val guardSrc = overlay.getGuardRectInSource()
-                        val roiSrc = RectF(roi)
-                        val tolSrc = (min(bmp.width, bmp.height) / 120f).coerceAtLeast(2f)
-                        val guardOk = if (guardSrc != null) !touchesBorder(roiSrc, guardSrc, tolSrc) else true
+                    // Cyan guard
+                    val guardSrc = overlay.getGuardRectInSource()
+                    val roiSrc = RectF(picked.box)
+                    val tolSrc = (min(bmp.width, bmp.height) / 120f).coerceAtLeast(2f)
+                    val guardOk = if (guardSrc != null) !touchesBorder(roiSrc, guardSrc, tolSrc) else true
 
-                        val minPeak = result.scores.minOrNull() ?: 0f
-                        val allHigh = minPeak >= INT_PEAK_THR
+                    val minPeak = inter?.scores?.minOrNull() ?: 0f
+                    val allHigh = haveGrid && (minPeak >= INT_PEAK_THR)
 
-                        // Maintain jitter window
-                        jitterHistory.addLast(grid128)
-                        while (jitterHistory.size > JITTER_WINDOW) jitterHistory.removeFirst()
+                    // Feed SM with pre-rectify snapshot (rectifyOk=false)
+                    val pre = GateSnapshot(
+                        hasDetectorLock = true,
+                        gridizedOk      = haveGrid,
+                        validPoints     = inter?.points?.size ?: 0,
+                        jitterPx128     = jitterPx,
+                        rectifyOk       = false,
+                        avgConf         = 0f,
+                        lowConfCells    = Int.MAX_VALUE
+                    )
+                    val sm = gate.update(pre)
+                    if (sm != gateState) changeGate(sm, "preRectify")
 
-                        val good = allHigh && geomOk && areaOk && aspectOk && jitterOk && guardOk
-                        if (good) {
-                            passing.addLast(PassingFrame(ptsSrc, roi, minPeak, now, ex))
-                            while (passing.size > STREAK_N) passing.removeFirst()
-                            changeGate(GateState.L2, "100pts_good")
+                    // Build "good" predicate (for streak buffer)
+                    val good = haveGrid && allHigh && geomOk && guardOk && jitterOk
 
-                            if (passing.size == STREAK_N) {
-                                // *** LOCK: we will use THIS frame. ***
-                                handoffInProgress = true
-                                runOnUiThread { overlay.setLocked(true) }
+                    if (good && inter != null) {
+                        // Capture the exact ROI bitmap now (for per-frame overlay saving later)
+                        val leftI   = inter.expandedRoiSrc.left.coerceIn(0, bmp.width - 1)
+                        val topI    = inter.expandedRoiSrc.top.coerceIn(0, bmp.height - 1)
+                        val rightI  = inter.expandedRoiSrc.right.coerceIn(leftI + 1, bmp.width)
+                        val bottomI = inter.expandedRoiSrc.bottom.coerceIn(topI + 1, bmp.height)
+                        val roiBitmap = Bitmap.createBitmap(bmp, leftI, topI, rightI - leftI, bottomI - topI)
 
-                                // Re-run intersections WITH DUMP on the very same frame,
-                                // so roi_model_in_128/heatmap/peaks/grid are from the locked frame.
-                                val dumpRes = try {
-                                    intersections.infer(
-                                        src = bmp,
-                                        roiSrc = picked.box,
-                                        padFrac = ROI_PAD_FRAC,
-                                        thrPred = INT_PEAK_THR,
-                                        topK = 140,
-                                        requireGridize = true,
-                                        dumpDebug = true,
-                                        dumpTag = "locked_${SystemClock.uptimeMillis()}"
-                                    )
-                                } catch (t: Throwable) {
-                                    Log.w("MainActivity", "Intersections dump infer failed, falling back to non-dump result", t)
-                                    result
-                                } ?: result
+                        // Maintain a buffer of last N good frames
+                        passing.addLast(
+                            PassingFrame(
+                                ptsSrc      = inter.points,
+                                roi         = RectF(picked.box),
+                                minPeak     = minPeak,
+                                tsMs        = now,
+                                expandedRoi = inter.expandedRoiSrc,
+                                roiBmp      = roiBitmap,
+                                jitterPx128 = jitterPx         // <-- store per-frame jitter
+                            )
+                        )
+                        while (passing.size > STREAK_N) passing.removeFirst()
 
-                                // Clear streak buffer now that we’re proceeding
-                                passing.clear()
+                        // Stay visually in Amber while collecting
+                        if (gateState != GateState.L2) changeGate(GateState.L2, "good_frame")
 
-                                // Handoff to rectification/classification using the dump result
-                                attemptRectifyAndClassify(
-                                    ptsSrc = dumpRes.points,
-                                    detectorRoi = roi,
-                                    srcBmp = bmp,
-                                    expandedRoiSrc = dumpRes.expandedRoiSrc
+                        if (passing.size >= STREAK_N) {
+                            // --- Score all N; save images + CSV for audit; pick best ---
+                            val guard = overlay.getGuardRectInSource()
+                            val frames = passing.toList()
+
+                            var bestIdx = -1
+                            var bestScore = Float.NEGATIVE_INFINITY
+
+                            for (i in frames.indices) {
+                                val pf = frames[i]
+                                val bd = computeFrameScore(
+                                    ptsSrc       = pf.ptsSrc,
+                                    ex           = pf.expandedRoi,
+                                    roi          = pf.roi,
+                                    jitterPx128  = pf.jitterPx128,   // <-- use the frame’s stored jitter
+                                    minPeak      = pf.minPeak,
+                                    guardRect    = guard,
+                                    imgW         = bmp.width,
+                                    imgH         = bmp.height
                                 )
+                                pf.score = bd
+                                if (bd.total > bestScore) { bestScore = bd.total; bestIdx = i }
                             }
-                        } else {
+
+                            // Save debug pack before clearing
+                            val debugRoot = getRectifyDebugDir()
+                            saveBestOfNDebugPack(debugRoot, frames, bestIdx.coerceAtLeast(0))
+
+                            // Recycle bitmaps & clear
+                            frames.forEach { f -> try { f.roiBmp.recycle() } catch (_: Throwable) {} }
                             passing.clear()
-                            changeGate(if (picked != null) GateState.L1 else GateState.NONE, "intersections_not_good")
+
+                            // Provisional green immediately
+                            handoffInProgress = true
+                            changeGate(GateState.L3, "lock_provisional_green")
+                            runOnUiThread { overlay.setLocked(true) }
+
+                            // Re-run intersections with dump on the same live frame
+                            val dumpRes = try {
+                                intersections.infer(
+                                    src = bmp,
+                                    roiSrc = picked.box,
+                                    padFrac = ROI_PAD_FRAC,
+                                    thrPred = INT_PEAK_THR,
+                                    topK = 140,
+                                    requireGridize = true,
+                                    dumpDebug = DUMP_LOCKED_INTERSECTIONS,
+                                    dumpTag = if (DUMP_LOCKED_INTERSECTIONS) "locked_${SystemClock.uptimeMillis()}" else null
+                                )
+                            } catch (t: Throwable) {
+                                Log.w("MainActivity", "Intersections dump infer failed; using current inter", t)
+                                inter
+                            } ?: inter
+
+                            attemptRectifyAndClassify(
+                                ptsSrc = dumpRes.points,
+                                detectorRoi = RectF(picked.box),
+                                srcBmp = bmp,
+                                expandedRoiSrc = dumpRes.expandedRoiSrc
+                            )
                         }
                     } else {
+                        // bad frame → drop to L1 (or stay None if no lock)
                         passing.clear()
-                        jitterHistory.clear()
-                        changeGate(if (picked != null) GateState.L1 else GateState.NONE, "insufficient_info")
+                        if (picked != null) {
+                            changeGate(GateState.L1, "not_good")
+                        }
                     }
-
                 } catch (t: Throwable) {
                     Log.e("Detector", "Analyzer error on frame $frameIndex", t)
                     runOnUiThread {
                         overlay.setSourceSize(previewView.width, previewView.height)
                         overlay.updateBoxes(emptyList(), HUD_DET_THRESH, 0)
-                        overlay.updateCorners(null, null)
                         overlay.updateCornerCropRect(null)
+                        overlay.updateIntersections(null)
                         overlay.setLocked(false)
                     }
                     passing.clear()
                     jitterHistory.clear()
+                    changeGate(GateState.NONE, "exception")
                 } finally {
                     proxy.close()
                 }
@@ -853,17 +1080,379 @@ class MainActivity : ComponentActivity() {
 
 
 
+    // -------------------------------------------------------------------------
+// Save Best-of-N debug pack:
+//  - frame_1_points.png ... frame_N_points.png (points drawn on ROI)
+//  - bestofN.csv with per-frame scoring breakdown and metadata
+// -------------------------------------------------------------------------
+    private fun saveBestOfNDebugPack(
+        parentDir: java.io.File,
+        frames: List<PassingFrame>,
+        chosenIdx: Int
+    ) {
+        runCatching {
+            val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+                .format(java.util.Date())
+
+            val dir = java.io.File(
+                parentDir,
+                "bestofN${STREAK_N}_${ts}_${android.os.SystemClock.uptimeMillis()}"
+            )
+            if (!dir.exists()) dir.mkdirs()
+
+            // locale-stable formatters
+            fun f6(x: Float) = String.format(java.util.Locale.US, "%.6f", x)
+            fun f2(x: Float) = String.format(java.util.Locale.US, "%.2f", x)
+
+            // --- helpers (local to this method) --------------------------------
+
+            // Order 100 points into a 10×10 grid (row-major) by banding on Y then sorting by X.
+            fun orderIntoGrid10(ptsLocal: List<PointF>): Array<Array<PointF>> {
+                require(ptsLocal.size >= 100) { "Need at least 100 points" }
+
+                // sort by Y asc, then partition into 10 consecutive bands of ~10
+                val sorted = ptsLocal.sortedBy { it.y }
+                val rows = Array(10) { ArrayList<PointF>(10) }
+                for (r in 0 until 10) {
+                    val start = (r * sorted.size) / 10
+                    val end = ((r + 1) * sorted.size) / 10
+                    val band = sorted.subList(start, end).sortedBy { it.x }
+                    // keep exactly 10 by trimming or padding with nearest endpoints
+                    val row = when {
+                        band.size == 10 -> band
+                        band.size > 10  -> band.take(10)
+                        else -> {
+                            val need = 10 - band.size
+                            val padLeft  = generateSequence { band.first() }.take(need / 2).toList()
+                            val padRight = generateSequence { band.last()  }.take(need - need / 2).toList()
+                            (padLeft + band + padRight)
+                        }
+                    }
+                    rows[r].addAll(row)
+                }
+                return Array(10) { r -> Array(10) { c -> rows[r][c] } }
+            }
+
+            // Per row, resample to 10 evenly spaced X positions from minX..maxX.
+            // Y is linearly interpolated between the row endpoints.
+            fun resampleRowsEvenX(grid: Array<Array<PointF>>): Array<Array<PointF>> {
+                val out = Array(10) { Array(10) { PointF() } }
+                for (r in 0 until 10) {
+                    val row = grid[r]
+                    val left  = row.first()
+                    val right = row.last()
+                    val minX = left.x
+                    val maxX = right.x
+                    val dx = (maxX - minX).coerceAtLeast(1e-3f)
+
+                    for (c in 0 until 10) {
+                        val t = c / 9f  // 0..1
+                        val x = minX + t * dx
+                        val y = left.y + t * (right.y - left.y)
+                        out[r][c] = PointF(x, y)
+                    }
+                }
+                return out
+            }
+
+            // Column-mean nudge: pull each point's X a fraction toward its column mean.
+            fun nudgeColumnsToMeans(grid: Array<Array<PointF>>, frac: Float = 0.20f): Array<Array<PointF>> {
+                val out = Array(10) { r -> Array(10) { c -> PointF(grid[r][c].x, grid[r][c].y) } }
+                for (c in 0 until 10) {
+                    var sumX = 0f
+                    for (r in 0 until 10) sumX += grid[r][c].x
+                    val meanX = sumX / 10f
+                    for (r in 0 until 10) {
+                        val p = out[r][c]
+                        p.x = p.x + frac * (meanX - p.x)
+                    }
+                }
+                return out
+            }
+
+            // Render the processed lattice onto a copy of roiBmp.
+            fun drawProcessedGridOverlay(base: Bitmap, grid: Array<Array<PointF>>): Bitmap {
+                val bmp = base.copy(Bitmap.Config.ARGB_8888, true)
+                val canvas = Canvas(bmp)
+
+                val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    style = Paint.Style.STROKE
+                    strokeWidth = (bmp.width.coerceAtMost(bmp.height) / 360f).coerceAtLeast(1.5f)
+                }
+                val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.CYAN
+                    style = Paint.Style.FILL
+                }
+                val dotR = (bmp.width.coerceAtMost(bmp.height) / 140f).coerceAtLeast(2.5f)
+
+                // rows
+                for (r in 0 until 10) {
+                    for (c in 0 until 9) {
+                        val a = grid[r][c]; val b = grid[r][c + 1]
+                        canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
+                    }
+                }
+                // columns
+                for (c in 0 until 10) {
+                    for (r in 0 until 9) {
+                        val a = grid[r][c]; val b = grid[r + 1][c]
+                        canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
+                    }
+                }
+                // dots
+                for (r in 0 until 10) {
+                    for (c in 0 until 10) {
+                        val p = grid[r][c]
+                        canvas.drawCircle(p.x, p.y, dotR, dotPaint)
+                    }
+                }
+                return bmp
+            }
+
+            // --------------------------------------------------------------------
+
+            // CSV header
+            val csv = StringBuilder().apply {
+                appendLine(
+                    "index,timestamp_ms,total,confPct,lineStraightness,orthogonality,cellUniformity,clearance,jitterScore,minPeak,validPoints,roi_left,roi_top,roi_right,roi_bottom,chosen"
+                )
+            }
+
+            frames.forEachIndexed { idx, pf ->
+                // Localize points to ROI
+                val localPts = pf.ptsSrc.map { p ->
+                    PointF(p.x - pf.expandedRoi.left, p.y - pf.expandedRoi.top)
+                }
+
+                // 1) Save annotated ROI (raw intersections)
+                val annotated = drawPointsOverlayOnBitmap(pf.roiBmp, localPts)
+                saveBitmapPng(java.io.File(dir, "frame_${idx + 1}_points.png"), annotated)
+
+                // 2) Save raw ROI
+                saveBitmapPng(java.io.File(dir, "frame_${idx + 1}_raw.png"), pf.roiBmp)
+
+                // 3) CSV row
+                val bd = pf.score ?: ScoreBreakdown(
+                    total = 0f, confPct = 0f, lineStraightness = 0f, orthogonality = 0f,
+                    cellUniformity = 0f, clearance = 0f, jitterScore = 0f
+                )
+                val r = pf.roi
+                csv.appendLine(
+                    listOf(
+                        (idx + 1).toString(),
+                        pf.tsMs.toString(),
+                        f6(bd.total),
+                        f6(bd.confPct),
+                        f6(bd.lineStraightness),
+                        f6(bd.orthogonality),
+                        f6(bd.cellUniformity),
+                        f6(bd.clearance),
+                        f6(bd.jitterScore),
+                        f6(pf.minPeak),
+                        pf.ptsSrc.size.toString(),
+                        f2(r.left), f2(r.top), f2(r.right), f2(r.bottom),
+                        if (idx == chosenIdx) "1" else "0"
+                    ).joinToString(",")
+                )
+            }
+
+            // Write CSV + chosen index
+            java.io.File(dir, "scores.csv").writeText(csv.toString())
+            java.io.File(dir, "chosen_idx.txt").writeText(chosenIdx.toString())
+
+            // --- NEW: write processed lattice overlay for the chosen frame only ---
+            if (chosenIdx in frames.indices) {
+                val pf = frames[chosenIdx]
+
+                // ROI-local points for the chosen frame
+                val localPts = pf.ptsSrc.map { p ->
+                    PointF(p.x - pf.expandedRoi.left, p.y - pf.expandedRoi.top)
+                }
+
+                // Rebuild the lattice exactly like rectification (ordering → resample → nudge)
+                val g0 = orderIntoGrid10(localPts)
+                val g1 = resampleRowsEvenX(g0)
+                val g2 = nudgeColumnsToMeans(g1, frac = 0.20f)   // use same factor as rectifier
+
+                val processedOverlay = drawProcessedGridOverlay(pf.roiBmp, g2)
+                saveBitmapPng(java.io.File(dir, "frame_${chosenIdx + 1}_points_resampled.png"), processedOverlay)
+            }
+
+            android.util.Log.i("BestOfN", "Saved Best-of-N debug to ${dir.absolutePath}")
+        }.onFailure {
+            android.util.Log.e("BestOfN", "Failed saving Best-of-N pack", it)
+        }
+    }
+
+
+
+
+
+    // -------------------------------------------------------------------------
+    // New helper: score a frame's "grid-likeness" (0..1-ish, higher is better)
+    // Uses only data we already have (intersections, ROI, jitter, guard clearance).
+    // -------------------------------------------------------------------------
+    private fun computeFrameScore(
+        ptsSrc: List<PointF>,
+        ex: Rect,
+        roi: RectF,
+        jitterPx128: Float,
+        minPeak: Float,
+        guardRect: RectF?,
+        imgW: Int,
+        imgH: Int
+    ): ScoreBreakdown {
+        if (ptsSrc.size < 90) {
+            return ScoreBreakdown(
+                total = -1f, confPct = 0f, lineStraightness = 0f,
+                orthogonality = 0f, cellUniformity = 0f, clearance = 0f, jitterScore = 0f
+            )
+        }
+
+        fun to128(p: PointF): PointF {
+            val x = ((p.x - ex.left) * 128f / max(1, ex.width()))
+            val y = ((p.y - ex.top)  * 128f / max(1, ex.height()))
+            return PointF(x, y)
+        }
+
+        val g = Array(10) { r -> Array(10) { c -> to128(ptsSrc[r * 10 + c]) } }
+
+        fun lineResidual(points: Array<PointF>): Float {
+            val p0 = points.first(); val p1 = points.last()
+            val vx = p1.x - p0.x; val vy = p1.y - p0.y
+            val vlen = kotlin.math.sqrt(vx*vx + vy*vy).coerceAtLeast(1e-3f)
+            val nx = -vy / vlen; val ny =  vx / vlen
+            var sum = 0f
+            for (p in points) sum += kotlin.math.abs((p.x - p0.x) * nx + (p.y - p0.y) * ny)
+            return (sum / points.size)
+        }
+
+        var straight = 0f
+        for (r in 0 until 10) straight += lineResidual(g[r])
+        for (c in 0 until 10) {
+            val col = Array(10) { r -> g[r][c] }
+            straight += lineResidual(col)
+        }
+        val lineStraightness = (1f - (straight / (20f * 2.0f))).coerceIn(0f, 1f)
+
+        fun dir(p0: PointF, p1: PointF): PointF {
+            val vx = p1.x - p0.x; val vy = p1.y - p0.y
+            val l = kotlin.math.sqrt(vx*vx + vy*vy).coerceAtLeast(1e-3f)
+            return PointF(vx / l, vy / l)
+        }
+        val rowDir = dir(g[0].first(), g[0].last())
+        val colDir = dir(g.first()[0], g.last()[0])
+        val dot = kotlin.math.abs(rowDir.x * colDir.x + rowDir.y * colDir.y)
+        val orthogonality = (1f - dot).coerceIn(0f, 1f)
+
+        fun meanStd(values: FloatArray): Pair<Float, Float> {
+            val m = values.average().toFloat()
+            var v = 0f; for (v0 in values) { val d = v0 - m; v += d * d }
+            v /= values.size.coerceAtLeast(1)
+            return m to kotlin.math.sqrt(v)
+        }
+        val widths = FloatArray(9 * 10) { i ->
+            val r = i / 9; val c = i % 9
+            val a = g[r][c]; val b = g[r][c+1]
+            kotlin.math.sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y))
+        }
+        val heights = FloatArray(10 * 9) { i ->
+            val r = i / 10; val c = i % 10
+            val a = g[r][c]; val b = g[r+1][c]
+            kotlin.math.sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y))
+        }
+        val wStd = meanStd(widths).second
+        val hStd = meanStd(heights).second
+        val cellUniformity = (1f - ((wStd + hStd) / 10f)).coerceIn(0f, 1f)
+
+        val clearance = if (guardRect != null) {
+            val dL = kotlin.math.abs(roi.left   - guardRect.left)
+            val dT = kotlin.math.abs(roi.top    - guardRect.top)
+            val dR = kotlin.math.abs(guardRect.right - roi.right)
+            val dB = kotlin.math.abs(guardRect.bottom - roi.bottom)
+            val dMin = min(min(dL, dR), min(dT, dB))
+            (dMin / (min(imgW, imgH) * 0.10f)).coerceIn(0f, 1f)
+        } else 1f
+
+        val confPct = minPeak.coerceIn(0f, 1f)
+        val jitterScore = (1f - (jitterPx128 / 7f)).coerceIn(0f, 1f)
+
+        val w1=0.25f; val w2=0.20f; val w3=0.15f; val w4=0.15f; val w5=0.10f; val w6=0.15f
+        val total = w1*confPct + w2*lineStraightness + w3*orthogonality + w4*cellUniformity + w5*clearance + w6*jitterScore
+
+        return ScoreBreakdown(
+            total = total,
+            confPct = confPct,
+            lineStraightness = lineStraightness,
+            orthogonality = orthogonality,
+            cellUniformity = cellUniformity,
+            clearance = clearance,
+            jitterScore = jitterScore
+        )
+    }
+
+
+
+
+
+    // Center-crop a square bitmap to an inner region, then resize back to outSize×outSize.
+// innerFrac is the fraction to trim from EACH side (e.g. 0.10f = 10% per side).
+    private fun centerCropAndResize(
+        src: Bitmap,
+        innerFrac: Float,
+        outSize: Int
+    ): Bitmap {
+        val w = src.width
+        val h = src.height
+
+        // We expect square tiles, but be defensive
+        val marginX = ((w * innerFrac).toInt()).coerceIn(0, w / 4)
+        val marginY = ((h * innerFrac).toInt()).coerceIn(0, h / 4)
+
+        val cropX = marginX
+        val cropY = marginY
+        val cropW = (w - 2 * marginX).coerceAtLeast(1)
+        val cropH = (h - 2 * marginY).coerceAtLeast(1)
+
+        val cropped = Bitmap.createBitmap(src, cropX, cropY, cropW, cropH)
+        val scaled  = Bitmap.createScaledBitmap(cropped, outSize, outSize, true)
+
+        // We don’t need the intermediate cropped bitmap after scaling
+        if (cropped != src) {
+            try { cropped.recycle() } catch (_: Throwable) {}
+        }
+
+        return scaled
+    }
+
+
+
+
     // Runs on a worker thread: expand+crop ROI; call Rectifier.process() to get tiles; push tiles into DigitClassifier; flatten to 81 digits and probabilities. If successful, set 'locked', flash/shutter, and navigate to results; otherwise keep scanning.
     // Runs on a worker thread: use the 10×10 intersection lattice to cut each cell
     // from its own quadrilateral, robust to bowed or bent grid lines.
     // Use the exact expanded ROI (expandedRoiSrc) that the intersections model used.
 // This keeps point->ROI-local mapping aligned and fixes the cyan points offset.
+
+
     private fun attemptRectifyAndClassify(
         ptsSrc: List<PointF>,
-        detectorRoi: RectF,     // kept for logging if you want
+        detectorRoi: RectF,
         srcBmp: Bitmap,
-        expandedRoiSrc: Rect    // <-- the rectangle used by intersections.infer(...)
+        expandedRoiSrc: Rect
     ) {
+        val GREEN_TO_SHUTTER_MS = 150L
+        val shutterCanceled = AtomicBoolean(false)
+
+        // schedule shutter; runnable won't do anything if canceled
+        val shutterRunnable = Runnable {
+            if (!shutterCanceled.get()) {
+                overlay.playShutter(null)
+            }
+        }
+        overlay.postDelayed(shutterRunnable, GREEN_TO_SHUTTER_MS)
+
         Thread {
             var err: String? = null
             var digitsFlat: IntArray? = null
@@ -871,88 +1460,137 @@ class MainActivity : ComponentActivity() {
             var boardBmpOut: Bitmap? = null
 
             try {
-                // --- Prepare debug folder ---
                 val debugDir = getRectifyDebugDir()
                 if (!debugDir.exists()) debugDir.mkdirs()
                 clearDirectory(debugDir)
 
-                // ---- Crop the exact expanded ROI used by the model ----
+                // exact crop used by intersections
                 val leftI   = expandedRoiSrc.left.coerceIn(0, srcBmp.width - 1)
                 val topI    = expandedRoiSrc.top.coerceIn(0, srcBmp.height - 1)
                 val rightI  = expandedRoiSrc.right.coerceIn(leftI + 1, srcBmp.width)
                 val bottomI = expandedRoiSrc.bottom.coerceIn(topI + 1, srcBmp.height)
 
-                val roiBitmap = Bitmap.createBitmap(srcBmp, leftI, topI, rightI - leftI, bottomI - topI)
+                val roiBitmap = Bitmap.createBitmap(
+                    srcBmp,
+                    leftI,
+                    topI,
+                    rightI - leftI,
+                    bottomI - topI
+                )
                 saveBitmapPng(java.io.File(debugDir, "roi.png"), roiBitmap)
 
-                // Map detected points into THIS ROI’s local coordinates
                 fun toLocal(p: PointF) = PointF(p.x - leftI, p.y - topI)
                 val ptsLocal = ptsSrc.map { toLocal(it) }
 
-                // Order/repair into a strict 10×10 lattice
                 val grid10 = orderPointsInto10x10(ptsLocal)
                     ?: throw IllegalStateException("Could not form 10×10 grid (points=${ptsLocal.size})")
 
-                // Save ROI with overlaid (local) points for sanity check
+                // Visualize ordered grid points on ROI
                 saveBitmapPng(
                     java.io.File(debugDir, "roi_points.png"),
                     drawPointsOverlayOnBitmap(roiBitmap, grid10.flatten())
                 )
 
-                // Cut each cell by its own quad
+                // --- TILE WARP + CENTER CROP (Fix B) ---------------------------------
+                val CELL_SIZE = 64
+                val GRID_SIZE = 576
+                val INNER_FRAC = 0.07f   // trim 10% from each side of the warped tile
+
                 val tiles = Array(9) { rIdx ->
                     Array(9) { cIdx ->
                         val tl = grid10[rIdx][cIdx]
                         val tr = grid10[rIdx][cIdx + 1]
                         val br = grid10[rIdx + 1][cIdx + 1]
                         val bl = grid10[rIdx + 1][cIdx]
-                        warpQuadToSquare(roiBitmap, tl, tr, br, bl, CELL_SIZE, CELL_SIZE)
+
+                        // 1) Warp full quad to square
+                        val rawTile = warpQuadToSquare(
+                            roiBitmap,
+                            tl, tr, br, bl,
+                            CELL_SIZE, CELL_SIZE
+                        )
+
+                        // 2) Center-crop inner region and resize back to 64×64
+                        val croppedTile = centerCropAndResize(
+                            rawTile,
+                            INNER_FRAC,
+                            CELL_SIZE
+                        )
+
+                        // We no longer need the raw tile bitmap
+                        try { rawTile.recycle() } catch (_: Throwable) {}
+
+                        croppedTile
                     }
                 }
 
-                // Debug: save cell tiles r1c1..r9c9
-                for (rr in 0 until 9) for (cc in 0 until 9) {
-                    saveBitmapPng(java.io.File(debugDir, "cell_r${rr + 1}c${cc + 1}.png"), tiles[rr][cc])
+                // Save final tiles for inspection (these are *post* center-crop tiles)
+                for (rr in 0 until 9) {
+                    for (cc in 0 until 9) {
+                        saveBitmapPng(
+                            java.io.File(debugDir, "cell_r${rr + 1}c${cc + 1}.png"),
+                            tiles[rr][cc]
+                        )
+                    }
                 }
 
-                // Build a mosaic preview
+                // Build mosaic board (also using post-crop tiles)
                 val mosaic = Bitmap.createBitmap(GRID_SIZE, GRID_SIZE, Bitmap.Config.ARGB_8888)
                 val can = Canvas(mosaic)
-                for (rr in 0 until 9) for (cc in 0 until 9) {
-                    can.drawBitmap(tiles[rr][cc], (cc * CELL_SIZE).toFloat(), (rr * CELL_SIZE).toFloat(), null)
+                for (rr in 0 until 9) {
+                    for (cc in 0 until 9) {
+                        can.drawBitmap(
+                            tiles[rr][cc],
+                            (cc * CELL_SIZE).toFloat(),
+                            (rr * CELL_SIZE).toFloat(),
+                            null
+                        )
+                    }
                 }
                 boardBmpOut = mosaic
 
-                // Classify
+                // --- Digit classification -------------------------------------------
                 ensureDigitClassifier()
                 val (digits, confs) = digitClassifier!!.classifyTiles(tiles)
                 digitsFlat = IntArray(81) { i -> digits[i / 9][i % 9] }
                 probsFlat  = FloatArray(81) { i -> confs[i / 9][i % 9] }
 
-                // Lock & show
+                // post-rectify gates
+                val avgConf = probsFlat!!.average().toFloat()
+                val lowConfCells = probsFlat!!.count { it < 0.60f }
+
+                val postSnap = GateSnapshot(
+                    hasDetectorLock = true,
+                    gridizedOk      = true,
+                    validPoints     = ptsSrc.size,
+                    jitterPx128     = 0f,
+                    rectifyOk       = true,
+                    avgConf         = avgConf,
+                    lowConfCells    = lowConfCells
+                )
+                val sm = gate.update(postSnap)
+                runOnUiThread { changeGate(sm, "postRectify") }
+
+                // success path → keep provisional green, shutter will fire (already scheduled)
                 locked = true
-                runOnUiThread {
-                    overlay.playShutter(null)
-                    overlay.setLocked(true)
-                    changeGate(GateState.L3, "locked")
-                }
+
             } catch (t: Throwable) {
                 err = t.message ?: "$t"
-                Log.e("MainActivity", "attemptRectifyAndClassify (aligned ROI) failed", t)
+                Log.e("MainActivity", "attemptRectifyAndClassify failed", t)
             } finally {
                 handoffInProgress = false
-                if (locked && boardBmpOut != null) {
+                if (locked && boardBmpOut != null && digitsFlat != null && probsFlat != null) {
+                    // OK → go to results; shutter already scheduled/fired (or will fire)
                     runOnUiThread {
-                        showResults(
-                            boardBmpOut!!,
-                            digitsFlat ?: IntArray(81) { 0 },
-                            probsFlat  ?: FloatArray(81) { 1f }
-                        )
+                        showResults(boardBmpOut!!, digitsFlat!!, probsFlat!!)
                     }
                 } else {
+                    // FAIL → cancel shutter and softly demote to Amber
+                    shutterCanceled.set(true)
                     runOnUiThread {
+                        overlay.removeCallbacks(shutterRunnable)
                         overlay.setLocked(false)
-                        changeGate(GateState.L1, "resume_after_fail")
+                        changeGate(GateState.L2, "demote_after_fail")
                         if (err != null) {
                             Toast.makeText(this, "Rectify failed: $err", Toast.LENGTH_SHORT).show()
                         }
@@ -961,6 +1599,12 @@ class MainActivity : ComponentActivity() {
             }
         }.start()
     }
+
+
+
+
+
+
 
     // Lazy-init the TFLite digit classifier; avoids upfront load on app start.
     private fun ensureDigitClassifier() {
@@ -1030,10 +1674,9 @@ class MainActivity : ComponentActivity() {
         dir.listFiles()?.forEach { f ->
             try {
                 if (f.isDirectory) {
-                    // KEEP intersections parity packs
-                    if (!f.name.startsWith("intersections_")) {
-                        f.deleteRecursively()
-                    }
+                    // Keep intersections parity packs AND Best-of-N audit packs
+                    val keep = f.name.startsWith("intersections_") || f.name.startsWith("bestofN")
+                    if (!keep) f.deleteRecursively()
                 } else {
                     // Remove loose files (roi.png, cell_*.png, etc.)
                     f.delete()
