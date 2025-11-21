@@ -3,6 +3,33 @@ plugins {
     id 'org.jetbrains.kotlin.android' version '1.9.24'
 }
 
+
+import java.util.Properties
+
+def localPropsFile = rootProject.file("local.properties")
+def localProps = new Properties()
+if (localPropsFile.exists()) {
+    localProps.load(localPropsFile.newDataInputStream())
+}
+
+// helper: prefer -Pkey, else local.properties; supports UPPERCASE and lowercase
+def readProp = { String... keys ->
+    for (k in keys) {
+        def v = project.findProperty(k) ?: localProps.getProperty(k)
+        if (v) return v.toString().trim()
+    }
+    return ""
+}
+
+// Your file uses UPPERCASE; we also allow lowercase fallbacks
+def openAIApiKey      = readProp("OPENAI_API_KEY", "openAIApiKey")
+def azureSpeechKey    = readProp("AZURE_SPEECH_KEY", "azureSpeechKey")
+def azureSpeechRegion = readProp("AZURE_SPEECH_REGION", "azureSpeechRegion")
+
+
+
+
+
 android {
     namespace "com.contextionary.sudoku"
     compileSdk 34
@@ -19,6 +46,15 @@ android {
         externalNativeBuild {
             cmake { cppFlags "-std=c++20 -O3" }
         }
+
+        // 🔴 ADD THIS LINE: expose the key to BuildConfig
+        buildConfigField "String", "OPENAI_API_KEY", "\"${openAIApiKey}\""
+
+
+
+        // TODO: put your real key/region here or inject from local.properties/CI secrets
+        buildConfigField "String", "AZURE_SPEECH_KEY", "\"${azureSpeechKey}\""
+        buildConfigField "String", "AZURE_SPEECH_REGION", "\"${azureSpeechRegion}\""
     }
 
     packagingOptions {
@@ -46,6 +82,14 @@ android {
     androidResources {
         // keep big ML assets uncompressed
         noCompress += ["tflite", "ptl", "pt", "bin", "onnx"]
+    }
+}
+
+gradle.projectsEvaluated {
+    if (!azureSpeechKey || !azureSpeechRegion) {
+        println "⚠️  Azure TTS disabled (missing azureSpeechKey/azureSpeechRegion). Falling back to Android TTS."
+    } else {
+        println "✅  Azure TTS enabled for region: ${azureSpeechRegion}"
     }
 }
 
@@ -81,6 +125,17 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:1.1.5"
     androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
 
-    implementation "org.tensorflow:tensorflow-lite:2.14.0"
+
+
+    testImplementation 'junit:junit:4.13.2'
+
     implementation "org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0"
+
+    implementation "com.squareup.okhttp3:okhttp:4.12.0"
+
+    implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.8.0"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
+
+    implementation "com.google.android.exoplayer:exoplayer:2.19.1"
+
 }

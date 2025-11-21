@@ -37,6 +37,18 @@
 // ==============================================================================
 package com.contextionary.sudoku
 
+
+import com.contextionary.sudoku.logic.SudokuSolver
+import com.contextionary.sudoku.logic.SudokuAutoCorrector
+import com.contextionary.sudoku.logic.GridPrediction
+import com.contextionary.sudoku.logic.AutoCorrectionResult
+import com.contextionary.sudoku.SudokuConfidence
+
+
+import com.contextionary.sudoku.logic.GridState
+import com.contextionary.sudoku.logic.GridCellState
+import com.contextionary.sudoku.logic.SudokuGrid
+
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -78,7 +90,13 @@ import android.graphics.PointF
 import org.opencv.imgproc.Imgproc
 import org.opencv.core.Size as CvSize
 
+import android.content.res.ColorStateList
+//import android.content.res.ColorStateList
+import android.util.TypedValue
+import android.graphics.drawable.GradientDrawable
+        // if not already imported
 
+import com.contextionary.sudoku.logic.GridConversationCoordinator
 import android.view.View
 import android.view.ViewGroup
 import android.view.Gravity
@@ -102,8 +120,56 @@ import androidx.appcompat.view.ContextThemeWrapper
 import java.util.concurrent.atomic.AtomicBoolean
 
 
+import com.contextionary.sudoku.logic.*
+import com.contextionary.sudoku.logic.SudokuLLMConversationCoordinator
+import com.contextionary.sudoku.logic.SudokuLLMClient
+import com.contextionary.sudoku.logic.LLMRawResponse
+import com.contextionary.sudoku.logic.LLMRawAction
+import com.contextionary.sudoku.logic.FakeSudokuLLMClient
+import com.contextionary.sudoku.logic.RealSudokuLLMClient
+
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+
+import com.contextionary.sudoku.BuildConfig
+
+import android.text.TextUtils
+
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import java.util.Locale
+
+
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+
+import android.graphics.Typeface
+import android.view.HapticFeedbackConstants
+
+import androidx.lifecycle.lifecycleScope
+
+
+
+
+
+
+
+
+
+
+// TODO: move this to BuildConfig or secure storage before shipping!
+
 // The central orchestrator for camera preview, analysis, HUD, detection, corner refinement, gating, and the final capture/rectify/classify path.
 class MainActivity : ComponentActivity() {
+
+
+    // --- Sudo TTS state ---
+    private lateinit var tts: TextToSpeech
+    private var ttsReady: Boolean = false
+    private var lastUtteranceId: String? = null
+
+    private val ttsPending: MutableList<String> = mutableListOf()
 
     private lateinit var previewView: PreviewView
     private lateinit var overlay: OverlayView
@@ -117,11 +183,37 @@ class MainActivity : ComponentActivity() {
 
     private var resultsSudokuView: SudokuResultView? = null
 
+    // === Sudoku logic (solver + auto-corrector) ===
+    private val sudokuSolver = SudokuSolver()
+    private val sudokuAutoCorrector = SudokuAutoCorrector(sudokuSolver)
+    private var lastGridPrediction: GridPrediction? = null
+    private var lastAutoCorrectionResult: AutoCorrectionResult? = null
+
+    // === LLM conversation orchestration for the result grid ===
+    private val gridConversationCoordinator = GridConversationCoordinator()
+
+
+
     // === Timing / throttling ===
     private var frameIndex = 0
     private var lastInferMs = 0L
     private val minInferIntervalMs = 80L
     private val skipEvery = 0
+
+
+
+    // Azure TTS
+    //private var azureTts: SudoTtsEngine? = null
+
+    private var azureTts: AzureCloudTtsEngine? = null
+    // pick a default; we can auto-detect later
+    //private var currentLocaleTag: String = "en-US"
+
+    // MainActivity.kt — class fields
+    private var currentLocaleTag: String = java.util.Locale.getDefault().toLanguageTag()
+
+
+    private var lastGridSeverity: String = "ok" // "ok" | "mild" | "severe"
 
     // Prevents double-processing while a capture is being rectified/classified.
     @Volatile
@@ -132,9 +224,25 @@ class MainActivity : ComponentActivity() {
 
     private val gate = GateController()
 
+    // --- Audio focus for TTS ---
+    private lateinit var audioManager: AudioManager
+    private var focusRequest: AudioFocusRequest? = null
+
 
     // === MM4: results overlay state ===
     private var captureLocked = false
+
+    // Add near other overlay refs
+    private var voiceBars: SudoVoiceBarsView? = null
+
+
+    private var ccToggle: TextView? = null
+
+
+    private var tempoScale = 1.2f   // 1.0 = as-is; >1.0 = slower, <1.0 = faster
+
+    // Optional: runtime toggle for captions (you can wire a settings switch later)
+    private var showCaptions = false
 
 
     // Back-compat alias so the rest of the code compiles
@@ -168,13 +276,71 @@ class MainActivity : ComponentActivity() {
     }
 
 
+
+    /** Create a small bottom-strip picker button with white text on black. */
+    private fun createPickerButton(
+        label: String,
+        onClick: () -> Unit
+    ): MaterialButton {
+        val ctx = ContextThemeWrapper(this, R.style.Sudoku_Button_Outline)
+
+        return MaterialButton(ctx).apply {
+            text = label
+            isAllCaps = false
+
+            // 🔥 Make the label visible on black background
+            setTextColor(Color.WHITE)
+
+            // Optional but nice: white outline, transparent fill
+            strokeColor = ColorStateList.valueOf(Color.WHITE)
+            strokeWidth = 2.dp()
+            setBackgroundColor(Color.TRANSPARENT)
+
+            // Size & spacing in the strip
+            layoutParams = LinearLayout.LayoutParams(0, 40.dp(), 1f).apply {
+                setMargins(4.dp(), 4.dp(), 4.dp(), 4.dp())
+            }
+
+            setOnClickListener { onClick() }
+        }
+    }
+
+
     private var resultsRoot: FrameLayout? = null
     private var resultsImage: ImageView? = null
     private var lastBoardBitmap: Bitmap? = null
     private var lastDigits81: IntArray? = null
 
+    // For overlay editing UI
+    //private var overlayUnresolved: MutableSet<Int> = mutableSetOf()
+
+    private var overlayUnresolved: MutableSet<Int> = mutableSetOf()
+
+
+
+    // Sequence number for overlay edits (1, 2, 3, ...)
+    private var overlayEditSeq: Int = 0
+
+
+    // Cells that are allowed to be edited in the overlay.
+// Initialized from the *original* unresolvedIndices and never shrinks.
+    private var overlayEditable: MutableSet<Int> = mutableSetOf()
+
+    private var selectedOverlayIdx: Int? = null
+    private var digitPickerRow: LinearLayout? = null
+
+    // NEW: Sudo message bubble on the result overlay
+    private var sudoMessageTextView: TextView? = null
+
+
+
+
+
+
 
     private var resultsDigits: IntArray? = null
+
+
 
     private var resultsConfidences: FloatArray? = null
 
@@ -188,6 +354,34 @@ class MainActivity : ComponentActivity() {
     private val AREA_RATIO_MAX = 1.20f       // and <= 120% of detector box area
     private val SIDE_RATIO_MAX  = 1.8f       // side length max/min bound
     private val ASPECT_TOL      = 1.30f      // aspect similarity (±30% in ratio)
+
+
+
+
+
+
+    // LLM coordinator with a stub client (no real network yet).
+    // LLM coordinator using either the real OpenAI client or the fake one.
+    private val llmCoordinator: SudokuLLMConversationCoordinator by lazy {
+
+        // Toggle this if you want to go back to the fake client for offline testing.
+        val useFakeClient = false
+
+        Log.i("SudokuLLM", "BuildConfig.OPENAI_API_KEY length = ${BuildConfig.OPENAI_API_KEY.length}")
+        val llmClient: SudokuLLMClient = if (useFakeClient) {
+            FakeSudokuLLMClient()
+        } else {
+            RealSudokuLLMClient(
+                apiKey = BuildConfig.OPENAI_API_KEY,
+                model = "gpt-4o-mini"
+            )
+        }
+
+        SudokuLLMConversationCoordinator(
+            solver = sudokuSolver,
+            llmClient = llmClient
+        )
+    }
 
 
 
@@ -354,6 +548,8 @@ class MainActivity : ComponentActivity() {
         resetCaptureForFreshScan()
     }
 
+
+
     // === Best-of-N locking ===
     companion object {
         private const val STREAK_N = 4
@@ -379,7 +575,7 @@ class MainActivity : ComponentActivity() {
         private const val MIN_VALID_PTS         = 90         // intersections ≥90/100
         // private const val MAX_JITTER_PX128      = 7f         // already used in your flow
         private const val MIN_AVG_CELL_CONF     = 0.75f
-        private const val LOWCONF_CELL_THR      = 0.60f
+
         private const val MAX_LOWCONF_CELLS     = 6
     }
 
@@ -395,9 +591,18 @@ class MainActivity : ComponentActivity() {
     private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 
 
+
+
+
+
+
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
 
         previewView = findViewById(R.id.preview)
         overlay = findViewById(R.id.overlay)
@@ -438,8 +643,6 @@ class MainActivity : ComponentActivity() {
             overlay.updateCornerCropRect(null)
         }
 
-
-
         intersections = IntersectionsFinder(
             this,
             modelAsset = "models/intersections_fp16.tflite",
@@ -451,7 +654,6 @@ class MainActivity : ComponentActivity() {
         overlay.showCornerDots = false
         overlay.showIntersections = false
 
-
         analyzerExecutor = Executors.newSingleThreadExecutor()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -461,14 +663,297 @@ class MainActivity : ComponentActivity() {
         } else {
             askCameraPermission.launch(Manifest.permission.CAMERA)
         }
+
+        // --- Initialize TextToSpeech for Sudo (local fallback) ---
+        tts = TextToSpeech(this) { status: Int ->
+            ttsReady = (status == TextToSpeech.SUCCESS)
+            Log.i("SudokuTTS", "onInit status=$status ready=$ttsReady")
+            if (ttsReady) {
+                val result = tts.setLanguage(java.util.Locale.getDefault())
+                Log.i("SudokuTTS", "setLanguage result=$result")
+                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                    Log.w("SudokuTTS", "Selected TTS language not supported on this device.")
+                }
+
+                // 🔴 Make bars follow audio start/stop
+                initTtsListener()
+
+                // Drain any pending messages queued before init completed
+                if (ttsPending.isNotEmpty()) {
+                    val copy = ttsPending.toList()
+                    ttsPending.clear()
+                    copy.forEach { speakAssistant(it) }
+                }
+            } else {
+                Log.e("SudokuTTS", "TTS init failed")
+            }
+        }
+
+        // --- Initialize Azure Neural TTS (primary, if configured) ---
+        try {
+            if (BuildConfig.AZURE_SPEECH_KEY.isNotEmpty() && BuildConfig.AZURE_SPEECH_REGION.isNotEmpty()) {
+
+                //azureTts = AzureCloudTtsEngine(
+                //  context = this,
+                //    apiKey  = BuildConfig.AZURE_SPEECH_KEY,
+                //    region  = BuildConfig.AZURE_SPEECH_REGION
+                //)
+
+                azureTts = AzureCloudTtsEngine(
+                    context = this,
+                    subscriptionKey = BuildConfig.AZURE_SPEECH_KEY,
+                    region = BuildConfig.AZURE_SPEECH_REGION
+                )
+                // If you track a locale tag elsewhere, keep it; otherwise default to device:
+                // currentLocaleTag = java.util.Locale.getDefault().toLanguageTag()  // uncomment if you have this field
+                Log.i("SudokuTTS", "Azure TTS enabled (${BuildConfig.AZURE_SPEECH_REGION})")
+            } else {
+                Log.i("SudokuTTS", "Azure TTS disabled (missing key/region); using local Android TTS.")
+            }
+        } catch (t: Throwable) {
+            Log.e("SudokuTTS", "Azure TTS init failed; will use local Android TTS", t)
+        }
     }
 
+
+
+
     override fun onDestroy() {
+        // Stop any Azure playback first (if active)
+        try { azureTts?.stop() } catch (_: Throwable) {}
+
+        // Then stop local Android TTS
+        try {
+            if (::tts.isInitialized) {
+                tts.stop()
+                tts.shutdown()
+            }
+        } catch (_: Throwable) {}
+
         super.onDestroy()
+
         if (::analyzerExecutor.isInitialized) analyzerExecutor.shutdown()
         if (::shutter.isInitialized) {
             try { shutter.release() } catch (_: Throwable) {}
         }
+    }
+
+
+
+
+
+
+
+    override fun onPause() {
+        stopSpeaking()
+        super.onPause()
+    }
+
+
+    private fun requestAudioFocus(): Boolean {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ASSISTANT)    // speech from an assistant
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+
+        val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(attrs)
+            .setOnAudioFocusChangeListener { /* no-op for now */ }
+            .build()
+
+        focusRequest = req
+        val res = audioManager.requestAudioFocus(req)
+        return res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    private fun abandonAudioFocus() {
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        focusRequest = null
+    }
+
+
+    // Known-good SSML for eastus + JennyNeural. Returns (ssml, localeTag).
+    private fun buildSsml(text: String): Pair<String, String> {
+        val voiceName = "en-US-JennyNeural"
+        val localeTag = "en-US"
+
+        val safe = text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
+        val ssml = """
+        <speak version="1.0" xml:lang="$localeTag">
+          <voice name="$voiceName">
+            <prosody rate="medium" pitch="+0st">
+              $safe
+            </prosody>
+          </voice>
+        </speak>
+    """.trimIndent()
+
+        return Pair(ssml, localeTag)
+    }
+
+
+    // Speak Sudo's message (queued). Milestone 7 will set Locale per utterance.
+    private fun speakAssistant(message: String) {
+        // Build SSML (force voice + locale that Azure eastus accepts)
+        val (ssml, localeTag) = buildSsml(message)
+
+        // Stop anything currently talking
+        try { azureTts?.stop() } catch (_: Throwable) {}
+        try { tts.stop() } catch (_: Throwable) {}
+        voiceBars?.stopSpeaking()
+
+
+
+        // Azure route (with clean fallback to Android TTS)
+        if (isAzureConfigured() && azureTts?.isReady() == true) {
+            Log.i("SudokuTTS", "speakAssistant: Azure path? ${isAzureConfigured()} & ${azureTts?.isReady()==true}")
+            val engine = azureTts!!
+            lifecycleScope.launch {
+                try {
+                    engine.speakSsml(
+                        ssml = ssml,
+                        voiceName = "en-US-JennyNeural",   // must match buildSsml()
+                        localeTag = localeTag,
+                        onStart = {
+                            runOnUiThread {
+                                requestAudioFocus()
+                                voiceBars?.startSpeaking()
+                            }
+                        },
+                        onDone = {
+                            runOnUiThread {
+                                voiceBars?.stopSpeaking()
+                                abandonAudioFocus()
+                            }
+                        },
+                        onError = { err ->
+                            Log.w("SudokuTTS", "Azure speak error — falling back to Android TTS.", err)
+                            runOnUiThread { speakWithAndroidTts(message) }
+                        }
+                    )
+                } catch (t: Throwable) {
+                    Log.w("SudokuTTS", "Azure threw before playback — falling back to Android TTS.", t)
+                    runOnUiThread { speakWithAndroidTts(message) }
+                }
+            }
+        } else {
+            // Fallback: local Android TTS (works offline)
+            Log.i("SudokuTTS", "speakAssistant: using Android TTS fallback")
+            speakWithAndroidTts(message)
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+    // MainActivity.kt — ADD THIS helper anywhere in the class
+    private fun toSimpleSsml(text: String): String {
+        // Mildly humanized prosody; safe for most neural engines
+        val escaped = text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
+        return """
+        <speak version="1.0" xml:lang="${java.util.Locale.getDefault().toLanguageTag()}">
+          <prosody rate="medium" pitch="+2st">
+            $escaped
+          </prosody>
+        </speak>
+    """.trimIndent()
+    }
+
+    // MainActivity.kt — ADD THIS if missing
+    private fun speakWithAndroidTts(text: String) {
+        if (!ttsReady) {
+            Log.w("SudokuTTS", "Android TTS not ready; dropping line")
+            return
+        }
+
+        val params = Bundle()
+        val uttId = "sudo-${System.currentTimeMillis()}"
+
+        tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                runOnUiThread {
+                    requestAudioFocus()
+                    voiceBars?.startSpeaking()
+                }
+            }
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread {
+                    voiceBars?.stopSpeaking()
+                    abandonAudioFocus()
+                }
+            }
+            override fun onError(utteranceId: String?) {
+                runOnUiThread {
+                    voiceBars?.stopSpeaking()
+                    abandonAudioFocus()
+                }
+            }
+        })
+
+        tts.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
+    }
+
+
+    private fun speakWithLocalTts(message: String, utteranceId: String) {
+        val params = android.os.Bundle().apply {
+            putString(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
+        }
+        // Rate/pitch personalization can be handled elsewhere (e.g., your stylist)
+        tts.speak(message, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+    }
+
+
+    private fun speakAssistantWithAndroidTts(spokenText: String, styled: SudoVoiceStyler.Styled) {
+        try {
+            // apply per-line rate/pitch if present; else defaults (you already init them)
+            styled.speechRate?.let { tts.setSpeechRate(it) }
+            styled.pitch?.let { tts.setPitch(it) }
+
+            val id = "sudo_${System.currentTimeMillis()}"
+            lastUtteranceId = id
+            val params = android.os.Bundle()
+            params.putString("utteranceId", id)
+            tts.speak(spokenText, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, id)
+        } catch (t: Throwable) {
+            Log.e("SudokuTTS", "Local TTS failed", t)
+            voiceBars?.stopSpeaking()
+        }
+    }
+
+
+
+    private fun stopSpeaking() {
+        // Stop Azure first (if present)
+        try { azureTts?.stop() } catch (_: Throwable) {}
+
+        // Then stop local Android TTS
+        if (::tts.isInitialized) {
+            try {
+                Log.i("SudokuTTS", "stopSpeaking()")
+                tts.stop()
+            } catch (_: Throwable) { }
+        }
+
+        // Make sure visuals stop even if we didn't get an onDone()
+        voiceBars?.stopSpeaking()
+
+        // Release audio focus
+        abandonAudioFocus()
     }
 
     private fun resetCaptureForFreshScan() {
@@ -505,7 +990,7 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // NOTE: gravity CENTER to center the whole column vertically
+        // Column centered vertically
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -516,7 +1001,108 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // 1) Board view (hard-size it in post{} once we know the screen size)
+
+
+
+        // --- Voice-first header: centered voice bars + (optional) caption line ---
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 16.dp() }
+        }
+
+        // 1) Centered voice bars (hero)
+        voiceBars = SudoVoiceBarsView(this).apply {
+            id = View.generateViewId()
+            val screenW = resources.displayMetrics.widthPixels
+            val targetW = (screenW * 0.40f).toInt()   // ≈ 55% of screen width (hero, not edge-to-edge)
+            layoutParams = LinearLayout.LayoutParams(
+                targetW,
+                72.dp()
+            ).apply {
+                bottomMargin = 12.dp()
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+        header.addView(voiceBars)
+
+        voiceBars?.setMinMax(minFrac = 0.45f, maxFrac = 0.90f)
+
+        // Sudo personality tweaks
+        voiceBars?.apply {
+            // Color (pick one)
+            setBarColor(0xFFFFFFFF.toInt())          // Pure white
+            // setBarColor(0xFF00D3C0.toInt())       // Sudo teal (optional)
+
+            // Tempo: bigger = slower, calmer
+            setTempoMs(1600L)
+
+            // Breathing range: slightly restrained for elegance
+            setMinMax(minFrac = 0.30f, maxFrac = 0.85f)
+        }
+
+        // 2) Small “CC” pill to toggle captions on/off (below bars)
+        /*
+        ccToggle = TextView(this).apply {
+            text = "CC"
+            setTextColor(0xFF000000.toInt())
+            typeface = Typeface.DEFAULT_BOLD
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(10.dp(), 6.dp(), 10.dp(), 6.dp())
+            // Glassy look (tiny visual tweak)
+            background = GradientDrawable().apply {
+                cornerRadius = 12.dp().toFloat()
+                setColor(0x22FFFFFF)              // translucent white
+                setStroke(1.dp(), 0x33FFFFFF)     // subtle white border
+            }
+            alpha = if (showCaptions) 1.0f else 0.55f
+
+            setOnClickListener {
+                showCaptions = !showCaptions
+                sudoMessageTextView?.visibility = if (showCaptions) View.VISIBLE else View.GONE
+                alpha = if (showCaptions) 1.0f else 0.55f
+                try { it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP) } catch (_: Throwable) {}
+            }
+
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 4.dp()
+                bottomMargin = 4.dp()
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+        }
+        header.addView(ccToggle)
+        */
+
+        // 3) Optional one-line caption (hidden by default)
+        sudoMessageTextView = TextView(this).apply {
+            id = View.generateViewId()
+            text = ""
+            setTextColor(Color.parseColor("#DDFFFFFF"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            gravity = Gravity.CENTER
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+            visibility = if (showCaptions) View.VISIBLE else View.GONE
+        }
+        header.addView(sudoMessageTextView)
+
+        // Place header as the first element
+        container.addView(header)
+
+
+
+
+
+
+
+        // 1) Board view
         val boardView = SudokuResultView(this).apply {
             id = View.generateViewId()
             layoutParams = LinearLayout.LayoutParams(
@@ -524,12 +1110,19 @@ class MainActivity : ComponentActivity() {
                 0, // we’ll override height/width later
                 1f
             ).apply {
-                setMargins(0, 0, 0, 24.dp()) // provisional gap above buttons
+                setMargins(0, 0, 0, 24.dp())
             }
+
+            // Tap handler directly on the overlay board
+            setOnCellClickListener(object : SudokuResultView.OnCellClickListener {
+                override fun onCellClicked(row: Int, col: Int) {
+                    onOverlayCellClicked(row, col)
+                }
+            })
         }
         resultsSudokuView = boardView
 
-        // 2) Button row
+        // 2) Button row (Retake / Keep)
         val buttonsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -539,7 +1132,6 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        // Styled buttons (your styles.xml themes)
         val retakeBtnCtx = ContextThemeWrapper(this, R.style.Sudoku_Button_Outline)
         val keepBtnCtx   = ContextThemeWrapper(this, R.style.Sudoku_Button_Primary)
 
@@ -560,7 +1152,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val btnKeep = MaterialButton(keepBtnCtx).apply {
-            text = "Keep"
+            text = "Keep"   // later "Send to solver"
             isAllCaps = false
             layoutParams = LinearLayout.LayoutParams(0, 52.dp(), 1f).apply {
                 setMargins(12.dp(), 0, 0, 0)
@@ -571,22 +1163,107 @@ class MainActivity : ComponentActivity() {
         buttonsRow.addView(btnRetake)
         buttonsRow.addView(btnKeep)
 
+        // 3) Digit picker container (2 rows) under the buttons,
+        // ALWAYS takes space, but starts INVISIBLE (so showing/hiding it does not move layout).
+        digitPickerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 12.dp()  // small gap under the Retake / Keep row
+            }
+            visibility = View.INVISIBLE   // IMPORTANT: not GONE → no layout jump
+        }
+
+        // --- Helper: build a single digit chip using TextView ---
+        fun makeDigitChip(label: String, value: Int): TextView {
+            val tv = TextView(this)
+            tv.text = label
+            tv.isAllCaps = false
+            tv.setTextColor(Color.WHITE)
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            tv.gravity = Gravity.CENTER
+
+            // Oval white-stroke, transparent fill
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 999f
+                setColor(Color.TRANSPARENT)
+                setStroke(2.dp(), Color.WHITE)
+            }
+            tv.background = bg
+
+            tv.layoutParams = LinearLayout.LayoutParams(0, 40.dp(), 1f).apply {
+                setMargins(4.dp(), 0, 4.dp(), 0)
+            }
+
+            tv.isClickable = true
+            tv.isFocusable = true
+            tv.setOnClickListener { onOverlayDigitPicked(value) }
+
+            return tv
+        }
+
+        // Row 1: Clear, 1, 2, 3, 4
+        val pickerRowTop = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        pickerRowTop.addView(makeDigitChip("Clear", 0))
+        for (d in 1..4) {
+            pickerRowTop.addView(makeDigitChip(d.toString(), d))
+        }
+
+        // Row 2: 5, 6, 7, 8, 9
+        val pickerRowBottom = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = 4.dp()
+            }
+        }
+        for (d in 5..9) {
+            pickerRowBottom.addView(makeDigitChip(d.toString(), d))
+        }
+
+        digitPickerRow?.addView(pickerRowTop)
+        digitPickerRow?.addView(pickerRowBottom)
+
+        // Add everything to the container
         container.addView(boardView)
         container.addView(buttonsRow)
+        container.addView(digitPickerRow)
         resultsRoot!!.addView(container)
         (findViewById<ViewGroup>(android.R.id.content)).addView(resultsRoot)
 
-        // ---- After layout: compute a centered square, align buttons to grid ----
+        // ---- After layout: compute a centered square, align buttons & picker to grid ----
         resultsRoot!!.post {
             val rootW = resultsRoot!!.width
             val rootH = resultsRoot!!.height
 
-            val screenMargin = 24.dp()   // outer margin around composition
-            val btnHeight    = 52.dp()   // 48–56dp target
-            val gapAboveBtns = 24.dp()   // space between board & buttons
+            val screenMargin   = 24.dp()   // outer margin
+            val btnHeight      = 52.dp()   // Retake / Keep row
+            val pickerHeight   = 40.dp() * 2 + 4.dp()  // approx for two rows
+            val gapAboveBtns   = 24.dp()   // space between board & button row
+            val gapBetweenRows = 12.dp()   // space between button row & picker container
 
+            // We *reserve* max picker height so nothing moves when we toggle INVISIBLE ↔ VISIBLE
             val availW = rootW - 2 * screenMargin
-            val availH = rootH - 2 * screenMargin - btnHeight - gapAboveBtns
+            val availH = rootH -
+                    2 * screenMargin -
+                    btnHeight -
+                    pickerHeight -
+                    gapAboveBtns -
+                    gapBetweenRows
 
             val boardSize = minOf(availW, availH)
 
@@ -607,11 +1284,18 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER_HORIZONTAL
             }
 
-            // Align button row’s left/right edges with the board’s OUTER GRID BORDER.
-            // SudokuResultView uses: pad = max(16dp, 4% of view width). Recompute that here:
             val gridPad = kotlin.math.max((boardSize * 0.04f).toInt(), 16.dp())
             buttonsRow.setPadding(gridPad, 0, gridPad, 0)
             buttonsRow.requestLayout()
+
+            // Make the digit picker container match the same width & alignment
+            (digitPickerRow?.layoutParams as? LinearLayout.LayoutParams)?.apply {
+                width = boardSize
+                height = LinearLayout.LayoutParams.WRAP_CONTENT
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
+            digitPickerRow?.setPadding(gridPad, 0, gridPad, 0)
+            digitPickerRow?.requestLayout()
         }
     }
 
@@ -643,6 +1327,9 @@ class MainActivity : ComponentActivity() {
     private fun showResults(boardBitmap: Bitmap?, digits81: IntArray?, confs81: FloatArray?) {
         ensureResultsOverlay()
 
+        // Reset per-capture overlay edit sequence
+        overlayEditSeq = 0
+
         resultsDigits = digits81
         resultsConfidences = confs81
 
@@ -652,6 +1339,105 @@ class MainActivity : ComponentActivity() {
         } else {
             resultsSudokuView?.setDigits(digits81 ?: IntArray(81))
         }
+
+
+        // NEW: temporary placeholder message until LLM is wired
+        updateSudoMessage("Hi, I’m Sudo 👋 Let’s make sure I copied your puzzle correctly.")
+
+        // Apply logic annotations from the last auto-correction
+        lastAutoCorrectionResult?.let { ac ->
+            // Cells that logic still considers suspicious → red borders
+            overlayUnresolved = ac.unresolvedIndices.toMutableSet()
+
+            // Cells the user is allowed to edit in the overlay.
+            // editable = unresolved ∪ changed
+            overlayEditable.clear()
+            overlayEditable.addAll(ac.unresolvedIndices)
+            overlayEditable.addAll(ac.changedIndices)
+
+            // Apply annotations to the view:
+            //  - changedIndices  → cyan borders
+            //  - overlayUnresolved → red borders
+            resultsSudokuView?.setLogicAnnotations(
+                changed = ac.changedIndices,
+                unresolved = overlayUnresolved.toList()
+            )
+        } ?: run {
+            overlayUnresolved.clear()
+            overlayEditable.clear()
+            resultsSudokuView?.setLogicAnnotations(
+                changed = emptyList(),
+                unresolved = emptyList()
+            )
+        }
+
+        // NEW: notify the conversation coordinator of the initial post-auto-correction state
+        buildGridStateFromOverlay()?.let { state ->
+            gridConversationCoordinator.onAutoCorrectionCompleted(state)
+        }
+
+
+
+
+        // After auto-correction + overlay update, once digits are final:
+        val auto = lastAutoCorrectionResult
+        val digitsAfter = resultsDigits
+        val confsAfter = resultsConfidences
+
+        if (auto != null && digitsAfter != null) {
+            // Reuse the same conflict logic as for GridState
+            val conflictIndicesForLlm = findConflictIndicesForDigits(digitsAfter)
+
+            // NEW: compute low-confidence cells for the LLM, using the same threshold as GridConversationCoordinator
+            val lowConfidenceIndicesForLlm = mutableListOf<Int>()
+            if (confsAfter != null) {
+                for (idx in 0 until 81) {
+                    val digit = digitsAfter[idx]
+                    val conf = confsAfter[idx]
+                    if (digit != 0 && conf < SudokuConfidence.THRESH_HIGH) {
+                        lowConfidenceIndicesForLlm.add(idx)
+                    }
+                }
+            }
+
+            val llmGridState = llmCoordinator.buildLLMGridState(
+                auto = auto,
+                conflicts = conflictIndicesForLlm,
+                lowConfidenceCells = lowConfidenceIndicesForLlm
+            )
+
+            lastGridSeverity = llmGridState.severity
+
+            val humanSummary = llmCoordinator.buildHumanSummary(llmGridState)
+
+            android.util.Log.i(
+                "SudokuLLM",
+                "LLMGridState: severity=${llmGridState.severity} unique=${llmGridState.uniqueSolvable} " +
+                        "unresolved=${llmGridState.unresolvedCells.size} changed=${llmGridState.changedCells.size} " +
+                        "conflicts=${llmGridState.conflictCells.size} summary=\"${humanSummary.message}\""
+            )
+
+            lifecycleScope.launch {
+                try {
+                    val (assistantMessage, action) = llmCoordinator.sendToLLM(
+                        systemPrompt = SudokuLLMPrompts.SYSTEM_PROMPT,
+                        gridState = llmGridState,
+                        userMessage = ""  // system-initiated for now
+                    )
+
+                    android.util.Log.i(
+                        "SudokuLLM",
+                        "assistant_message=\"$assistantMessage\" action=$action"
+                    )
+
+                    handleAssistantUpdate(assistantMessage, action)
+                } catch (t: Throwable) {
+                    android.util.Log.e("SudokuLLM", "LLM call failed", t)
+                }
+            }
+        }
+
+
 
         // Make sure overlay is actually visible before animating
         resultsRoot?.apply {
@@ -666,27 +1452,138 @@ class MainActivity : ComponentActivity() {
     }
 
 
-    private fun onKeepResults() {
-        val digits = resultsDigits ?: return
-        val intent = Intent(this, ResultActivity::class.java).apply {
-            putExtra("digits", digits)
-        }
-        startActivity(intent)
-        //overridePendingTransition(0, 0)
+    // Is Azure key/region present at build time?
+    private fun isAzureConfigured(): Boolean {
+        val key = BuildConfig.AZURE_SPEECH_KEY
+        val region = BuildConfig.AZURE_SPEECH_REGION
+        return !key.isNullOrBlank() && !region.isNullOrBlank()
     }
 
-    private fun dismissResults(resumePreview: Boolean = true) {
+    // Minimal SSML escape to avoid breaking XML when using <speak> with raw text.
+    private fun ssmlEscape(s: String): String =
+        s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
+
+    private fun onKeepResults() {
+        val digits = resultsDigits ?: return
+
+        val intent = Intent(this, ResultActivity::class.java).apply {
+            putExtra("digits", digits)
+
+            resultsConfidences?.let { confs ->
+                putExtra("confidences", confs)
+            }
+
+            lastAutoCorrectionResult?.changedIndices?.let { changed ->
+                putExtra("changedIndices", changed.toIntArray())
+            }
+
+            lastAutoCorrectionResult?.unresolvedIndices?.let { unresolved ->
+                putExtra("unresolvedIndices", unresolved.toIntArray())
+            }
+        }
+
+        startActivity(intent)
+        // overridePendingTransition(0, 0)  // keep commented if you don't want animation
+    }
+
+
+
+
+    fun dismissResults(resumePreview: Boolean = true) {
+        // Stop voice (both engines) + visuals immediately
+        stopSpeaking()                  // now stops Azure + local + bars
+        sudoMessageTextView?.visibility = View.GONE
+
         resultsRoot?.visibility = View.GONE
         lastBoardBitmap = null
         lastDigits81 = null
 
+        // RESET RESULT OVERLAY STATE (important when retaking)
+        digitPickerRow?.visibility = View.INVISIBLE
+        selectedOverlayIdx = null
+        overlayEditable.clear()
+        overlayUnresolved.clear()
+        resultsSudokuView?.stopConfirmationPulse()
+
         if (resumePreview) {
             captureLocked = false
-            resumeAnalyzer() // your existing method to un-pause and continue frames
-        } else {
-            // Keep it locked. You can add a “Save / Export” flow later.
+            resumeAnalyzer()
+        }
+
+        // Put the HUD back into a neutral/ready state
+        changeGate(GateState.L1, "retake_resume")
+
+        previewView.alpha = 1f
+        overlay.alpha = 1f
+        overlay.postInvalidateOnAnimation()
+    }
+
+
+
+    private fun initTtsListener() {
+        try {
+            tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    android.util.Log.i("SudokuTTS", "onStart id=$utteranceId")
+                    runOnUiThread {
+                        // ✅ Bars start ONLY when audio actually begins
+                        voiceBars?.startSpeaking()
+                    }
+                }
+                override fun onDone(utteranceId: String?) {
+                    android.util.Log.i("SudokuTTS", "onDone id=$utteranceId")
+                    runOnUiThread {
+                        // ✅ Stop the bars exactly when audio ends
+                        voiceBars?.stopSpeaking()
+                    }
+                }
+                @Suppress("OVERRIDE_DEPRECATION")
+                override fun onError(utteranceId: String?) {
+                    android.util.Log.w("SudokuTTS", "onError id=$utteranceId")
+                    runOnUiThread { voiceBars?.stopSpeaking() }
+                }
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    android.util.Log.w("SudokuTTS", "onError id=$utteranceId code=$errorCode")
+                    runOnUiThread { voiceBars?.stopSpeaking() }
+                }
+            })
+        } catch (t: Throwable) {
+            android.util.Log.e("SudokuTTS", "Failed to set TTS listener", t)
         }
     }
+
+
+
+
+
+
+    private fun estimateTempoMsFor(message: String): Long {
+        // Rough speech model: ~13–16 chars/sec at TTS rate 1.0; clamp for extremes
+        val chars = message.length.coerceIn(20, 240)
+        val rate = try { tts.voice?.let { 1.0f } ?: 1.0f } catch (_: Throwable) { 1.0f } // customize if you let users change rate
+        val charsPerSec = 14f * rate
+        val estSec = chars / charsPerSec
+
+        // Aim for ~2.2–2.8 cycles per second for short lines, slower for long ones
+        val targetHz = when {
+            estSec < 2.0f -> 2.5f
+            estSec < 4.5f -> 2.0f
+            else -> 1.3f
+        }
+        val ms = (1000f / targetHz).toLong()
+
+        // Keep within pleasant bounds
+        return ms.coerceIn(350L, 900L)
+    }
+
+
+
+
+
+
 
     private fun resumeAnalyzer() {
         // Fully reset all scan gating
@@ -742,6 +1639,368 @@ class MainActivity : ComponentActivity() {
         }
         return out
     }
+
+
+    /**
+     * Build a GridState snapshot from the current overlay / result grid,
+     * for the conversation layer (GridConversationCoordinator).
+     *
+     * - Uses resultsDigits / resultsConfidences as the canonical board.
+     * - Uses overlayUnresolved as the set of "still doubtful" cells.
+     * - Uses lastAutoCorrectionResult.changedIndices for wasChangedByLogic.
+     * - Marks low-confidence cells using LOWCONF_CELL_THR.
+     */
+    private fun buildGridStateFromOverlay(): GridState? {
+        val digits = resultsDigits ?: return null
+        val confidences = resultsConfidences ?: return null
+        val auto = lastAutoCorrectionResult ?: return null
+
+        val digitsCopy = digits.copyOf()
+        val confidencesCopy = confidences.copyOf()
+
+        // Unresolved cells for the conversation = overlayUnresolved
+        // (seeded from auto-correct, then updated by manual edits)
+        val unresolvedIndices = overlayUnresolved.toList()
+
+        // Compute conflicts for this grid snapshot
+        val conflictIndices = findConflictIndicesForGridState(digitsCopy)
+
+        // Structural validity = "no Sudoku rule violation"
+        val isStructurallyValid = conflictIndices.isEmpty()
+
+        // Unique / multi-solution check using the solver (cap at 2 solutions)
+        val grid = SudokuGrid(digitsCopy)
+        val solutionCount = if (isStructurallyValid) {
+            sudokuSolver.countSolutions(grid.digits, maxCount = 2)
+        } else {
+            0
+        }
+        val hasUniqueSolution = (solutionCount == 1)
+        val hasMultipleSolutions = (solutionCount >= 2)
+
+        // Per-cell view
+        val cells = (0 until 81).map { idx ->
+            val row = idx / 9
+            val col = idx % 9
+            val digit = digitsCopy[idx]
+            val conf = confidencesCopy[idx]
+
+            GridCellState(
+                index = idx,
+                row = row,
+                col = col,
+                digit = digit,
+                confidence = conf,
+                isConflict = conflictIndices.contains(idx),
+                wasChangedByLogic = auto.changedIndices.contains(idx),
+                isUnresolved = unresolvedIndices.contains(idx),
+                // "low confidence" here means: same threshold as your
+                // orange/red overlay (LOWCONF_CELL_THR).
+                isLowConfidence = (digit != 0 && conf < SudokuConfidence.THRESH_HIGH)
+            )
+        }
+
+        return GridState(
+            cells = cells,
+            digits = digitsCopy,
+            confidences = confidencesCopy,
+            conflictIndices = conflictIndices,
+            changedByLogic = auto.changedIndices,
+            unresolvedIndices = unresolvedIndices,
+            isStructurallyValid = isStructurallyValid,
+            hasUniqueSolution = hasUniqueSolution,
+            hasMultipleSolutions = hasMultipleSolutions
+        )
+    }
+
+
+
+
+
+    /**
+     * For the LLM
+     * Local copy of the conflict finder used in SudokuAutoCorrector.
+     * Returns indices (0..80) of cells that participate in any row/col/box conflict.
+     */
+    private fun findConflictIndicesForDigits(digits: IntArray): List<Int> {
+        val conflicts = mutableSetOf<Int>()
+
+        // Rows
+        for (row in 0 until 9) {
+            val seen = mutableMapOf<Int, MutableList<Int>>() // digit -> indices
+            for (col in 0 until 9) {
+                val idx = row * 9 + col
+                val v = digits[idx]
+                if (v == 0) continue
+                val list = seen.getOrPut(v) { mutableListOf() }
+                list.add(idx)
+            }
+            for ((_, idxList) in seen) {
+                if (idxList.size > 1) conflicts.addAll(idxList)
+            }
+        }
+
+        // Columns
+        for (col in 0 until 9) {
+            val seen = mutableMapOf<Int, MutableList<Int>>()
+            for (row in 0 until 9) {
+                val idx = row * 9 + col
+                val v = digits[idx]
+                if (v == 0) continue
+                val list = seen.getOrPut(v) { mutableListOf() }
+                list.add(idx)
+            }
+            for ((_, idxList) in seen) {
+                if (idxList.size > 1) conflicts.addAll(idxList)
+            }
+        }
+
+        // 3x3 boxes
+        for (boxRow in 0 until 3) {
+            for (boxCol in 0 until 3) {
+                val seen = mutableMapOf<Int, MutableList<Int>>()
+                val startRow = boxRow * 3
+                val startCol = boxCol * 3
+                for (dr in 0 until 3) {
+                    for (dc in 0 until 3) {
+                        val row = startRow + dr
+                        val col = startCol + dc
+                        val idx = row * 9 + col
+                        val v = digits[idx]
+                        if (v == 0) continue
+                        val list = seen.getOrPut(v) { mutableListOf() }
+                        list.add(idx)
+                    }
+                }
+                for ((_, idxList) in seen) {
+                    if (idxList.size > 1) conflicts.addAll(idxList)
+                }
+            }
+        }
+
+        return conflicts.toList()
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+    /**
+     * For the LLM
+     * Build a GridState snapshot from the current overlay state:
+     *  - resultsDigits / resultsConfidences
+     *  - lastAutoCorrectionResult (changed + unresolved)
+     *  - overlayUnresolved (live user-edited unresolved set)
+     *  - sudokuSolver (for unique-solution check)
+     */
+    private fun findConflictIndicesForGridState(digits: IntArray): List<Int> {
+        val conflicts = mutableSetOf<Int>()
+
+        // Rows
+        for (row in 0 until 9) {
+            val seen = mutableMapOf<Int, MutableList<Int>>() // digit -> indices
+            for (col in 0 until 9) {
+                val idx = row * 9 + col
+                val v = digits[idx]
+                if (v == 0) continue
+                val list = seen.getOrPut(v) { mutableListOf() }
+                list.add(idx)
+            }
+            for ((_, idxList) in seen) {
+                if (idxList.size > 1) conflicts.addAll(idxList)
+            }
+        }
+
+        // Columns
+        for (col in 0 until 9) {
+            val seen = mutableMapOf<Int, MutableList<Int>>()
+            for (row in 0 until 9) {
+                val idx = row * 9 + col
+                val v = digits[idx]
+                if (v == 0) continue
+                val list = seen.getOrPut(v) { mutableListOf() }
+                list.add(idx)
+            }
+            for ((_, idxList) in seen) {
+                if (idxList.size > 1) conflicts.addAll(idxList)
+            }
+        }
+
+        // Boxes
+        for (boxRow in 0 until 3) {
+            for (boxCol in 0 until 3) {
+                val seen = mutableMapOf<Int, MutableList<Int>>()
+                val startRow = boxRow * 3
+                val startCol = boxCol * 3
+                for (dr in 0 until 3) {
+                    for (dc in 0 until 3) {
+                        val row = startRow + dr
+                        val col = startCol + dc
+                        val idx = row * 9 + col
+                        val v = digits[idx]
+                        if (v == 0) continue
+                        val list = seen.getOrPut(v) { mutableListOf() }
+                        list.add(idx)
+                    }
+                }
+                for ((_, idxList) in seen) {
+                    if (idxList.size > 1) conflicts.addAll(idxList)
+                }
+            }
+        }
+
+        return conflicts.toList()
+    }
+
+
+
+
+
+
+
+    // Called when the user taps a cell on the overlay SudokuResultView.
+    private fun onOverlayCellClicked(row: Int, col: Int) {
+        val idx = row * 9 + col
+
+        // Allow taps on any cell that the logic layer marked as editable:
+        // editable = unresolved ∪ changed (set up in showResults()).
+        if (!overlayEditable.contains(idx)) {
+            return
+        }
+
+        // Keep a local index of the currently-selected overlay cell
+        selectedOverlayIdx = idx
+
+        // Show the bottom digit picker strip
+        digitPickerRow?.visibility = View.VISIBLE
+    }
+
+
+    // Called when user taps "Clear" or a digit in the bottom picker strip
+    private fun onOverlayDigitPicked(value: Int) {
+        val idx = selectedOverlayIdx ?: return
+        if (resultsDigits == null || resultsConfidences == null) return
+
+        val currentDigits = resultsDigits!!
+        val currentConfs  = resultsConfidences!!
+
+        // Helper for rXcY formatting
+        fun idxToCell(i: Int): String {
+            val r = i / 9 + 1
+            val c = i % 9 + 1
+            return "r${r}c${c}"
+        }
+
+        val oldDigit = currentDigits[idx]
+
+        // 1) Apply the user's edit
+        if (value == 0) {
+            // Clear the cell
+            currentDigits[idx] = 0
+            // Treat as "user confirmed as blank"
+            currentConfs[idx] = 1.0f
+        } else {
+            // Set new digit and mark as high confidence
+            currentDigits[idx] = value
+            currentConfs[idx] = 1.0f
+        }
+
+        // 2) Visually: this cell is no longer "unresolved" → remove red border.
+        //    IMPORTANT: we do NOT touch overlayEditable, so the cell remains tappable.
+        overlayUnresolved.remove(idx)
+
+        // 3) Re-check grid unique solvability after this edit.
+        //    We enforce SudokuRules + SudokuSolver.countSolutions==1.
+        var solvable = false
+        try {
+            val grid = com.contextionary.sudoku.logic.SudokuGrid(currentDigits.copyOf())
+            val consistent = com.contextionary.sudoku.logic.SudokuRules.isGridConsistent(grid.digits)
+            val count = sudokuSolver.countSolutions(grid.digits, maxCount = 2)
+            solvable = consistent && (count == 1)
+        } catch (e: Exception) {
+            android.util.Log.e(
+                "SudokuLogic",
+                "overlayEdit: error while checking solvability after edit",
+                e
+            )
+        }
+
+        // 4) If the grid is now uniquely solvable, clear any remaining unresolved cells
+        //    so the board is visually treated as fully resolved.
+        if (solvable) {
+            overlayUnresolved.clear()
+        }
+
+        // 5) Push updated digits + confidences + annotations to the overlay view
+        resultsSudokuView?.setDigitsAndConfidences(currentDigits, currentConfs)
+
+        // Use original auto-correction changedIndices for cyan borders,
+        // and our up-to-date overlayUnresolved for red borders.
+        val changedCellsIdx = lastAutoCorrectionResult?.changedIndices ?: emptyList()
+        lastAutoCorrectionResult?.let { ac ->
+            resultsSudokuView?.setLogicAnnotations(
+                changed = ac.changedIndices,
+                unresolved = overlayUnresolved.toList()
+            )
+        } ?: run {
+            resultsSudokuView?.setLogicAnnotations(
+                changed = emptyList(),
+                unresolved = overlayUnresolved.toList()
+            )
+        }
+
+        // 6) Increment edit sequence and log the state after this edit.
+        overlayEditSeq += 1
+        val editSeq = overlayEditSeq
+        val unresolvedIdx = overlayUnresolved.toList()
+
+        android.util.Log.i(
+            "SudokuLogic",
+            "overlayEdit: edit=$editSeq idx=$idx cell=${idxToCell(idx)} " +
+                    "old=$oldDigit new=$value solvable=$solvable " +
+                    "unresolved=${unresolvedIdx.size} " +
+                    "changedCells=${changedCellsIdx.map { idxToCell(it) }} " +
+                    "unresolvedCells=${unresolvedIdx.map { idxToCell(it) }}"
+        )
+
+        // 7) Notify conversation coordinator of this manual edit
+        buildGridStateFromOverlay()?.let { state ->
+            val editEvent = com.contextionary.sudoku.logic.GridEditEvent(
+                seq = editSeq,
+                cellIndex = idx,
+                row = idx / 9,
+                col = idx % 9,
+                oldDigit = oldDigit,
+                newDigit = value,
+                timestampMs = android.os.SystemClock.elapsedRealtime()
+            )
+            gridConversationCoordinator.onManualEditApplied(state, editEvent)
+        }
+
+
+
+        // If we were in an LLM-driven confirmation state, stop the pulse
+        resultsSudokuView?.stopConfirmationPulse()
+
+        // 8) Hide the picker strip after a choice, but keep its space reserved.
+        digitPickerRow?.visibility = View.INVISIBLE
+
+
+
+
+
+
+        // 9) Clear the selection
+        selectedOverlayIdx = null
+    }
+
 
     // Optional rough warp from ROI to square board
     // Uses the 4 outer corners. If the homography fails, we fall back to the raw ROI
@@ -1491,10 +2750,10 @@ class MainActivity : ComponentActivity() {
                     drawPointsOverlayOnBitmap(roiBitmap, grid10.flatten())
                 )
 
-                // --- TILE WARP + CENTER CROP (Fix B) ---------------------------------
+                // --- TILE WARP + CENTER CROP -------------------------------------------
                 val CELL_SIZE = 64
                 val GRID_SIZE = 576
-                val INNER_FRAC = 0.07f   // trim 10% from each side of the warped tile
+                val INNER_FRAC = 0.07f   // trim ~7% from each side of the warped tile
 
                 val tiles = Array(9) { rIdx ->
                     Array(9) { cIdx ->
@@ -1551,13 +2810,68 @@ class MainActivity : ComponentActivity() {
 
                 // --- Digit classification -------------------------------------------
                 ensureDigitClassifier()
-                val (digits, confs) = digitClassifier!!.classifyTiles(tiles)
-                digitsFlat = IntArray(81) { i -> digits[i / 9][i % 9] }
-                probsFlat  = FloatArray(81) { i -> confs[i / 9][i % 9] }
+                val (digits, confs, fullProbs) = digitClassifier!!.classifyTilesWithProbs(tiles)
 
-                // post-rectify gates
-                val avgConf = probsFlat!!.average().toFloat()
-                val lowConfCells = probsFlat!!.count { it < 0.60f }
+                // Flatten 9×9 -> 81 (row-major)
+                val flatDigits = IntArray(81) { i -> digits[i / 9][i % 9] }
+                val flatConfs  = FloatArray(81) { i -> confs[i / 9][i % 9] }
+
+                // Build GridPrediction summary (for Sudoku logic & auto-correction).
+                val gridPrediction = GridPrediction.fromFlat(
+                    flatDigits,
+                    flatConfs,
+                    lowConfThreshold = 0.60f
+                )
+                lastGridPrediction = gridPrediction
+
+                // Run auto-correction / validation layer with full per-class probs.
+                val autoResult = sudokuAutoCorrector.autoCorrect(gridPrediction, fullProbs)
+                lastAutoCorrectionResult = autoResult
+
+                // --- Logging: Sudoku validity & uncertainty -------------------------
+                run {
+                    val tag = "SudokuLogic"
+
+                    val initialConflicts = autoResult.hadConflictsInitially
+                    val initialSolvable  = autoResult.initiallySolvable
+                    val finalSolvable    = autoResult.wasSolvable
+
+                    val changedCount = autoResult.changedIndices.size
+                    val changedSample = autoResult.changedIndices
+                        .take(10)
+                        .joinToString(",") { idx ->
+                            val r = idx / 9 + 1
+                            val c = idx % 9 + 1
+                            "r${r}c${c}"
+                        }
+
+                    val unresolvedCount = autoResult.unresolvedIndices.size
+                    val unresolvedSample = autoResult.unresolvedIndices
+                        .take(10)
+                        .joinToString(",") { idx ->
+                            val r = idx / 9 + 1
+                            val c = idx % 9 + 1
+                            "r${r}c${c}"
+                        }
+
+                    android.util.Log.i(
+                        tag,
+                        "autoCorrect: " +
+                                "before={hadConflicts=$initialConflicts, solvable=$initialSolvable} " +
+                                "after={solvable=$finalSolvable, changed=$changedCount, unresolved=$unresolvedCount} " +
+                                "changedCells=[$changedSample] " +
+                                "unresolvedCells=[$unresolvedSample]"
+                    )
+                }
+
+                // Use the corrected grid for UI & navigation.
+                val correctedDigits = autoResult.correctedGrid.digits
+                digitsFlat = correctedDigits
+                probsFlat  = flatConfs
+
+                // post-rectify gates (still driven by confidences only)
+                val avgConf = gridPrediction.avgConfidence
+                val lowConfCells = gridPrediction.lowConfidenceCount
 
                 val postSnap = GateSnapshot(
                     hasDetectorLock = true,
@@ -1792,6 +3106,105 @@ class MainActivity : ComponentActivity() {
         val h = r.height().coerceAtLeast(1f)
         return w / h
     }
+
+
+
+
+
+
+
+
+
+    private fun updateSudoMessage(text: String?) {
+        runOnUiThread {
+            val tv = sudoMessageTextView ?: return@runOnUiThread
+            if (text.isNullOrBlank()) {
+                tv.text = ""
+                tv.visibility = View.INVISIBLE
+            } else {
+                tv.text = text
+                tv.visibility = View.VISIBLE
+            }
+        }
+    }
+
+
+
+
+
+
+    private fun handleAssistantUpdate(assistantMessage: String, action: LLMAction) {
+        // Voice-first: captions (if any) are updated inside speakAssistant()
+        speakAssistant(assistantMessage)
+
+        // Handle the structured action
+        when (action) {
+            is LLMAction.RetakePhoto -> {
+                Toast.makeText(this, "Sudo suggests retaking the photo.", Toast.LENGTH_SHORT).show()
+            }
+            is LLMAction.ValidateGrid -> {
+                Toast.makeText(this, "Sudo thinks the grid looks good!", Toast.LENGTH_SHORT).show()
+            }
+            is LLMAction.ChangeCell -> {
+                Log.i("SudokuLLM", "ChangeCell suggested but not yet wired to UI: $action")
+            }
+            is LLMAction.AskUserConfirmation -> {
+                handleAskUserConfirmation(action)
+            }
+            is LLMAction.NoAction -> { /* no-op */ }
+            is LLMAction.Unknown -> {
+                Log.w("SudokuLLM", "Unknown LLMAction from model: ${action.raw}")
+            }
+        }
+    }
+
+
+
+    /**
+     * Handle an AskUserConfirmation action from the LLM:
+     *  - highlight the target cell with a pulsing border
+     *  - show the bottom digit picker strip
+     *  - select that cell for the next digit tap
+     */
+    private fun handleAskUserConfirmation(action: LLMAction.AskUserConfirmation) {
+        var idx = action.row * 9 + action.col
+        if (idx !in 0..80) return
+        if (resultsDigits == null || resultsConfidences == null || resultsSudokuView == null) return
+
+        // If the chosen cell is NOT actually doubtful, redirect to a better candidate:
+        val digit = resultsDigits!![idx]
+        val conf  = resultsConfidences!![idx]
+        val isChangedByLogic = lastAutoCorrectionResult?.changedIndices?.contains(idx) == true
+        val isLowConf = (digit != 0 && conf < SudokuConfidence.THRESH_HIGH)
+
+        if (!isChangedByLogic && !isLowConf) {
+            // Prefer: first low-confidence, else first logic-changed, else keep original
+            val betterIdx =
+                (0 until 81).firstOrNull { i ->
+                    val d = resultsDigits!![i]
+                    val c = resultsConfidences!![i]
+                    (d != 0 && c < SudokuConfidence.THRESH_HIGH)
+                } ?: lastAutoCorrectionResult?.changedIndices?.firstOrNull()
+
+            if (betterIdx != null) idx = betterIdx
+        }
+
+        // Allow user to edit/tap this cell, but DO NOT mark as "unresolved" (no red border)
+        overlayEditable.add(idx)
+
+        // Track selection for the digit picker
+        selectedOverlayIdx = idx
+
+        // Pulse highlight only (keeps the visual distinct from true unresolved/red)
+        resultsSudokuView?.startConfirmationPulse(idx)
+
+        // Show the picker strip at the bottom (we reuse the existing Clear/1–9 row)
+        digitPickerRow?.visibility = View.VISIBLE
+    }
+
+
+
+
 
 
     /**

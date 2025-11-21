@@ -87,6 +87,8 @@ class DigitClassifier(
         Log.i(TAG, "Preproc: normalize=$APPLY_NORMALIZATION, calibrated_softmax=$APPLY_CALIBRATED_SOFTMAX (T=$CALIB_T)")
     }
 
+
+
     /**
      * Classify a grid of cell bitmaps. Each tile should be the **raw rectified cell crop**
      * (pre-resize), preferably ~80–120 px square. We handle resize to model input (28×28).
@@ -103,6 +105,56 @@ class DigitClassifier(
         val outDigits = Array(9) { IntArray(9) }
         val outProbs  = Array(9) { FloatArray(9) }
 
+        // Reuse shared core that can also (optionally) fill full per-class distributions.
+        runClassificationCore(
+            tiles = tiles,
+            outDigits = outDigits,
+            outTop1Probs = outProbs,
+            outFullProbs = null  // only top-1 needed for this API
+        )
+
+        return Pair(outDigits, outProbs)
+    }
+
+    /**
+     * Extended classification API that also returns a [9][9][10] tensor of probabilities
+     * per cell and per digit class (0..9).
+     *
+     * - digits[r][c]      = argmax class (0..9)
+     * - probs[r][c]       = probability of that top-1 class
+     * - fullProbs[r][c][k]= probability for digit k (0..9) after (calibrated) softmax
+     */
+    fun classifyTilesWithProbs(
+        tiles: Array<Array<Bitmap>>,
+        innerCrop: Float = 0.92f
+    ): Triple<Array<IntArray>, Array<FloatArray>, Array<Array<FloatArray>>> {
+
+        val outDigits = Array(9) { IntArray(9) }
+        val outProbs  = Array(9) { FloatArray(9) }
+        val fullProbs = Array(9) { Array(9) { FloatArray(10) } }
+
+        runClassificationCore(
+            tiles = tiles,
+            outDigits = outDigits,
+            outTop1Probs = outProbs,
+            outFullProbs = fullProbs  // we want full per-class distributions
+        )
+
+        return Triple(outDigits, outProbs, fullProbs)
+    }
+
+    /**
+     * Shared core: runs TFLite once per tile and fills:
+     *  - outDigits[r][c]      = top-1 digit
+     *  - outTop1Probs[r][c]   = probability of that digit
+     *  - outFullProbs[r][c][] = full distribution over 10 classes (if not null)
+     */
+    private fun runClassificationCore(
+        tiles: Array<Array<Bitmap>>,
+        outDigits: Array<IntArray>,
+        outTop1Probs: Array<FloatArray>,
+        outFullProbs: Array<Array<FloatArray>>? // may be null if caller only wants top-1
+    ) {
         val parityDir: File? = if (dumpParity) {
             val stamp = android.text.format.DateFormat.format("yyyyMMdd_HHmmss", java.util.Date())
             File(dumpRoot, "parity_${dumpSessionTag}_$stamp").apply {
@@ -111,6 +163,7 @@ class DigitClassifier(
             }
         } else null
 
+        // Per-tile classification
         for (r in 0 until 9) {
             for (c in 0 until 9) {
                 val tileRaw = tiles[r][c]
@@ -128,6 +181,7 @@ class DigitClassifier(
                     interpreter.run(pre.postNormNHWC, logits2d)
                 }
                 val logits = logits2d[0]
+
                 val probs = if (APPLY_CALIBRATED_SOFTMAX) {
                     softmaxCalibrated(logits, CALIB_T)
                 } else {
@@ -135,25 +189,44 @@ class DigitClassifier(
                 }
 
                 val bestIdx = argmax(probs)
-                outDigits[r][c] = bestIdx
-                outProbs[r][c]  = probs[bestIdx]
+                val bestProb = probs[bestIdx]
+
+                outDigits[r][c]    = bestIdx
+                outTop1Probs[r][c] = bestProb
+
+                // If caller wants full distributions, copy them.
+                if (outFullProbs != null) {
+                    val dest = outFullProbs[r][c]
+                    // dest is FloatArray(10)
+                    for (k in 0 until 10) {
+                        dest[k] = probs[k]
+                    }
+                }
 
                 if (doDump && parityDir != null) {
                     writeText(File(parityDir, "${tag}_logits.txt"), logits.joinToString(","))
                     writeText(File(parityDir, "${tag}_probsCal.txt"), probs.joinToString(","))
                 }
 
-                Log.d(TAG, "tile[$r,$c] -> pred=$bestIdx p=${"%.3f".format(outProbs[r][c])}")
+                Log.d(TAG, "tile[$r,$c] -> pred=$bestIdx p=${"%.3f".format(bestProb)}")
             }
         }
 
-        // Histogram for sanity
+        // Histogram for sanity (based on top-1 digits)
         val hist = IntArray(10)
-        for (r in 0 until 9) for (c in 0 until 9) hist[outDigits[r][c]]++
+        for (r in 0 until 9) {
+            for (c in 0 until 9) {
+                val d = outDigits[r][c]
+                if (d in 0..9) hist[d]++
+            }
+        }
         Log.i(TAG, "Class histogram (0..9) after batch: ${hist.joinToString(",")}  total=${hist.sum()}")
-
-        return Pair(outDigits, outProbs)
     }
+
+
+
+
+
 
     /**
      * Preprocess a single tile:
