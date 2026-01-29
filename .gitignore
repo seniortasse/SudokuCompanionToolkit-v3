@@ -52,20 +52,21 @@ python/mobile/android/app/src/main/cpp/third_party/opencv*.zip
 # --- Native/NDK compiled libs (covered by build/, but explicit for safety)
 **/jniLibs/*.so
 
-# --- ML artifacts & datasets
+# --- datasets and models
 runs/
 datasets/
-checkpoints/
+debug/
+models/
+exports/
+
+*.tflite
+*.onnx
 *.pt
 *.pth
-*.onnx
-*.tflite
+*.ckpt
 *.pb
-*.engine
-*.npy
-*.npz
-*.pkl
-*.h5
+saved_model.pb
+
 
 # --- Python caches
 # Python caches/virtualenvs; not source.
@@ -123,8 +124,5 @@ python/mobile/android/app/src/main/cpp/third_party/OpenCV-android-sdk/
 python/demo_export/
 python/vision/data/
 python/vision/export/
-
-python/solver - OLD/
-python/sudoku generator/
-python/sudoku solver/
+python/mobile/android/logcat_crash.txt
 

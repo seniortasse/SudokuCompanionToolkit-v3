@@ -6,7 +6,7 @@ package com.contextionary.sudoku.logic
  * - digits: 81-length IntArray (row-major, 0 = empty)
  * - confidences: 81-length FloatArray (0.0f..1.0f)
  * - avgConfidence: mean of confidences
- * - lowConfidenceCount: how many cells are below [lowConfidenceThreshold] at creation time
+ * - lowConfidenceCount: how many cells are below [lowConfThreshold] at creation time
  * - lowConfidenceIndices: indices [0..80] of those low-confidence cells (row * 9 + col)
  */
 data class GridPrediction(

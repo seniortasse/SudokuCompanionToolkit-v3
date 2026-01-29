@@ -2,6 +2,8 @@ package com.contextionary.sudoku
 
 import android.app.Application
 import android.util.Log
+//import org.opencv.core.Core
+//import org.opencv.android.OpenCVLoader
 import org.opencv.core.Core
 
 class App : Application() {

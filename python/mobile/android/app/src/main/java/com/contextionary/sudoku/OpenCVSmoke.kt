@@ -8,6 +8,8 @@ import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Point
+import org.opencv.core.Size
 
 object OpenCVSmoke {
     private const val TAG = "SudokuSmoke"
