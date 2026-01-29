@@ -3,8 +3,24 @@ plugins {
     id 'org.jetbrains.kotlin.android' version '1.9.24'
 }
 
+//// Locate the vendored OpenCV Android SDK ////
+// We look under the app module first (preferred), then fall back to repo root.
+def openCvCandidates = [
+        file("${rootProject.projectDir}/app/src/main/cpp/third_party/OpenCV-android-sdk/sdk"),
+        file("${rootProject.projectDir}/app/src/main/cpp/third-party/OpenCV-android-sdk/sdk"),
+        file("${rootProject.projectDir}/third_party/OpenCV-android-sdk/sdk")
+]
+def opencvSdkRootFile = openCvCandidates.find { it.exists() }
+def opencvSdkRoot = opencvSdkRootFile ? opencvSdkRootFile.absolutePath.replace('\\','/') : null
+if (!opencvSdkRoot) {
+    println "❌ OpenCV SDK not found for :openCV module. Expected one of:\n" +
+            openCvCandidates.collect { " - ${it}" }.join("\n")
+} else {
+    println "✅ [:openCV] Using OpenCV SDK at: ${opencvSdkRoot}"
+}
+
 android {
-    namespace "org.opencv"           // This matches the SDK’s Java package expectations
+    namespace "org.opencv"    // must match OpenCV Java package
     compileSdk 34
 
     defaultConfig {
@@ -15,18 +31,22 @@ android {
 
     buildFeatures { buildConfig = true }
 
-    // Point this wrapper module to the SDK contents shipped in your repo/CI
+    // Wire the OpenCV Java sources, resources, jniLibs, and optional assets
     sourceSets {
         getByName("main") {
-            // Java API sources and resources (attrs, layouts, etc.)
-            java.srcDir    "../app/src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/src"
-            res.srcDir     "../app/src/main/cpp/third_party/OpenCV-android-sdk/sdk/java/res"
+            if (opencvSdkRoot) {
+                java.srcDir     "${opencvSdkRoot}/java/src"
+                res.srcDir      "${opencvSdkRoot}/java/res"
+                jniLibs.srcDir  "${opencvSdkRoot}/native/libs"
+                assets.srcDir   "${opencvSdkRoot}/etc"   // ok if missing
+            }
+        }
+    }
 
-            // Native .so files for each ABI provided by the SDK
-            jniLibs.srcDir "../app/src/main/cpp/third_party/OpenCV-android-sdk/sdk/native/libs"
-
-            // Optional OpenCV assets (safe if missing)
-            assets.srcDir  "../app/src/main/cpp/third_party/OpenCV-android-sdk/sdk/etc"
+    // If you only ship arm64-v8a, exclude the others to keep the AAR slim
+    packagingOptions {
+        jniLibs {
+            excludes += ["**/armeabi/**", "**/armeabi-v7a/**", "**/x86/**", "**/x86_64/**"]
         }
     }
 
@@ -35,15 +55,8 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = '17' }
-
-    // If you only ship arm64:
-    packagingOptions {
-        jniLibs {
-            excludes += ["**/armeabi/**", "**/armeabi-v7a/**", "**/x86/**", "**/x86_64/**"]
-        }
-    }
 }
 
 dependencies {
-    // No external deps needed for the wrapper
+    // No external deps required for the OpenCV wrapper
 }

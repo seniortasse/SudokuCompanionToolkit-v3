@@ -1,3 +1,8 @@
+message(STATUS "USING OpenCV_DIR='${OpenCV_DIR}'")
+file(GLOB _probe "${OpenCV_DIR}/*")
+message(STATUS "CONTENTS of OpenCV_DIR: ${_probe}")
+
+
 cmake_minimum_required(VERSION 3.22.1)
 project(sudoku_native)
 

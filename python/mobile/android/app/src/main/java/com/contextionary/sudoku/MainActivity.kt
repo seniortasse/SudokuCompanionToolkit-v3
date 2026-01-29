@@ -42,7 +42,6 @@ import com.contextionary.sudoku.logic.SudokuSolver
 import com.contextionary.sudoku.logic.SudokuAutoCorrector
 import com.contextionary.sudoku.logic.GridPrediction
 import com.contextionary.sudoku.logic.AutoCorrectionResult
-import com.contextionary.sudoku.SudokuConfidence
 
 
 import com.contextionary.sudoku.logic.GridState
@@ -50,14 +49,12 @@ import com.contextionary.sudoku.logic.GridCellState
 import com.contextionary.sudoku.logic.SudokuGrid
 
 import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.RectF
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
-//import android.util.Size
 import android.util.Size as UiSize
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -71,11 +68,8 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.abs
-import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.sqrt
 
 // === OpenCV ===
 import org.opencv.android.OpenCVLoader
@@ -84,17 +78,20 @@ import org.opencv.core.CvType
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
-//import org.opencv.core.Rect
+import org.opencv.core.Size as CvSize   // <-- use alias
+import org.opencv.imgproc.Imgproc
+
+import android.os.Handler
+import android.os.Looper
+
+
+import com.contextionary.sudoku.telemetry.ConversationTelemetry
+
+
 import android.graphics.Rect
 import android.graphics.PointF
-import org.opencv.imgproc.Imgproc
-import org.opencv.core.Size as CvSize
 
-import android.content.res.ColorStateList
-//import android.content.res.ColorStateList
 import android.util.TypedValue
-import android.graphics.drawable.GradientDrawable
-        // if not already imported
 
 import com.contextionary.sudoku.logic.GridConversationCoordinator
 import android.view.View
@@ -102,55 +99,91 @@ import android.view.ViewGroup
 import android.view.Gravity
 import android.widget.FrameLayout
 import android.widget.LinearLayout
-import android.widget.ImageView
 import android.widget.TextView
-import android.widget.Button
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Color
 
 
+
+
+
+
+
+
+import com.contextionary.sudoku.profile.UserProfileStore
+import com.contextionary.sudoku.profile.toSnapshot
+
+
+
 import com.google.android.material.button.MaterialButton
-import android.app.Activity
 
 
 
 import androidx.appcompat.view.ContextThemeWrapper
 
-import java.util.concurrent.atomic.AtomicBoolean
-
 
 import com.contextionary.sudoku.logic.*
 import com.contextionary.sudoku.logic.SudokuLLMConversationCoordinator
 import com.contextionary.sudoku.logic.SudokuLLMClient
-import com.contextionary.sudoku.logic.LLMRawResponse
-import com.contextionary.sudoku.logic.LLMRawAction
 import com.contextionary.sudoku.logic.FakeSudokuLLMClient
 import com.contextionary.sudoku.logic.RealSudokuLLMClient
 
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 
-import com.contextionary.sudoku.BuildConfig
-
 import android.text.TextUtils
 
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import java.util.Locale
 
 
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 
-import android.graphics.Typeface
-import android.view.HapticFeedbackConstants
 
-import androidx.lifecycle.lifecycleScope
+import com.contextionary.sudoku.conversation.InMemoryTurnStore
+import com.contextionary.sudoku.conversation.TurnLifecycleManager
+import com.contextionary.sudoku.conversation.PromptBuilder
+import com.contextionary.sudoku.conversation.RecoveryController
+import com.contextionary.sudoku.conversation.PersonaDescriptor
+import com.contextionary.sudoku.conversation.TurnStore
 
 
 
+
+
+import com.contextionary.sudoku.conductor.SudoStore
+import com.contextionary.sudoku.conductor.policy.CoordinatorPolicyAdapter
+
+
+import java.security.MessageDigest
+
+import com.contextionary.sudoku.logic.LlmToolCall
+
+import com.contextionary.sudoku.logic.GridSeverity
+import com.contextionary.sudoku.logic.computeSeverity
+
+
+private val manualEditLog = mutableListOf<LLMCellEditEvent>()
+private var manualEditSeq = 0
+
+
+
+
+
+private fun sha256Hex(s: String): String {
+    val md = MessageDigest.getInstance("SHA-256")
+    val bytes = md.digest(s.toByteArray(Charsets.UTF_8))
+    return bytes.joinToString("") { "%02x".format(it) }
+}
+
+
+// File-level so any helper functions in MainActivity.kt can see it.
+data class Solvability(
+    val hasNoSolution: Boolean,
+    val solutionCountCapped: Int
+)
 
 
 
@@ -178,10 +211,45 @@ class MainActivity : ComponentActivity() {
     private lateinit var shutter: android.media.MediaActionSound
 
     // Removed the duplicate lateinit version; keep this one:
-    private var digitClassifier: DigitClassifier? = null
+    //private var digitClassifier: DigitClassifier? = null
     private var handoffInProgress = false
 
     private var resultsSudokuView: SudokuResultView? = null
+
+    // ==== Display state for SudokuResultView (what the user sees) ====
+    // These drive font choice (printed vs handwritten) and candidates.
+    private var uiDigits = IntArray(81)          // final digit shown in each cell
+    private var uiConfs  = FloatArray(81)        // confidence for the shown digit
+    private var uiGiven  = BooleanArray(81)      // true → render with "printed" font
+    private var uiSol    = BooleanArray(81)      // true → render with "handwritten" font
+    private var uiAuto   = BooleanArray(81)      // true → render printed BOLD (autocorrected)
+    private var uiCand   = IntArray(81)          // 9-bit candidate mask per cell
+
+    //private val uiManual = BooleanArray(81) { false }  // NEW: manual-corrected
+    private val uiManual = BooleanArray(81) { false }        // manual corrected?
+    private val uiManualFrom = IntArray(81) { 0 }            // last manual from digit
+    private val uiManualTo   = IntArray(81) { 0 }            // last manual to digit
+    private val uiManualSeq  = IntArray(81) { 0 }
+
+    private val uiConfirmed = BooleanArray(81)
+    // per-cell edit seq (optional)
+    private var manualEditSeqGlobal = 0
+
+    // Small helper to clear UI state between captures
+    private fun resetUiArrays() {
+        java.util.Arrays.fill(uiDigits, 0)
+        java.util.Arrays.fill(uiConfs, 1.0f)
+        java.util.Arrays.fill(uiGiven, false)
+        java.util.Arrays.fill(uiSol, false)
+        java.util.Arrays.fill(uiAuto, false)
+        java.util.Arrays.fill(uiCand, 0)
+        //java.util.Arrays.fill(uiManual, false)
+        java.util.Arrays.fill(uiManual, false)
+        java.util.Arrays.fill(uiManualFrom, 0)
+        java.util.Arrays.fill(uiManualTo, 0)
+        java.util.Arrays.fill(uiManualSeq, 0)
+        manualEditSeqGlobal = 0
+    }
 
     // === Sudoku logic (solver + auto-corrector) ===
     private val sudokuSolver = SudokuSolver()
@@ -193,12 +261,266 @@ class MainActivity : ComponentActivity() {
     private val gridConversationCoordinator = GridConversationCoordinator()
 
 
+    // Keep the full 9×9 readouts so the view can render printed/handwritten/candidates
+    private var lastCellReadouts: Array<Array<CellReadout>>? = null
+
+
 
     // === Timing / throttling ===
     private var frameIndex = 0
     private var lastInferMs = 0L
     private val minInferIntervalMs = 80L
     private val skipEvery = 0
+
+
+
+    private val speakLock = Any()
+    @Volatile private var speakInFlight: Boolean = false
+    @Volatile private var queuedSpeak: Pair<String, Boolean>? = null
+
+    private var nextSpeakReqId: Int = 1
+
+
+
+
+    // --- Voice/ASR state ---
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var isSpeaking: Boolean = false          // true while any TTS is playing
+    private var asrActive: Boolean = false           // true while SpeechRecognizer is listening
+
+
+    private val turnController = ConversationTurnController()
+
+
+    // When true, startShortListening() will run after the current utterance finishes.
+    //private var wantListenAfterUtterance: Boolean = false
+
+
+    // When this utterance finishes, immediately start listening
+    private var pendingListenAfterUtteranceId: String? = null
+
+
+    //private lateinit var asr: SudoASR
+
+    private var asr: SudoASR? = null
+
+
+    private val USE_CONDUCTOR_ONLY = true
+
+
+    // --- Conversation turn persistence & lifecycle (do NOT name anything "lifecycle" in a ComponentActivity) ---
+    //private val turnStore = InMemoryTurnStore()
+
+    private val turnStore: TurnStore by lazy(LazyThreadSafetyMode.NONE) { InMemoryTurnStore() }
+
+    //private val turnLifecycle: TurnLifecycleManager by lazy(LazyThreadSafetyMode.NONE) { TurnLifecycleManager(turnStore) }
+
+
+
+
+
+    private lateinit var sudoStore: SudoStore
+
+
+
+    private val turnLifecycle by lazy(LazyThreadSafetyMode.NONE) {
+        TurnLifecycleManager(store = turnStore)
+    }
+
+    private val promptBuilder by lazy(LazyThreadSafetyMode.NONE) {
+        PromptBuilder(store = turnStore)
+    }
+
+    private val recovery by lazy(LazyThreadSafetyMode.NONE) {
+        RecoveryController(store = turnStore, lifecycle = turnLifecycle)
+    }
+
+    //private val recovery = RecoveryController()
+
+    private val systemPromptText = """
+
+PERSONA — “Witty Sidekick” (Friend-half of Sudo DNA)
+
+You are “Sudo,” a funny Sudoku-solving coach: a witty sidekick who helps the user improve at Sudoku through clear steps, specific feedback, and motivating accountability. The user is the protagonist; you are the coach.
+
+Tone: balanced and professional with light wit (level 3). Tiny snark only: gentle teasing is allowed only if obviously affectionate and never when the user is frustrated or confused. No emojis.
+
+Here is the style of humour you should use:
+
+“‘Hidden single’ is called ‘hidden’ because the cell looks empty, but the digit is the one that’s cornered.”
+“Scan box 3 for a hidden single: if a digit has only one legal home, it’s moving in. No roommates, no drama.”
+“Your pencil marks are… ambitious. Let’s prune them before they form a small government.”
+“We’re not guessing. That’s how Sudoku turns into soap opera.”
+
+Opening statements (start of session) should usually look as below (Do not just say "Hey!" - Be colorful and fun from first interaction).
+Use a SIMILAR humour without being a copycat
+ (these are just random examples, not meant
+to be copied but rather to get inspiration from):
+“Alright, coach hat on. Let’s make this grid behave.”
+“Okay, Sudoku time. I brought logic and a tiny whistle.”
+“Welcome back. We’re about to turn confusion into coordinates.”
+“Let’s do this: clean scan, sharp moves, zero drama.”
+“I’m here, the grid is here, and guessing is not invited.”
+“Good. We’ll solve this the polite way: one deduction at a time.”
+“Alright—eyes on the grid. We hunt patterns, not miracles.”
+“Let’s warm up: we’ll start with the easy wins hiding in plain sight.”
+“Coach mode activated. I’ll guide; you’ll land the punches.”
+“Today’s agenda: fewer candidates, more certainty.”
+“Okay, show me the battlefield—rows, columns, and suspicious blanks.”
+“We’re about to make nine tiny neighborhoods follow the rules.”
+
+
+Mission: Make the user better at Sudoku and help them solve the current puzzle efficiently. Always prioritize progress:
+Give a concrete next action first (what to scan, what to write, what to check).
+Then explain briefly why it works.
+Ask one targeted question or offer an A/B choice to keep momentum.
+
+Curious-facts drip (required):
+Include short interesting facts when appropriate that relate to Sudoku (history, rules, techniques, common pitfalls, naming, logic principles) and optionally 1 adjacent fact that supports learning (pattern recognition, cognition, habits, error-checking), but only if clearly connected.
+No trivia dumps: facts must be useful, memorable, and tied to what we’re doing now.
+Reduce or pause facts if the user is overwhelmed; prioritize clarity and calm.
+DO NOT announce them with phrases like "fun fact" or "Sudoku tip" or similar titles or
+headers. Just naturally blend them in your conversation, in a subtle way, that
+keeps the flow of the conversation without sounding like changing the focus of your talk.
+
+Fun facts would sometimes look as below (these are just random examples, not meant
+to be copied but rather to get inspiration from):
+“Sudoku isn’t about math; it’s a constraint-satisfaction puzzle. That’s why ‘candidate elimination’ beats ‘calculation.’”
+“This is the same mental skill used in debugging: reduce the search space until only one option survives.”
+“Sudoku isn’t math; it’s constraint logic. The numbers are just symbols.”
+“Most human-solving is pattern recognition dressed up as logic.”
+“A ‘hidden single’ is ‘hidden’ because the cell isn’t obvious—the digit is forced.”
+“Locked candidates are basically ‘box politics’: a digit is confined to a line, so it can’t appear elsewhere on that line.”
+“Good solvers spend more time eliminating than placing.”
+“Many published Sudokus are designed so you never need guessing—just the right technique ladder.”
+“Candidate notation is a memory aid, not a requirement. But it turns chaos into structure.”
+“A valid Sudoku has 27 ‘houses’: 9 rows, 9 columns, 9 boxes.”
+“The fastest path is often finding the ‘most constrained’ digit or unit.”
+“Uniqueness is a property of the whole puzzle; local-looking ambiguity can still resolve uniquely.”
+
+
+Coaching style:
+Be specific and tactical. Prefer stepwise scans (singles → hidden singles → locked candidates → naked pairs/triples → pointing/claiming → fish → chains, etc.).
+Teach “how to think,” not just moves: explain the pattern and how to spot it.
+Keep the grid grounded: use row/column/box notation (r1c1…r9c9). If the user provides a grid, verify and restate key cells before deep solving.
+Encourage good habits: penciling candidates, systematic scanning, and checking for contradictions.
+Humor rule:
+At most one short quip per message, after the actionable content.
+Refusal/uncertainty:
+If information is missing (no grid), don’t stall. Ask for the minimal input needed (e.g., a row, a box, or a screenshot) and give a “while you fetch it” micro-lesson or drill.
+
+
+
+COMMUNICATION CHANNEL (HARD):
+- You MUST communicate ONLY by emitting TOOL CALLS (no plain text outside tools).
+- Always emit at least one tool call: reply(text=...).
+- reply.text MUST be non-empty.
+- Do NOT output any extra text outside tool calls.
+
+CORE IDENTITY (NON-NEGOTIABLE):
+You are 50% friendly companion + 50% practical coach.
+- Friend: warm, human, supportive, lightly colorful when it fits the moment.
+- Coach: action-driven, efficient, crystal-clear, and always grounded.
+
+GLOBAL RULE: ALWAYS RESPOND TO WHAT THE USER JUST SAID
+- Even if unclear/noisy: acknowledge + ask a focused follow-up.
+- Never ignore a direct question. Never dodge. Never go silent.
+
+DRIVING RULE:
+- The user is the driver. If they ask a question, answer it first.
+- In GRID_SESSION, after answering, also give ONE concrete next step so the session keeps moving.
+
+GRID_SESSION MISSION (THIS IS YOUR JOB):
+Your mission has TWO outcomes (do BOTH, efficiently):
+1) TRUTH: Ensure the on-screen grid matches the user’s paper/book 100%.
+2) READINESS: Once it matches, ensure the grid is uniquely solvable before “solve-assist”.
+
+EFFICIENCY (IMPORTANT):
+- Minimize turns. The only hard limit is: user can confirm ONE cell per turn.
+- A great correction loop resolves N mismatching cells in ~N turns (plus only unavoidable ASR clarifications).
+
+GROUNDING / FACTUALITY (HARD):
+- You will receive GRID_CONTEXT / STATE_HEADER / TURN_HISTORY.
+- Only state facts explicitly present there.
+- You MUST NOT invent digits, counts, or solvability claims unless provided in GRID_CONTEXT.
+- You may be transparent: “I don’t have enough info yet; can you confirm X?”
+
+COMPLETE TURN REQUIREMENT (GRID_SESSION):
+
+Every GRID_SESSION reply must be COMPLETE and ACTIONABLE:
+A) Human warmth appropriate to the moment (short is fine, but not cold).
+B) A clear, evidence-backed explanation of the situation (or explicit uncertainty).
+C) Exactly ONE concrete next step (non-vague):
+   - ask_confirm_cell_rc(...) OR recommend_validate OR recommend_retake OR (if needed) ask_clarifying_question / confirm_interpretation / switch_to_tap.
+D) Never end with vague closings like “Let’s start…” without a specific next action.
+
+FIRST TURN AFTER CAPTURE:
+If userMessage contains “[EVENT] grid_captured”, treat it as: grid is available now.
+- Warm greeting + confirm you received the scan.
+- Immediately explain the situation using GRID_CONTEXT.
+- Immediately choose ONE best next step and ask it (no vague “we’ll check something”).
+
+PENDING THREADS (OPEN, USER CAN CHANGE TOPIC):
+- You may receive “[EVENT] pending_...” messages.
+- Pending is context only. The user may speak naturally or change topic.
+- If the user clearly answers the pending question, proceed.
+- If unclear/noisy, acknowledge and ask one short clarifying question.
+
+
+TOOLS (IMPORTANT — MANDATORY EMISSION, NOT ADVISORY):
+- When you need the user to verify a cell: ALWAYS use ask_confirm_cell_rc(row, col, prompt).
+
+- PENDING ANSWER RESOLUTION (HARD):
+  If the user message is answering a pending cell check (STATE_HEADER / pending_ctx indicates ask_cell_value with row+col),
+  then in THIS SAME response you MUST:
+  1) emit confirm_cell_value_rc(row, col, digit_or_blank)
+     - digit_or_blank is 1..9, or 0 if the user clearly says the cell is blank/empty.
+  2) If the confirmed digit differs from CURRENT_DISPLAY at that (row,col), you MUST ALSO emit:
+     apply_user_edit_rc(row, col, digit_or_blank, source="user_voice" or "user_text")
+  3) If your toolset includes a progress/update tool, emit it in the same response after apply_user_edit_rc.
+
+  You MUST NOT merely acknowledge the user in reply.text without emitting confirm_cell_value_rc when the user answered the pending cell check.
+
+- Explicit user edits (outside pending):
+  If the user explicitly requests a change (row/col/digit intent), emit apply_user_edit_rc(row, col, digit, source="user_voice" or "user_text") in the SAME response.
+
+- Truthfulness:
+  Never claim you changed a digit unless you also emitted apply_user_edit_rc (or legacy apply_user_edit) in the same response.
+
+- When you emit apply_user_edit_rc:
+  In reply.text, confirm the change in past tense (“Updated rXcY to D.”), then give exactly ONE next step.
+
+
+
+STYLE:
+- Warm, friendly, human. Not robotic.
+- One question at a time.
+- No scripts. No canned phrase rotation. You decide how to speak based on the moment — but you must stay mission-driven and precise.
+""".trimIndent()
+
+
+    val persona = PersonaDescriptor(
+        id = "sudo",
+        version = 1,
+        hash = sha256Hex(systemPromptText)
+    )
+
+    // Use a stable session id you already correlate with telemetry; keep simple for now:
+    private val convoSessionId: String = java.util.UUID.randomUUID().toString().take(8)
+
+
+
+
+    // Detector stability tracking (replace passing/jitter/intersections fields)
+    private var lastDetRect: RectF? = null
+    private var stableCount: Int = 0
+
+
+    // To silence shutter refs if you use delayed shutter effects
+    private var shutterCanceled = false
+    private val shutterRunnable = Runnable {
+        if (!shutterCanceled) try { shutter.play(android.media.MediaActionSound.SHUTTER_CLICK) } catch(_: Throwable) {}
+    }
 
 
 
@@ -215,12 +537,10 @@ class MainActivity : ComponentActivity() {
 
     private var lastGridSeverity: String = "ok" // "ok" | "mild" | "severe"
 
-    // Prevents double-processing while a capture is being rectified/classified.
-    @Volatile
-    private var isProcessingLockedGrid: Boolean = false
 
+    //private var gateState: GateState = GateState.NONE
 
-    private var gateState: GateState = GateState.NONE
+    private var gateState: com.contextionary.sudoku.GateState = com.contextionary.sudoku.GateState.NONE
 
     private val gate = GateController()
 
@@ -235,12 +555,6 @@ class MainActivity : ComponentActivity() {
     // Add near other overlay refs
     private var voiceBars: SudoVoiceBarsView? = null
 
-
-    private var ccToggle: TextView? = null
-
-
-    private var tempoScale = 1.2f   // 1.0 = as-is; >1.0 = slower, <1.0 = faster
-
     // Optional: runtime toggle for captions (you can wire a settings switch later)
     private var showCaptions = false
 
@@ -252,67 +566,33 @@ class MainActivity : ComponentActivity() {
 
 
 
+
+
+
+
+    // --- Lightweight prefs + greeting ---
+// Put this INSIDE MainActivity, near your other fields/methods.
+
+    private inline fun withAsr(block: (SudoASR) -> Unit) { asr?.let(block) }
+
+    private val prefs by lazy { getSharedPreferences("sudo_prefs", android.content.Context.MODE_PRIVATE) }
+
+
+
+
     // Gate change helper (updates state + OverlayView HUD)
-    private fun changeGate(state: GateState, why: String? = null) {
+    private fun changeGate(state: com.contextionary.sudoku.GateState, why: String? = null) {
         if (gateState != state) {
             gateState = state
-            runOnUiThread { overlay.setGateState(state) }
-            Logx.d("Gate", "to" to state.name, "why" to (why ?: ""))
-        }
-    }
-
-    // Intersections jitter helper (average per-point motion in 128×128 model space)
-    private fun avgJitterPx128(curr: Grid128): Float {
-        if (jitterHistory.isEmpty()) return 0f
-        val prev = jitterHistory.last()
-        val n = kotlin.math.min(curr.xs.size, prev.xs.size)
-        var sum = 0f
-        for (i in 0 until n) {
-            val dx = curr.xs[i] - prev.xs[i]
-            val dy = curr.ys[i] - prev.ys[i]
-            sum += kotlin.math.sqrt(dx*dx + dy*dy)
-        }
-        return if (n <= 0) 0f else sum / n
-    }
-
-
-
-    /** Create a small bottom-strip picker button with white text on black. */
-    private fun createPickerButton(
-        label: String,
-        onClick: () -> Unit
-    ): MaterialButton {
-        val ctx = ContextThemeWrapper(this, R.style.Sudoku_Button_Outline)
-
-        return MaterialButton(ctx).apply {
-            text = label
-            isAllCaps = false
-
-            // 🔥 Make the label visible on black background
-            setTextColor(Color.WHITE)
-
-            // Optional but nice: white outline, transparent fill
-            strokeColor = ColorStateList.valueOf(Color.WHITE)
-            strokeWidth = 2.dp()
-            setBackgroundColor(Color.TRANSPARENT)
-
-            // Size & spacing in the strip
-            layoutParams = LinearLayout.LayoutParams(0, 40.dp(), 1f).apply {
-                setMargins(4.dp(), 4.dp(), 4.dp(), 4.dp())
-            }
-
-            setOnClickListener { onClick() }
+            runOnUiThread { overlay.setGateState(com.contextionary.sudoku.GateState.valueOf(state.name)) }
+            Log.d("Gate", "to=${state.name} why=${why ?: ""}")
         }
     }
 
 
     private var resultsRoot: FrameLayout? = null
-    private var resultsImage: ImageView? = null
     private var lastBoardBitmap: Bitmap? = null
     private var lastDigits81: IntArray? = null
-
-    // For overlay editing UI
-    //private var overlayUnresolved: MutableSet<Int> = mutableSetOf()
 
     private var overlayUnresolved: MutableSet<Int> = mutableSetOf()
 
@@ -334,6 +614,150 @@ class MainActivity : ComponentActivity() {
 
 
 
+    // --- Detector stability tunables (for lock-on-stability path) ---
+    private val STABLE_FRAMES    = 6        // how many consecutive stable frames to lock
+    private val IOU_THR          = 0.80f    // IoU vs previous box
+    private val CENTER_DRIFT_PX  = 12f      // max center drift per frame (px, source space)
+    private val SIZE_DRIFT_FRAC  = 0.06f    // max width/height change per frame (fraction)
+
+
+
+    // Snapshot of gating-relevant signals for GateController.update(...)
+    private data class GateSnapshot(
+        val hasDetectorLock: Boolean,  // detector has a current ROI
+        val gridizedOk: Boolean,       // "dots visible" / corners stable enough
+        val validPoints: Int,          // 0..100 intersections judged valid
+        val jitterPx128: Float,        // jitter in 128x128 space (if you track it)
+        val rectifyOk: Boolean,        // rectification step succeeded
+        val avgConf: Float,            // mean digit confidence (0..1)
+        val lowConfCells: Int          // count of cells below threshold
+    )
+
+    // --- Debug instrumentation for CellInterpreter picks -------------------------
+    //private enum class PickHead { GIVEN, SOLUTION, BLANK }
+
+    private data class PickDebug(
+        val digit: Int,
+        val conf: Float,
+        val head: PickHead,
+        val rule: String  // which rule fired
+    )
+
+    // --- Conversation routing
+    private enum class ConversationMode { GRID, FREE_TALK }
+
+
+    //enum class GateState { NONE, L1, L2, L3 }
+
+    //private enum class ConversationMode { GRID_SESSION, FREE_TALK }
+
+    private fun decideConversationMode(): ConversationMode {
+        val hasGrid = (resultsDigits != null)
+
+        val reason = when {
+            hasGrid && lastAutoCorrectionResult == null -> "grid_present_but_no_autocorrect"
+            hasGrid -> "grid_present"
+            else -> "no_grid"
+        }
+
+        // Telemetry uses the concept name "GRID_SESSION", but code uses ConversationMode.GRID.
+        ConversationTelemetry.emitKv(
+            "CONV_MODE_CHOSEN",
+            "mode" to (if (hasGrid) "GRID_SESSION" else "FREE_TALK"),
+            "reason" to reason,
+            "has_digits" to (resultsDigits != null),
+            "has_autocorrect" to (lastAutoCorrectionResult != null)
+        )
+
+        return if (hasGrid) ConversationMode.GRID else ConversationMode.FREE_TALK
+    }
+
+
+    // -------------------------
+// Step-2 (Confirm scanned grid) state
+// -------------------------
+    private enum class Step2Phase { IDLE, CONFIRMING }
+
+
+    private enum class PendingKind { CONFIRM_CELL, CONFIRM_EDIT, CONFIRM_SIGNOFF, CONFIRM_RETAKE }
+
+    /**
+     * Small solvability bundle.
+     * NOTE: default should represent "unknown" until computed.
+     */
+    private data class Solvability(
+        val hasNoSolution: Boolean,
+        val solutionCountCapped: Int
+    ) {
+        val hasUniqueSolution: Boolean get() = solutionCountCapped == 1
+        val hasMultipleSolutions: Boolean get() = solutionCountCapped >= 2
+        val label: String get() = when {
+            hasUniqueSolution -> "unique"
+            hasMultipleSolutions -> "multiple"
+            hasNoSolution -> "none"
+            else -> "none"
+        }
+    }
+
+    private data class Step2State(
+        var phase: Step2Phase = Step2Phase.IDLE,
+
+        // Your existing "mediation" switch is fine.
+        var mediationMode: Boolean = true,
+
+        // ✅ Pending confirmation (Row 1 relies on these)
+        var pendingKind: PendingKind? = null,
+        var pendingCellIdx: Int? = null,
+        var pendingDigit: Int? = null,
+
+        // Default to "unknown": we haven’t computed solvability yet.
+        var lastSolvability: Solvability = Solvability(
+            hasNoSolution = false,
+            solutionCountCapped = 0
+        ),
+
+        // Retake recommendation default
+        var lastRetakeRec: String = "none"
+    )
+
+
+
+
+
+
+
+    // Which head we selected to render
+    private enum class PickHead { GIVEN, SOLUTION }
+
+    // Small record we also log in capture_debug: which head + why
+    private data class Pick(
+        val head: PickHead,
+        val rule: String
+    )
+
+    // Must mirror the fusion thresholds used by UI
+    // Decide which head to use purely by your S-first policy.
+// - If S predicts 0 (blank) -> use GIVEN (whatever it is, including 0)
+// - Else (S != 0):
+//     - If G predicts 0 -> use SOLUTION
+//     - Else (G != 0)    -> use GIVEN
+    private fun decidePick(rd: CellReadout): Pick {
+        val s = rd.solutionDigit
+        val g = rd.givenDigit
+
+        return if (s == 0) {
+            Pick(PickHead.GIVEN, "S=0 -> GIVEN")
+        } else {
+            if (g == 0) {
+                Pick(PickHead.SOLUTION, "S!=0 & G=0 -> SOLUTION")
+            } else {
+                Pick(PickHead.GIVEN, "S!=0 & G!=0 -> GIVEN")
+            }
+        }
+    }
+
+
+
 
 
 
@@ -350,13 +774,125 @@ class MainActivity : ComponentActivity() {
 
     // === Corner gating params ===
     private val CORNER_PEAK_THR = 0.90f      // all four must be >= this
-    private val AREA_RATIO_MIN = 0.90f       // quadArea >= 90% of detector box area
-    private val AREA_RATIO_MAX = 1.20f       // and <= 120% of detector box area
-    private val SIDE_RATIO_MAX  = 1.8f       // side length max/min bound
-    private val ASPECT_TOL      = 1.30f      // aspect similarity (±30% in ratio)
 
 
+    // M1/A — CellInterpreter wiring
+    private var cellInterpreter: CellInterpreter? = null
 
+    private fun ensureCellInterpreter() {
+        if (cellInterpreter == null) {
+            // Use your fp32 model that lives in assets/models/
+            cellInterpreter = CellInterpreter(
+                context    = this,
+                modelAsset = CellInterpreter.MODEL_FP32,
+                numThreads = 4
+            )
+            android.util.Log.i("CellInterpreter", "Initialized with ${CellInterpreter.MODEL_FP32}")
+        }
+    }
+
+
+    /** Write small text files safely. */
+    private fun writeText(file: java.io.File, text: String) {
+        try {
+            file.parentFile?.mkdirs()
+            file.writeText(text, Charsets.UTF_8)
+        } catch (t: Throwable) {
+            Log.w("CaptureDebug", "writeText failed: ${file.absolutePath}", t)
+        }
+    }
+
+    /** CSV escape */
+    private fun csv(s: String) = s.replace("\"", "\"\"")
+
+    /** Dump per-cell debug as CSV + JSONL + summary into the parity run dir you already create. */
+    private fun dumpInterpreterDebug(
+        caseDir: java.io.File,
+        grid: Array<Array<CellReadout>>,
+        chosenDigits: IntArray,
+        chosenConfs: FloatArray
+    ) {
+        val csvSb = StringBuilder()
+        csvSb.appendLine("idx,row,col,given_digit,given_conf,solution_digit,solution_conf,cand_mask,chosen_digit,chosen_conf,chosen_head,rule")
+
+        val jsonlSb = StringBuilder()
+
+        var givenShown = 0
+        var solShown = 0
+        var blanks = 0
+        var givenEligible = 0
+
+        // Keep in sync with the candidate threshold used in CellInterpreter
+        val candThr = 0.58f
+
+        fun candPassList(rd: CellReadout, thr: Float): String {
+            // Build "[d@0.75,d2@0.62,...]" (sorted by confidence desc), empty "[]" if none
+            val pairs = (1..9).mapNotNull { d ->
+                val p = rd.candidateConfs.getOrNull(d) ?: 0f
+                if (p >= thr) d to p else null
+            }.sortedByDescending { it.second }
+            if (pairs.isEmpty()) return "[]"
+            return pairs.joinToString(prefix = "[", postfix = "]") { (d, p) -> "$d@${"%.2f".format(p)}" }
+        }
+
+        var idx = 0
+        for (r in 0 until 9) {
+            for (c in 0 until 9) {
+                val rd = grid[r][c]
+                val pick = decidePick(rd)
+
+                // Chosen (for logging) follows the S-first rule
+                val (cd, cc) = when (pick.head) {
+                    PickHead.GIVEN    -> rd.givenDigit to rd.givenConf
+                    PickHead.SOLUTION -> rd.solutionDigit to rd.solutionConf
+                }
+
+                if (cd == 0) blanks++
+                if (pick.head == PickHead.GIVEN) givenShown++ else solShown++
+                if (rd.givenDigit in 1..9 && rd.givenConf >= HI_GIVEN) givenEligible++
+
+                csvSb.appendLine(
+                    "${idx},${r},${c}," +
+                            "${rd.givenDigit},${"%.4f".format(rd.givenConf)}," +
+                            "${rd.solutionDigit},${"%.4f".format(rd.solutionConf)}," +
+                            "${rd.candidateMask}," +
+                            "${cd},${"%.4f".format(cc)}," +
+                            "${pick.head}," +
+                            "${csv(pick.rule)}"
+                )
+
+                jsonlSb.appendLine(
+                    """{"idx":$idx,"row":$r,"col":$c,"given_digit":${rd.givenDigit},"given_conf":${"%.6f".format(rd.givenConf)},"solution_digit":${rd.solutionDigit},"solution_conf":${"%.6f".format(rd.solutionConf)},"cand_mask":${rd.candidateMask},"chosen_digit":$cd,"chosen_conf":${"%.6f".format(cc)},"chosen_head":"${pick.head}","rule":"${pick.rule}"}"""
+                )
+
+                // Logcat one-liner + candidates passing threshold
+                val candStr = candPassList(rd, candThr)
+                Log.i(
+                    "CaptureDebug",
+                    "r${r + 1}c${c + 1} " +
+                            "G=${rd.givenDigit}@${"%.2f".format(rd.givenConf)} " +
+                            "S=${rd.solutionDigit}@${"%.2f".format(rd.solutionConf)} " +
+                            "→ ${cd}@${"%.2f".format(cc)} ${pick.head} (${pick.rule}) " +
+                            "C=$candStr"
+                )
+
+                idx++
+            }
+        }
+
+        val summary = buildString {
+            appendLine("# Capture summary")
+            appendLine("given_eligible(>=HI_GIVEN): $givenEligible")
+            appendLine("chosen_given: $givenShown")
+            appendLine("chosen_solution: $solShown")
+            appendLine("chosen_blank: $blanks")
+            appendLine("thresholds: HI_GIVEN=$HI_GIVEN HI_SOLUTION=$HI_SOLUTION MID_SOLUTION=$MID_SOLUTION")
+        }
+
+        writeText(java.io.File(caseDir, "capture_debug.csv"), csvSb.toString())
+        writeText(java.io.File(caseDir, "capture_debug.jsonl"), jsonlSb.toString())
+        writeText(java.io.File(caseDir, "capture_summary.txt"), summary)
+    }
 
 
 
@@ -364,7 +900,6 @@ class MainActivity : ComponentActivity() {
     // LLM coordinator using either the real OpenAI client or the fake one.
     private val llmCoordinator: SudokuLLMConversationCoordinator by lazy {
 
-        // Toggle this if you want to go back to the fake client for offline testing.
         val useFakeClient = false
 
         Log.i("SudokuLLM", "BuildConfig.OPENAI_API_KEY length = ${BuildConfig.OPENAI_API_KEY.length}")
@@ -373,65 +908,24 @@ class MainActivity : ComponentActivity() {
         } else {
             RealSudokuLLMClient(
                 apiKey = BuildConfig.OPENAI_API_KEY,
-                model = "gpt-4o-mini"
+                model = "gpt-4.1"
             )
         }
 
         SudokuLLMConversationCoordinator(
             solver = sudokuSolver,
-            llmClient = llmClient
+            llmClient = llmClient,
+            turnStore = turnStore
         )
     }
 
 
 
-
-
-
-
-    private lateinit var intersections: IntersectionsFinder
-
-    // New gates
-    private val INT_PEAK_THR = 0.25f
-    private val JITTER_WINDOW = 3
-    private val MAX_JITTER_PX128 = 7f
-
     // For jitter history of 100 pts (in 128×128 model space)
     private data class Grid128(val xs: FloatArray, val ys: FloatArray) // size=100
     private val jitterHistory = ArrayDeque<Grid128>()
 
-    // Keep last passing frame for best-of-N
-    private data class PassingFrame(
-        val ptsSrc: List<PointF>,
-        val roi: RectF,
-        val minPeak: Float,
-        val tsMs: Long,
-        val expandedRoi: Rect,
-        val roiBmp: Bitmap,            // cropped ROI bitmap for this frame (used for debug overlay)
-        val jitterPx128: Float,        // <-- non-default must come before defaulted params
-        var score: ScoreBreakdown? = null   // optional cache of the computed breakdown
-    )
 
-    // Detailed per-frame scoring used for CSV debug.
-    private data class ScoreBreakdown(
-        val total: Float,
-        val confPct: Float,
-        val lineStraightness: Float,
-        val orthogonality: Float,
-        val cellUniformity: Float,
-        val clearance: Float,
-        val jitterScore: Float
-    )
-
-    private data class GateSnapshot(
-        val hasDetectorLock: Boolean,
-        val gridizedOk: Boolean,
-        val validPoints: Int,
-        val jitterPx128: Float,
-        val rectifyOk: Boolean,
-        val avgConf: Float,
-        val lowConfCells: Int
-    )
 
 
 
@@ -537,16 +1031,7 @@ class MainActivity : ComponentActivity() {
 
 
 
-    private val passing = ArrayDeque<PassingFrame>()
 
-
-    private val resultsLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        // Either result: retake (RESULT_CANCELED) or keep (RESULT_OK),
-        // we want to return to a fresh scanning state.
-        resetCaptureForFreshScan()
-    }
 
 
 
@@ -577,6 +1062,337 @@ class MainActivity : ComponentActivity() {
         private const val MIN_AVG_CELL_CONF     = 0.75f
 
         private const val MAX_LOWCONF_CELLS     = 6
+
+        // === Display fusion thresholds (given vs solution) ===
+        private const val HI_GIVEN     = 0.85f
+        private const val HI_SOLUTION  = 0.70f
+        private const val MID_SOLUTION = 0.45f
+
+
+        private const val AUTOCORR_LOWCONF_THR = 0.60f   // drives GridPrediction.lowConfidenceIndices
+        private const val AUTOCORR_MIN_ALT_PROB = 0.02f  // candidates must exceed this to be tried
+
+
+        private const val UNIQUE = "unique"
+        private const val MULTIPLE = "multiple"
+        private const val NONE = "none"
+
+    }
+
+
+
+    // --------------------------------------------
+// Autocorrect wiring helpers (GIVEN + SOLUTION + AUTOCORRECTED rendering)
+// --------------------------------------------
+
+    /** What we feed to SudokuAutoCorrector + what we keep for verification/UI. */
+    private data class AutocorrectInputs(
+        val digits: IntArray,                         // 81 (chosen digit from decidePick)
+        val confidences: FloatArray,                  // 81 (confidence of chosen digit)
+        val headsFlat: IntArray,                      // 81 (0=GIVEN, 1=SOLUTION) chosen head
+        val classProbs: Array<Array<FloatArray>>,     // [9][9][10] = probs of the CHOSEN head
+        val candMask: IntArray,                       // 81 candidate mask (UI only)
+
+        // For strict verification / future debug (not used by AutoCorrector today)
+        val givenProbsFlat: Array<Array<FloatArray>>, // [9][9][10] given head probs
+        val solProbsFlat: Array<Array<FloatArray>>    // [9][9][10] solution head probs
+    )
+
+    private fun buildAutocorrectInputsFromReadouts(
+        readouts9x9: Array<Array<CellReadout>>
+    ): AutocorrectInputs {
+
+        val digits   = IntArray(81)
+        val confs    = FloatArray(81)
+        val heads    = IntArray(81) // 0=GIVEN, 1=SOLUTION (chosen head)
+        val candMask = IntArray(81)
+
+        val chosenProbs9x9 = Array(9) { Array(9) { FloatArray(10) } }
+
+        // Keep full heads for strict “no info lost” verification
+        val givProbs9x9 = Array(9) { Array(9) { FloatArray(10) } }
+        val solProbs9x9 = Array(9) { Array(9) { FloatArray(10) } }
+
+        for (r in 0 until 9) {
+            for (c in 0 until 9) {
+                val idx = r * 9 + c
+                val rd = readouts9x9[r][c]
+
+                // Capture/ UI rule: decide which placed head we “see”
+                val pick = decidePick(rd)
+
+                val (d, cf, headIdx) = when (pick.head) {
+                    PickHead.GIVEN    -> Triple(rd.givenDigit, rd.givenConf, 0)
+                    PickHead.SOLUTION -> Triple(rd.solutionDigit, rd.solutionConf, 1)
+                }
+
+                digits[idx]   = d
+                confs[idx]    = cf.coerceIn(0f, 1f)
+                heads[idx]    = headIdx
+                candMask[idx] = rd.candidateMask
+
+                // Save full head probs
+                require(rd.givenProbs10.size == 10) { "givenProbs10 must be size 10" }
+                require(rd.solutionProbs10.size == 10) { "solutionProbs10 must be size 10" }
+                givProbs9x9[r][c] = rd.givenProbs10
+                solProbs9x9[r][c] = rd.solutionProbs10
+
+                // ✅ The ONLY probs AutoCorrector should see: probs from the chosen head
+                chosenProbs9x9[r][c] = if (headIdx == 0) rd.givenProbs10 else rd.solutionProbs10
+            }
+        }
+
+        return AutocorrectInputs(
+            digits = digits,
+            confidences = confs,
+            headsFlat = heads,
+            classProbs = chosenProbs9x9,
+            candMask = candMask,
+            givenProbsFlat = givProbs9x9,
+            solProbsFlat = solProbs9x9
+        )
+    }
+
+
+    private fun buildAutoFlags(auto: AutoCorrectionResult): BooleanArray {
+        val f = BooleanArray(81)
+        for (idx in auto.changedIndices) {
+            if (idx in 0..80) f[idx] = true
+        }
+        return f
+    }
+
+
+    private fun buildGivenSolFlagsFromHeadsExcludingAuto(
+        correctedDigits: IntArray,
+        headsFlat: IntArray,
+        autoFlags: BooleanArray
+    ): Pair<BooleanArray, BooleanArray> {
+        val asGiven = BooleanArray(81)
+        val asSol   = BooleanArray(81)
+        for (idx in 0 until 81) {
+            val d = correctedDigits[idx]
+            if (d == 0) continue
+            if (autoFlags[idx]) continue
+            if (headsFlat[idx] == 0) asGiven[idx] = true else asSol[idx] = true
+        }
+        return asGiven to asSol
+    }
+
+
+
+    private fun verifyAutocorrectInputMatchesCaptured(
+        readouts9x9: Array<Array<CellReadout>>,
+        inputs: AutocorrectInputs,
+        lowConfThr: Float
+    ): String {
+        var mismatchDigits = 0
+        var mismatchConfs = 0
+        var mismatchHead = 0
+        var mismatchCand = 0
+        var mismatchProbsChosen = 0
+        var mismatchProbsHeads = 0
+
+        fun close(a: Float, b: Float): Boolean = kotlin.math.abs(a - b) <= 1e-5f
+
+        for (r in 0 until 9) for (c in 0 until 9) {
+            val idx = r * 9 + c
+            val rd = readouts9x9[r][c]
+            val pick = decidePick(rd)
+            val expectedHead = if (pick.head == PickHead.GIVEN) 0 else 1
+
+            val expectedDigit = if (expectedHead == 0) rd.givenDigit else rd.solutionDigit
+            val expectedConf  = if (expectedHead == 0) rd.givenConf  else rd.solutionConf
+
+            if (inputs.headsFlat[idx] != expectedHead) mismatchHead++
+            if (inputs.digits[idx] != expectedDigit) mismatchDigits++
+            if (!close(inputs.confidences[idx], expectedConf.coerceIn(0f, 1f))) mismatchConfs++
+            if (inputs.candMask[idx] != rd.candidateMask) mismatchCand++
+
+            // chosen probs
+            val expectedChosen = if (expectedHead == 0) rd.givenProbs10 else rd.solutionProbs10
+            val gotChosen = inputs.classProbs[r][c]
+            for (k in 0..9) if (!close(gotChosen[k], expectedChosen[k])) { mismatchProbsChosen++; break }
+
+            // full head preservation
+            val gp = inputs.givenProbsFlat[r][c]
+            val sp = inputs.solProbsFlat[r][c]
+            for (k in 0..9) if (!close(gp[k], rd.givenProbs10[k])) { mismatchProbsHeads++; break }
+            for (k in 0..9) if (!close(sp[k], rd.solutionProbs10[k])) { mismatchProbsHeads++; break }
+        }
+
+        val avg = inputs.confidences.average().toFloat()
+        val lowCount = inputs.confidences.count { it < lowConfThr }
+
+        return buildString {
+            appendLine("VERIFY AutoCorrector input vs captured grid:")
+            appendLine("  avgConf=${"%.4f".format(avg)} lowConf(<${lowConfThr})=$lowCount")
+            appendLine("  mismatchHead=$mismatchHead")
+            appendLine("  mismatchDigits=$mismatchDigits")
+            appendLine("  mismatchConfs=$mismatchConfs")
+            appendLine("  mismatchCandMask=$mismatchCand")
+            appendLine("  mismatchChosenProbsVec=$mismatchProbsChosen")
+            appendLine("  mismatchFullHeadProbsVec=$mismatchProbsHeads")
+            appendLine("  PASS=${(mismatchHead+mismatchDigits+mismatchConfs+mismatchCand+mismatchProbsChosen+mismatchProbsHeads)==0}")
+        }
+    }
+
+
+    private fun computeDisplayConfsFromClassProbs(
+        correctedDigits: IntArray,
+        classProbs: Array<Array<FloatArray>>
+    ): FloatArray {
+        val out = FloatArray(81)
+        for (idx in 0 until 81) {
+            val d = correctedDigits[idx]
+            if (d == 0) {
+                out[idx] = 1.0f
+            } else {
+                val r = idx / 9
+                val c = idx % 9
+                val p = classProbs[r][c]
+                out[idx] = if (p.size == 10) p[d].coerceIn(0f, 1f) else 0f
+            }
+        }
+        return out
+    }
+
+
+
+    /**
+     * Hard verifier: ensures AutocorrectInputs were built strictly from decidePick(readouts),
+     * and candidates masks match too. This is your "AutoCorrector input == captured grid"
+     * enforcement (at least for chosen digit/conf/head + candidates).
+     */
+    private fun verifyAutocorrectInputsAgainstReadouts(
+        readouts9x9: Array<Array<CellReadout>>,
+        inputs: AutocorrectInputs
+    ): Boolean {
+        var ok = true
+        for (r in 0 until 9) {
+            for (c in 0 until 9) {
+                val idx = r * 9 + c
+                val rd = readouts9x9[r][c]
+                val pick = decidePick(rd)
+
+                val (expD, expC, expH) = when (pick.head) {
+                    PickHead.GIVEN    -> Triple(rd.givenDigit, rd.givenConf.coerceIn(0f, 1f), 0)
+                    PickHead.SOLUTION -> Triple(rd.solutionDigit, rd.solutionConf.coerceIn(0f, 1f), 1)
+                }
+
+                if (inputs.digits[idx] != expD) {
+                    Log.e("SudokuLogic", "verifyInputs: r${r+1}c${c+1} digit mismatch in=${inputs.digits[idx]} exp=$expD")
+                    ok = false
+                }
+                if (kotlin.math.abs(inputs.confidences[idx] - expC) > 1e-4f) {
+                    Log.e("SudokuLogic", "verifyInputs: r${r+1}c${c+1} conf mismatch in=${inputs.confidences[idx]} exp=$expC")
+                    ok = false
+                }
+                if (inputs.headsFlat[idx] != expH) {
+                    Log.e("SudokuLogic", "verifyInputs: r${r+1}c${c+1} head mismatch in=${inputs.headsFlat[idx]} exp=$expH")
+                    ok = false
+                }
+                if (inputs.candMask[idx] != rd.candidateMask) {
+                    Log.e("SudokuLogic", "verifyInputs: r${r+1}c${c+1} candMask mismatch in=${inputs.candMask[idx]} exp=${rd.candidateMask}")
+                    ok = false
+                }
+            }
+        }
+        return ok
+    }
+
+    /**
+     * Apply the autocorrected placed digit back into the 3-head readouts:
+     * - Candidates are untouched.
+     * - We overwrite ONLY the chosen head for the cell (given vs solution),
+     *   so the UI can still style it as printed vs handwritten.
+     */
+    private fun applyAutocorrectToReadouts(
+        original: Array<Array<CellReadout>>,
+        correctedDigits: IntArray,
+        correctedConfs: FloatArray,
+        headsFlat: IntArray
+    ): Array<Array<CellReadout>> {
+        val out = Array(9) { r -> Array(9) { c -> original[r][c] } }
+
+        for (r in 0 until 9) {
+            for (c in 0 until 9) {
+                val idx = r * 9 + c
+                val rd = original[r][c]
+                val d  = correctedDigits[idx]
+                val cf = correctedConfs[idx].coerceIn(0f, 1f)
+                val head = headsFlat[idx] // 0=GIVEN,1=SOLUTION
+
+                out[r][c] = when {
+                    d == 0 -> {
+                        // If autocorrect blanked it, blank both placed heads (keep candidates)
+                        rd.copy(
+                            givenDigit = 0, givenConf = 1f,
+                            solutionDigit = 0, solutionConf = 1f
+                        )
+                    }
+                    head == 0 -> rd.copy(givenDigit = d, givenConf = cf)
+                    else      -> rd.copy(solutionDigit = d, solutionConf = cf)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun dumpAutoCorrectDebug(
+        caseDir: java.io.File,
+        prediction: GridPrediction,
+        auto: AutoCorrectionResult,
+        inputs: AutocorrectInputs,
+        correctedConfs: FloatArray
+    ) {
+        try {
+            val changed = auto.changedIndices.toSet()
+            val unresolved = auto.unresolvedIndices.toSet()
+
+            val csv = StringBuilder()
+            csv.appendLine("idx,row,col,head_in,out_prov,in_digit,in_conf,out_digit,out_conf,changed,unresolved")
+
+            for (idx in 0 until 81) {
+                val r = idx / 9
+                val c = idx % 9
+
+                val headIn = if (inputs.headsFlat[idx] == 0) "GIVEN" else "SOLUTION"
+                val outProv = if (changed.contains(idx)) "AUTOCORRECTED" else headIn
+
+                val inD = prediction.digits[idx]
+                val inC = prediction.confidences[idx]
+                val outD = auto.correctedGrid.digits[idx]
+                val outC = correctedConfs[idx]
+
+                csv.appendLine(
+                    "${idx},${r},${c},${headIn},${outProv}," +
+                            "${inD},${"%.4f".format(inC)}," +
+                            "${outD},${"%.4f".format(outC)}," +
+                            "${changed.contains(idx)}," +
+                            "${unresolved.contains(idx)}"
+                )
+            }
+
+            val summary = buildString {
+                appendLine("# Autocorrect summary")
+                appendLine("lowConfThr=$AUTOCORR_LOWCONF_THR minAltProb=$AUTOCORR_MIN_ALT_PROB")
+                appendLine("prediction.nonZero=${prediction.digits.count { it != 0 }} avgConf=${"%.3f".format(prediction.avgConfidence)} lowConfCount=${prediction.lowConfidenceCount}")
+                appendLine("changedCount=${auto.changedIndices.size} unresolvedCount=${auto.unresolvedIndices.size}")
+                appendLine("changedCells=${auto.changedIndices.map { idx -> "r${idx/9+1}c${idx%9+1}" }}")
+                appendLine("unresolvedCells=${auto.unresolvedIndices.map { idx -> "r${idx/9+1}c${idx%9+1}" }}")
+            }
+
+            writeText(java.io.File(caseDir, "autocorrect_debug.csv"), csv.toString())
+            writeText(java.io.File(caseDir, "autocorrect_summary.txt"), summary)
+
+            Log.i(
+                "SudokuLogic",
+                "AutoCorrect: inLowConf=${prediction.lowConfidenceCount} changed=${auto.changedIndices.size} unresolved=${auto.unresolvedIndices.size}"
+            )
+        } catch (t: Throwable) {
+            Log.w("SudokuLogic", "dumpAutoCorrectDebug failed", t)
+        }
     }
 
 
@@ -591,15 +1407,16 @@ class MainActivity : ComponentActivity() {
     private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
 
 
-
-
-
-
-
-
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        ConversationTelemetry.init(
+            context = this,
+            userId = null,
+            sessionId = null,
+            logcatEcho = true
+        )
+
         setContentView(R.layout.activity_main)
 
         audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
@@ -607,12 +1424,13 @@ class MainActivity : ComponentActivity() {
         previewView = findViewById(R.id.preview)
         overlay = findViewById(R.id.overlay)
 
-        // OpenCV init (debug loader is fine for dev builds)
+        // ✅ MUST be ready before any capture pipeline can reach showResultsFromReadouts()
+        ensureSudoStore()
+
         if (!OpenCVLoader.initDebug()) {
             Log.e("OpenCV", "OpenCV init failed")
         }
 
-        // Camera shutter sound
         shutter = android.media.MediaActionSound()
         shutter.load(android.media.MediaActionSound.SHUTTER_CLICK)
 
@@ -623,9 +1441,8 @@ class MainActivity : ComponentActivity() {
         overlay.showCornerDots = false
         overlay.showBoxLabels = false
         overlay.showHudText   = false
-        overlay.showCropRect = false
+        overlay.showCropRect  = false
 
-        // Detector
         try {
             detector = Detector(
                 this,
@@ -643,42 +1460,62 @@ class MainActivity : ComponentActivity() {
             overlay.updateCornerCropRect(null)
         }
 
-        intersections = IntersectionsFinder(
-            this,
-            modelAsset = "models/intersections_fp16.tflite",
-            numThreads = 2,
-            enableNnapi = true
-        )
-
-        // HUD: show intersections, hide corner UI
-        overlay.showCornerDots = false
-        overlay.showIntersections = false
-
         analyzerExecutor = Executors.newSingleThreadExecutor()
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            startCamera()
-        } else {
-            askCameraPermission.launch(Manifest.permission.CAMERA)
-        }
-
-        // --- Initialize TextToSpeech for Sudo (local fallback) ---
+        // --- 🔊 Initialize TextToSpeech (local fallback) ---
         tts = TextToSpeech(this) { status: Int ->
             ttsReady = (status == TextToSpeech.SUCCESS)
             Log.i("SudokuTTS", "onInit status=$status ready=$ttsReady")
+
             if (ttsReady) {
+                try {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                        val aa = android.media.AudioAttributes.Builder()
+                            .setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+
+                        tts.setAudioAttributes(aa)
+
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "TTS_AUDIO_ATTR",
+                                "engine" to "AndroidTTS",
+                                "usage" to "USAGE_ASSISTANT",
+                                "content_type" to "CONTENT_TYPE_SPEECH"
+                            )
+                        )
+                        Log.i("SudokuTTS", "AndroidTTS audio attrs set: USAGE_ASSISTANT + SPEECH")
+                    } else {
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "TTS_AUDIO_ATTR",
+                                "engine" to "AndroidTTS",
+                                "usage" to "LEGACY",
+                                "content_type" to "LEGACY"
+                            )
+                        )
+                        Log.i("SudokuTTS", "AndroidTTS audio attrs: legacy (<21)")
+                    }
+                } catch (t: Throwable) {
+                    Log.w("SudokuTTS", "Failed to set AndroidTTS audio attributes", t)
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "TTS_AUDIO_ATTR_ERROR",
+                            "engine" to "AndroidTTS",
+                            "message" to (t.message ?: t.toString())
+                        )
+                    )
+                }
+
                 val result = tts.setLanguage(java.util.Locale.getDefault())
                 Log.i("SudokuTTS", "setLanguage result=$result")
                 if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
                     Log.w("SudokuTTS", "Selected TTS language not supported on this device.")
                 }
 
-                // 🔴 Make bars follow audio start/stop
                 initTtsListener()
 
-                // Drain any pending messages queued before init completed
                 if (ttsPending.isNotEmpty()) {
                     val copy = ttsPending.toList()
                     ttsPending.clear()
@@ -689,53 +1526,995 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // --- Initialize Azure Neural TTS (primary, if configured) ---
-        try {
-            if (BuildConfig.AZURE_SPEECH_KEY.isNotEmpty() && BuildConfig.AZURE_SPEECH_REGION.isNotEmpty()) {
+        // --- 🎤 ASR pre-wiring (permission check + prewarm SpeechRecognizer) ---
+        val hasMic = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
 
-                //azureTts = AzureCloudTtsEngine(
-                //  context = this,
-                //    apiKey  = BuildConfig.AZURE_SPEECH_KEY,
-                //    region  = BuildConfig.AZURE_SPEECH_REGION
-                //)
+        if (hasMic) {
+            asr = SudoASR(this).apply {
+                prewarm()
 
-                azureTts = AzureCloudTtsEngine(
-                    context = this,
-                    subscriptionKey = BuildConfig.AZURE_SPEECH_KEY,
-                    region = BuildConfig.AZURE_SPEECH_REGION
-                )
-                // If you track a locale tag elsewhere, keep it; otherwise default to device:
-                // currentLocaleTag = java.util.Locale.getDefault().toLanguageTag()  // uncomment if you have this field
-                Log.i("SudokuTTS", "Azure TTS enabled (${BuildConfig.AZURE_SPEECH_REGION})")
-            } else {
-                Log.i("SudokuTTS", "Azure TTS disabled (missing key/region); using local Android TTS.")
+                listener = object : SudoASR.Listener {
+                    override fun onReady(localeTag: String) {
+                        Log.i("SudoASR", "READY locale=$localeTag")
+                    }
+
+                    override fun onBegin() {
+                        Log.i("SudoASR", "BEGIN")
+                    }
+
+                    override fun onRmsChanged(rmsDb: Float) {
+                        // Keep invisible in Phase 0/1 (no mic bars)
+                    }
+
+                    override fun onPartial(text: String) {
+                        // Debug only
+                    }
+
+                    override fun onEnd() {
+                        Log.i("SudoASR", "END (waiting final)")
+                    }
+
+                    override fun onHeard(text: String, confidence: Float?) {
+                        // Keep for backwards compatibility / optional debug.
+                        val t = text.trim()
+                        if (t.isBlank()) return
+                        logAsrHeard("HEARD", t, confidence)
+                    }
+
+                    override fun onFinal(rowId: Int, text: String, confidence: Float?, reason: String) {
+                        val t = text.trim()
+                        if (t.isBlank()) {
+                            Log.i("SudoASR", "FINAL dropped blank final")
+                            return
+                        }
+
+                        logAsrHeard("FINAL", t, confidence)
+                        turnController.onAsrFinal(t, rowId = rowId, confidence = confidence)
+
+                        if (!USE_CONDUCTOR_ONLY) {
+                            handleUserUtterance(t) // legacy
+                        } else {
+                            // migrated path
+                            //sudoStore.dispatch(Evt.AsrFinal(rowId, t, confidence))
+                            //sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AsrFinal(text = t, confidence = confidence))
+                            sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AsrFinal(rowId = rowId, text = t, confidence = confidence))
+                        }
+                    }
+
+                    override fun onError(code: Int) {
+                        val name = SudoASR.errorName(code)
+                        Log.w("SudoASR", "ERROR code=$code ($name)")
+                        turnController.onAsrError(code, name)
+                    }
+                }
             }
-        } catch (t: Throwable) {
-            Log.e("SudokuTTS", "Azure TTS init failed; will use local Android TTS", t)
+
+            Log.i("SudoASR", "Prewarmed SudoASR + listener wired")
+            wireTurnControllerWorkers()
+
+        } else {
+            Log.i("SudoASR", "Mic permission not granted yet; ASR will prompt when needed.")
+            Toast.makeText(this, "Enable microphone permission to talk to Sudo.", Toast.LENGTH_SHORT).show()
+            wireTurnControllerWorkers()
         }
+
+        runConversationRecoveryBeforeVoiceLoop()
+        initAzureTtsIfConfigured()
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            startCamera()
+        } else {
+            askCameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+
+    private fun ensureSudoStore() {
+        if (::sudoStore.isInitialized) return
+
+        val sid: String = runCatching { convoSessionId }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: java.util.UUID.randomUUID().toString()
+
+        val policy: com.contextionary.sudoku.conductor.LlmPolicy =
+            com.contextionary.sudoku.conductor.policy.CoordinatorPolicyAdapter(
+                coord = llmCoordinator,
+                systemPrompt = systemPromptText
+            )
+
+        var applyEditSeq = 0L
+
+        var lastAssistantSpoken: String = ""
+
+        fun invokeNoArgIfExists(target: Any?, methodName: String): Boolean {
+            if (target == null) return false
+            return runCatching {
+                val m = target::class.java.methods.firstOrNull { it.name == methodName && it.parameterTypes.isEmpty() }
+                if (m != null) {
+                    m.isAccessible = true
+                    m.invoke(target)
+                    true
+                } else false
+            }.getOrDefault(false)
+        }
+
+        fun invokeStringArgIfExists(target: Any?, methodName: String, arg: String): Boolean {
+            if (target == null) return false
+            return runCatching {
+                val m = target::class.java.methods.firstOrNull {
+                    it.name == methodName &&
+                            it.parameterTypes.size == 1 &&
+                            it.parameterTypes[0] == String::class.java
+                }
+                if (m != null) {
+                    m.isAccessible = true
+                    m.invoke(target, arg)
+                    true
+                } else false
+            }.getOrDefault(false)
+        }
+
+        fun requestListenCompat(reason: String) {
+            runOnUiThread {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf("type" to "REQUEST_LISTEN", "reason" to reason)
+                )
+
+                if (isSpeaking || asrSuppressedByTts) {
+                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "REQUEST_LISTEN_SUPPRESSED",
+                            "reason" to reason,
+                            "isSpeaking" to isSpeaking,
+                            "asrSuppressedByTts" to asrSuppressedByTts
+                        )
+                    )
+                    return@runOnUiThread
+                }
+
+                val usedTurnController =
+                    invokeStringArgIfExists(turnController, "requestListen", reason) ||
+                            invokeStringArgIfExists(turnController, "onRequestListen", reason) ||
+                            invokeStringArgIfExists(turnController, "startListening", reason)
+
+                if (usedTurnController) {
+                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                        mapOf("type" to "REQUEST_LISTEN_OK", "via" to "turnController", "reason" to reason)
+                    )
+                    return@runOnUiThread
+                }
+
+                val usedAsr =
+                    invokeNoArgIfExists(asr, "start") ||
+                            invokeNoArgIfExists(asr, "startListening") ||
+                            invokeStringArgIfExists(asr, "start", reason) ||
+                            invokeStringArgIfExists(asr, "startListening", reason)
+
+                if (usedAsr) {
+                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                        mapOf("type" to "REQUEST_LISTEN_OK", "via" to "asr", "reason" to reason)
+                    )
+                } else {
+                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                        mapOf("type" to "REQUEST_LISTEN_FAILED", "reason" to reason)
+                    )
+                    android.util.Log.w(
+                        "MainActivity",
+                        "Eff.RequestListen: could not find a start/listen method on turnController or asr"
+                    )
+                }
+            }
+        }
+
+        /**
+         * Single place that:
+         * - re-renders SudokuResultView from canonical arrays
+         * - recomputes GridState/LLMGridState
+         * - emits exactly one GridSnapshotUpdated
+         */
+        fun emitSnapshotOnce(
+            emit: (com.contextionary.sudoku.conductor.Evt) -> Unit,
+            reason: String,
+            seq: Long
+        ) {
+            val gs = buildGridStateFromOverlay()
+            if (gs != null) {
+                val llmGrid = buildLLMGridStateFromOverlay(gs)
+                val snap = com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
+                emit(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(snap))
+
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "GRID_SNAPSHOT_UPDATED_EMIT",
+                        "edit_seq" to seq,
+                        "reason" to reason
+                    )
+                )
+            } else {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "GRID_SNAPSHOT_UPDATED_MISSED",
+                        "edit_seq" to seq,
+                        "reason" to "buildGridStateFromOverlay returned null ($reason)"
+                    )
+                )
+                android.util.Log.e("MainActivity", "Gate1 FAIL: buildGridStateFromOverlay() returned null ($reason)")
+            }
+        }
+
+        fun rerenderFromCanonical() {
+            val boldCorrected = BooleanArray(81) { i -> uiAuto[i] || uiManual[i] }
+
+            resultsSudokuView?.setUiData(
+                displayDigits = uiDigits,
+                displayConfs = uiConfs,
+                shownIsGiven = uiGiven,
+                shownIsSolution = uiSol,
+                candidatesMask = uiCand,
+                shownIsAutoCorrected = boldCorrected
+            )
+        }
+
+        val runner = object : com.contextionary.sudoku.conductor.EffectRunner {
+
+            override fun run(
+                effect: com.contextionary.sudoku.conductor.Eff,
+                emit: (com.contextionary.sudoku.conductor.Evt) -> Unit
+            ) {
+                try {
+                    when (effect) {
+
+                        is com.contextionary.sudoku.conductor.Eff.UpdateUiMessage -> {
+                            runOnUiThread {
+                                runCatching { updateSudoMessage(effect.text) }
+                                    .onFailure { android.util.Log.w("MainActivity", "UpdateUiMessage failed", it) }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.Speak -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "Speak",
+                                    "text_len" to effect.text.length,
+                                    "listen_after" to effect.listenAfter
+                                )
+                            )
+
+                            lastAssistantSpoken = effect.text
+
+                            runOnUiThread {
+                                runCatching { speakAssistant(effect.text, listenAfter = effect.listenAfter) }
+                                    .onFailure { android.util.Log.w("MainActivity", "Speak failed", it) }
+                            }
+                        }
+
+                        // ✅ NEW: Focus highlight (pulsing yellow border)
+                        is com.contextionary.sudoku.conductor.Eff.SetFocusCell -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "SetFocusCell",
+                                    "cellIndex" to (effect.cellIndex ?: -1),
+                                    "reason" to (effect.reason ?: "")
+                                )
+                            )
+                            runOnUiThread {
+                                runCatching {
+                                    val v = resultsSudokuView ?: return@runCatching
+                                    val idx = effect.cellIndex
+                                    if (idx != null && idx in 0..80) {
+                                        v.startConfirmationPulse(idx)
+                                    } else {
+                                        v.stopConfirmationPulse()
+                                    }
+                                }.onFailure { t ->
+                                    android.util.Log.w("MainActivity", "SetFocusCell failed", t)
+                                }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.RequestListen -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "RequestListen",
+                                    "reason" to effect.reason
+                                )
+                            )
+                            android.util.Log.i("MainActivity", "Eff.RequestListen(reason=${effect.reason})")
+                            requestListenCompat(reason = "eff:${effect.reason}")
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.StopAsr -> {
+                            android.util.Log.i("MainActivity", "Eff.StopAsr(reason=${effect.reason})")
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf("type" to "EFF_STOP_ASR", "reason" to effect.reason)
+                            )
+
+                            runCatching { asr?.stop() }
+                                .recoverCatching {
+                                    invokeNoArgIfExists(asr, "stop")
+                                    invokeNoArgIfExists(asr, "cancel")
+                                }
+                                .onFailure { android.util.Log.w("MainActivity", "StopAsr failed", it) }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.ApplyCellEdit -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "ApplyCellEdit",
+                                    "cellIndex" to effect.cellIndex,
+                                    "digit" to effect.digit,
+                                    "source" to effect.source
+                                )
+                            )
+
+                            val seq = ++applyEditSeq
+                            val idx = effect.cellIndex
+                            val d = effect.digit
+
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "APPLY_CELL_EDIT_BEGIN",
+                                    "edit_seq" to seq,
+                                    "cellIndex" to idx,
+                                    "digit" to d,
+                                    "source" to effect.source
+                                )
+                            )
+
+                            runOnUiThread {
+                                runCatching {
+                                    if (idx !in 0..80 || d !in 0..9) return@runCatching
+                                    if (resultsSudokuView == null || resultsDigits == null || resultsConfidences == null) {
+                                        android.util.Log.w("MainActivity", "ApplyCellEdit ignored: results UI not ready")
+                                        return@runCatching
+                                    }
+
+                                    val old = uiDigits[idx]
+                                    uiDigits[idx] = d
+                                    uiConfs[idx] = 1.0f
+
+                                    if (d == 0) {
+                                        uiGiven[idx] = false
+                                        uiSol[idx] = false
+                                    }
+
+                                    uiCand[idx] = 0
+
+                                    uiAuto[idx] = false
+                                    uiManual[idx] = true
+
+                                    System.arraycopy(uiDigits, 0, resultsDigits!!, 0, 81)
+                                    System.arraycopy(uiConfs, 0, resultsConfidences!!, 0, 81)
+
+                                    rerenderFromCanonical()
+                                    emitSnapshotOnce(emit, reason = "apply_cell_edit idx=$idx", seq = seq)
+
+                                    if (old != d) {
+                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                            mapOf(
+                                                "type" to "APPLY_CELL_EDIT_APPLIED",
+                                                "edit_seq" to seq,
+                                                "cellIndex" to idx,
+                                                "from" to old,
+                                                "to" to d,
+                                                "source" to effect.source
+                                            )
+                                        )
+                                    }
+                                }.onFailure { t ->
+                                    android.util.Log.w("MainActivity", "ApplyCellEdit failed", t)
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "APPLY_CELL_EDIT_CRASH",
+                                            "edit_seq" to seq,
+                                            "err" to (t.message ?: t.toString())
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.ConfirmCellValue -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "ConfirmCellValue",
+                                    "cellIndex" to effect.cellIndex,
+                                    "digit" to effect.digit,
+                                    "source" to effect.source,
+                                    "changed" to effect.changed
+                                )
+                            )
+
+                            val seq = ++applyEditSeq
+                            val idx = effect.cellIndex
+                            val d = effect.digit
+
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "CONFIRM_CELL_VALUE_BEGIN",
+                                    "edit_seq" to seq,
+                                    "cellIndex" to idx,
+                                    "digit" to d,
+                                    "source" to effect.source,
+                                    "changed" to effect.changed
+                                )
+                            )
+
+                            runOnUiThread {
+                                runCatching {
+                                    if (idx !in 0..80 || d !in 0..9) return@runCatching
+                                    if (resultsSudokuView == null) return@runCatching
+
+                                    uiConfirmed[idx] = true
+
+                                    emitSnapshotOnce(
+                                        emit,
+                                        reason = "confirm_cell_value idx=$idx changed=${effect.changed}",
+                                        seq = seq
+                                    )
+
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "CONFIRM_CELL_VALUE_APPLIED",
+                                            "edit_seq" to seq,
+                                            "cellIndex" to idx,
+                                            "digit" to d,
+                                            "changed" to effect.changed
+                                        )
+                                    )
+                                }.onFailure { t ->
+                                    android.util.Log.w("MainActivity", "ConfirmCellValue failed", t)
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "CONFIRM_CELL_VALUE_CRASH",
+                                            "edit_seq" to seq,
+                                            "err" to (t.message ?: t.toString())
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.ApplyCellClassify -> {
+                            val seq = ++applyEditSeq
+                            val idx = effect.cellIndex
+
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "APPLY_CELL_CLASSIFY_BEGIN",
+                                    "edit_seq" to seq,
+                                    "cellIndex" to idx,
+                                    "cellClass" to effect.cellClass.name,
+                                    "source" to effect.source
+                                )
+                            )
+
+                            runOnUiThread {
+                                runCatching {
+                                    if (idx !in 0..80) return@runCatching
+                                    if (resultsSudokuView == null) return@runCatching
+
+                                    when (effect.cellClass) {
+                                        com.contextionary.sudoku.conductor.CellClass.GIVEN -> {
+                                            uiGiven[idx] = true
+                                            uiSol[idx] = false
+                                        }
+                                        com.contextionary.sudoku.conductor.CellClass.SOLUTION -> {
+                                            uiGiven[idx] = false
+                                            uiSol[idx] = true
+                                        }
+                                        com.contextionary.sudoku.conductor.CellClass.EMPTY -> {
+                                            uiGiven[idx] = false
+                                            uiSol[idx] = false
+                                            uiDigits[idx] = 0
+                                            uiConfs[idx] = 1.0f
+                                            uiCand[idx] = 0
+                                            uiAuto[idx] = false
+                                            uiManual[idx] = true
+                                        }
+                                    }
+
+                                    rerenderFromCanonical()
+                                    emitSnapshotOnce(emit, reason = "apply_cell_classify idx=$idx", seq = seq)
+                                }.onFailure { t ->
+                                    android.util.Log.w("MainActivity", "ApplyCellClassify failed", t)
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "APPLY_CELL_CLASSIFY_CRASH",
+                                            "edit_seq" to seq,
+                                            "err" to (t.message ?: t.toString())
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.ApplyCellCandidatesMask -> {
+                            val seq = ++applyEditSeq
+                            val idx = effect.cellIndex
+                            val mask = effect.candidateMask
+
+                            runOnUiThread {
+                                runCatching {
+                                    if (idx !in 0..80) return@runCatching
+                                    uiCand[idx] = mask.coerceIn(0, (1 shl 9) - 1)
+                                    rerenderFromCanonical()
+                                    emitSnapshotOnce(emit, reason = "apply_candidates idx=$idx", seq = seq)
+                                }.onFailure { t ->
+                                    android.util.Log.w("MainActivity", "ApplyCellCandidatesMask failed", t)
+                                }
+                            }
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.CallPolicy -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "CallPolicy",
+                                    "reason" to effect.reason,
+                                    "turnId" to effect.turnId,
+                                    "mode" to (effect.mode?.name ?: "null"),
+                                    "userText_preview" to effect.userText.take(120)
+                                )
+                            )
+                            android.util.Log.w("MainActivity", "Eff.CallPolicy should be handled by SudoStore; ignoring.")
+                        }
+
+                        is com.contextionary.sudoku.conductor.Eff.CallPolicyContinuationTick2 -> {
+                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "EFFECT_RUN",
+                                    "effect" to "CallPolicyContinuationTick2",
+                                    "tool_results_n" to effect.toolResults.size,
+                                    "mode" to effect.mode.name,
+                                    "reason" to effect.reason,
+                                    "turnId" to effect.turnId
+                                )
+                            )
+
+                            lifecycleScope.launch {
+                                val t0 = android.os.SystemClock.elapsedRealtime()
+
+                                // ----------------------------
+                                // Minimal helpers (local-safe)
+                                // ----------------------------
+                                fun anyToString(x: Any?): String? = (x as? String)?.trim()
+
+                                fun argsToJsonObject(args: Map<String, Any?>): org.json.JSONObject {
+                                    val o = org.json.JSONObject()
+                                    for ((k, v) in args) {
+                                        when (v) {
+                                            null -> o.put(k, org.json.JSONObject.NULL)
+                                            is Boolean, is Int, is Long, is Double, is Float, is String -> o.put(k, v)
+                                            is Number -> o.put(k, v.toDouble())
+                                            is Map<*, *> -> {
+                                                @Suppress("UNCHECKED_CAST")
+                                                o.put(k, argsToJsonObject(v as Map<String, Any?>))
+                                            }
+                                            is List<*> -> {
+                                                val arr = org.json.JSONArray()
+                                                for (item in v) {
+                                                    when (item) {
+                                                        null -> arr.put(org.json.JSONObject.NULL)
+                                                        is Boolean, is Int, is Long, is Double, is Float, is String -> arr.put(item)
+                                                        is Number -> arr.put(item.toDouble())
+                                                        is Map<*, *> -> {
+                                                            @Suppress("UNCHECKED_CAST")
+                                                            arr.put(argsToJsonObject(item as Map<String, Any?>))
+                                                        }
+                                                        else -> arr.put(item.toString())
+                                                    }
+                                                }
+                                                o.put(k, arr)
+                                            }
+                                            else -> o.put(k, v.toString())
+                                        }
+                                    }
+                                    return o
+                                }
+
+                                // -----------------------------------------
+                                // ✅ Robust ToolCall factory via reflection
+                                // -----------------------------------------
+                                fun toConductorToolCall(wireName: String, args: Map<String, Any?>): com.contextionary.sudoku.conductor.ToolCall? {
+                                    val tcClass = com.contextionary.sudoku.conductor.ToolCall::class.java
+                                    val argsJson = argsToJsonObject(args)
+
+                                    // Candidate factory method names you likely have somewhere (ToolCall or ToolCall.Companion)
+                                    val methodNames = listOf(
+                                        "fromWire", "fromNameArgs", "from", "decode", "parse", "fromJson", "fromJSONObject", "fromMap"
+                                    )
+
+                                    // 1) Try Companion.INSTANCE methods first (most Kotlin patterns)
+                                    try {
+                                        val companion = tcClass.declaredClasses.firstOrNull { it.simpleName == "Companion" }
+                                        if (companion != null) {
+                                            val instField = companion.getDeclaredField("INSTANCE")
+                                            instField.isAccessible = true
+                                            val inst = instField.get(null)
+
+                                            // Try (String, JSONObject)
+                                            for (mn in methodNames) {
+                                                val m = companion.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 2 }
+                                                if (m != null) {
+                                                    val p0 = m.parameterTypes[0]
+                                                    val p1 = m.parameterTypes[1]
+                                                    val out = when {
+                                                        p0 == String::class.java && p1 == org.json.JSONObject::class.java ->
+                                                            m.invoke(inst, wireName, argsJson)
+                                                        p0 == String::class.java && Map::class.java.isAssignableFrom(p1) ->
+                                                            m.invoke(inst, wireName, args)
+                                                        else -> null
+                                                    }
+                                                    if (out is com.contextionary.sudoku.conductor.ToolCall) return out
+                                                }
+                                            }
+
+                                            // Try (JSONObject) where JSON contains name+args
+                                            val packed = org.json.JSONObject()
+                                                .put("name", wireName)
+                                                .put("args", argsJson)
+
+                                            for (mn in methodNames) {
+                                                val m = companion.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && it.parameterTypes[0] == org.json.JSONObject::class.java }
+                                                if (m != null) {
+                                                    val out = m.invoke(inst, packed)
+                                                    if (out is com.contextionary.sudoku.conductor.ToolCall) return out
+                                                }
+                                            }
+                                        }
+                                    } catch (_: Throwable) {
+                                        // ignore; we’ll try static methods next
+                                    }
+
+                                    // 2) Try static methods on ToolCall itself
+                                    try {
+                                        for (mn in methodNames) {
+                                            val m2 = tcClass.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 2 }
+                                            if (m2 != null) {
+                                                val p0 = m2.parameterTypes[0]
+                                                val p1 = m2.parameterTypes[1]
+                                                val out = when {
+                                                    p0 == String::class.java && p1 == org.json.JSONObject::class.java ->
+                                                        m2.invoke(null, wireName, argsJson)
+                                                    p0 == String::class.java && Map::class.java.isAssignableFrom(p1) ->
+                                                        m2.invoke(null, wireName, args)
+                                                    else -> null
+                                                }
+                                                if (out is com.contextionary.sudoku.conductor.ToolCall) return out
+                                            }
+                                        }
+
+                                        // Try static (JSONObject) packed
+                                        val packed = org.json.JSONObject()
+                                            .put("name", wireName)
+                                            .put("args", argsJson)
+
+                                        for (mn in methodNames) {
+                                            val m1 = tcClass.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && it.parameterTypes[0] == org.json.JSONObject::class.java }
+                                            if (m1 != null) {
+                                                val out = m1.invoke(null, packed)
+                                                if (out is com.contextionary.sudoku.conductor.ToolCall) return out
+                                            }
+                                        }
+                                    } catch (_: Throwable) {
+                                        // ignore
+                                    }
+
+                                    // Nothing matched
+                                    return null
+                                }
+
+                                try {
+                                    // Build fresh grid snapshot AFTER tools (overlay is canonical now)
+                                    val gs = buildGridStateFromOverlay()
+                                    if (gs == null) {
+                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                            mapOf(
+                                                "type" to "POLICY_CONTINUATION_ERR",
+                                                "err" to "grid_state_null",
+                                                "turnId" to effect.turnId
+                                            )
+                                        )
+                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
+                                        return@launch
+                                    }
+                                    val llmGridAfter = buildLLMGridStateFromOverlay(gs)
+
+                                    val ack = lastAssistantSpoken.trim()
+
+                                    // ✅ Coordinator returns logic.LlmToolCall
+                                    val llmTools: List<com.contextionary.sudoku.logic.LlmToolCall> = runCatching {
+                                        llmCoordinator.sendToLLMToolsContinuationTick2(
+                                            sessionId = sid,
+                                            systemPrompt = systemPromptText,
+                                            gridStateAfterTools = llmGridAfter,
+                                            llm1ReplyText = ack,
+                                            toolResults = effect.toolResults,
+                                            stateHeader = effect.stateHeader,
+                                            continuationUserMessage = "Continue.",
+                                            turnId = effect.turnId
+                                        )
+                                    }.getOrElse { callErr ->
+                                        val dt = android.os.SystemClock.elapsedRealtime() - t0
+                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                            mapOf(
+                                                "type" to "POLICY_CONTINUATION_CRASH",
+                                                "ms" to dt,
+                                                "turnId" to effect.turnId,
+                                                "err" to (callErr.message ?: callErr.toString())
+                                            )
+                                        )
+                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
+                                        return@launch
+                                    }
+
+                                    val dt = android.os.SystemClock.elapsedRealtime() - t0
+
+                                    // Extract reply text (wire-name is almost certainly "reply")
+                                    val replyText = llmTools
+                                        .firstOrNull { it.name.equals("reply", ignoreCase = true) }
+                                        ?.args
+                                        ?.get("text")
+                                        ?.toString()
+                                        ?.trim()
+                                        .orEmpty()
+
+                                    if (replyText.isBlank()) {
+                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                            mapOf(
+                                                "type" to "POLICY_CONTINUATION_EMPTY",
+                                                "ms" to dt,
+                                                "turnId" to effect.turnId
+                                            )
+                                        )
+                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
+                                        return@launch
+                                    }
+
+                                    // Convert to conductor ToolCall using existing factory (via reflection)
+                                    val conductorTools = llmTools.mapNotNull { tc ->
+                                        toConductorToolCall(tc.name, tc.args)
+                                    }
+
+                                    if (conductorTools.isEmpty()) {
+                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                            mapOf(
+                                                "type" to "POLICY_CONTINUATION_NO_TOOLCALL_FACTORY_MATCH",
+                                                "ms" to dt,
+                                                "turnId" to effect.turnId,
+                                                "llm_tool_names" to llmTools.map { it.name }
+                                            )
+                                        )
+                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
+                                        return@launch
+                                    }
+
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "POLICY_CONTINUATION_OK",
+                                            "ms" to dt,
+                                            "turnId" to effect.turnId,
+                                            "reply_len" to replyText.length,
+                                            "tool_n" to conductorTools.size,
+                                            // ToolCall may not expose .name; log the LLM wire names instead:
+                                            "tool_names" to llmTools.map { it.name }
+                                        )
+                                    )
+
+                                    // ✅ Most important: emit tools so Store/Conductor continues normally
+                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyTools(conductorTools))
+
+                                    // ✅ Optional compatibility event (keep if your store expects it)
+                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationReply(replyText))
+
+                                } catch (t: Throwable) {
+                                    val dt = android.os.SystemClock.elapsedRealtime() - t0
+                                    android.util.Log.e("MainActivity", "Tick2 crashed (dt=${dt}ms)", t)
+                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                                        mapOf(
+                                            "type" to "POLICY_CONTINUATION_CRASH",
+                                            "ms" to dt,
+                                            "turnId" to effect.turnId,
+                                            "err" to (t.message ?: t.toString())
+                                        )
+                                    )
+                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
+                                }
+                            }
+                        }
+
+                        else -> {
+                            android.util.Log.w("MainActivity", "Unhandled effect: ${effect::class.java.simpleName}")
+                        }
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.e("MainActivity", "EffectRunner.run crashed", t)
+                }
+            }
+
+            override fun applyTools(
+                tools: List<com.contextionary.sudoku.conductor.ToolCall>,
+                emit: (com.contextionary.sudoku.conductor.Evt) -> Unit
+            ) {
+                runCatching { emit(com.contextionary.sudoku.conductor.Evt.PolicyTools(tools)) }
+                    .onFailure { android.util.Log.e("MainActivity", "applyTools crashed", it) }
+            }
+        }
+
+        val conductor = com.contextionary.sudoku.conductor.SudoConductor()
+        val initial = com.contextionary.sudoku.conductor.SudoState(
+            sessionId = sid,
+            mode = com.contextionary.sudoku.conductor.SudoMode.FREE_TALK
+        )
+
+        sudoStore = com.contextionary.sudoku.conductor.SudoStore(
+            initial = initial,
+            conductor = conductor,
+            policy = policy,
+            effects = runner,
+            scope = lifecycleScope
+        )
+
+        android.util.Log.i("MainActivity", "sudoStore initialized OK (sessionId=$sid)")
+
+        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AppStarted())
+        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.CameraActive)
+    }
+
+
+    private fun runConversationRecoveryBeforeVoiceLoop() {
+        ConversationTelemetry.emit(
+            mapOf(
+                "type" to "TURN_RECOVERY_BEGIN",
+                "convo_session_id" to convoSessionId
+            )
+        )
+
+        // IMPORTANT:
+        // - promptBuilder should be your PromptBuilder instance
+        // - turnLifecycle should be YOUR lifecycle manager (NOT ComponentActivity.lifecycle)
+        // - turnStore should be your store (InMemoryTurnStore, etc.)
+        val pool: List<Any> = listOf(
+            convoSessionId,
+            persona,
+            promptBuilder,
+            turnLifecycle,
+            turnStore
+        )
+
+        val candidateNames = setOf("recover", "run", "resolve", "restore")
+
+        val rc = recovery
+
+        // Search public + declared methods (declared helps if you made it internal/private)
+        val methods = (rc.javaClass.methods.asList() + rc.javaClass.declaredMethods.asList())
+            .distinctBy { it.name + "#" + it.parameterTypes.joinToString(",") { t -> t.name } }
+
+        val m = methods.firstOrNull { method ->
+            if (method.name !in candidateNames) return@firstOrNull false
+            val pts = method.parameterTypes
+            // Can we satisfy every parameter type from our pool?
+            pts.all { pt -> pool.any { arg -> pt.isAssignableFrom(arg.javaClass) } }
+        }
+
+        if (m == null) {
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "TURN_RECOVERY_SKIPPED",
+                    "reason" to "no_compatible_method_found",
+                    "controller" to rc.javaClass.simpleName
+                )
+            )
+            Log.i("TurnRecovery", "No compatible RecoveryController method found; skipping.")
+            return
+        }
+
+        fun pickArgs(paramTypes: Array<Class<*>>): Array<Any?> {
+            val used = BooleanArray(pool.size)
+            return paramTypes.map { pt ->
+                var picked: Any? = null
+                for (i in pool.indices) {
+                    if (!used[i] && pt.isAssignableFrom(pool[i].javaClass)) {
+                        used[i] = true
+                        picked = pool[i]
+                        break
+                    }
+                }
+                picked
+            }.toTypedArray()
+        }
+
+        runCatching {
+            m.isAccessible = true
+            val args = pickArgs(m.parameterTypes)
+            m.invoke(rc, *args)
+
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "TURN_RECOVERY_OK",
+                    "method" to m.name,
+                    "controller" to rc.javaClass.simpleName
+                )
+            )
+            Log.i("TurnRecovery", "Recovery invoked via ${rc.javaClass.simpleName}.${m.name}(...)")
+        }.onFailure { t ->
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "TURN_RECOVERY_ERROR",
+                    "method" to m.name,
+                    "controller" to rc.javaClass.simpleName,
+                    "message" to (t.message ?: t.toString())
+                )
+            )
+            Log.w("TurnRecovery", "Recovery failed via ${m.name}", t)
+        }
+    }
+
+    private inline fun <T> List<T>.indexOfFirstIndexed(predicate: (Int, T) -> Boolean): Int {
+        for (i in indices) if (predicate(i, this[i])) return i
+        return -1
     }
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     override fun onDestroy() {
-        // Stop any Azure playback first (if active)
-        try { azureTts?.stop() } catch (_: Throwable) {}
+        // 0) Kill any delayed runnables (e.g., post-speak auto-listen)
+        runCatching { mainHandler.removeCallbacksAndMessages(null) }
 
-        // Then stop local Android TTS
-        try {
-            if (::tts.isInitialized) {
-                tts.stop()
-                tts.shutdown()
-            }
-        } catch (_: Throwable) {}
+        // 1) ASR lifecycle (owned by SudoASR, but nullable)
+        runCatching { withAsr { it.stop() } }
+        runCatching { voiceBars?.stopSpeaking(source = "asr_rms") }
+        runCatching { withAsr { it.release() } }
+        asr = null
 
-        super.onDestroy()
+        // 2) Stop any TTS playback and visuals
+        runCatching { azureTts?.stop() }
+        azureTts = null
 
-        if (::analyzerExecutor.isInitialized) analyzerExecutor.shutdown()
-        if (::shutter.isInitialized) {
-            try { shutter.release() } catch (_: Throwable) {}
+        if (::tts.isInitialized) {
+            runCatching { tts.stop() }
+            runCatching { tts.shutdown() }
         }
+        runCatching { voiceBars?.stopSpeaking(source = "tts_cleanup") }
+
+        // 3) Release audio focus
+        runCatching { abandonAudioFocus() }
+
+        // 4) Camera / analysis resources
+        if (::analyzerExecutor.isInitialized) runCatching { analyzerExecutor.shutdown() }
+        if (::shutter.isInitialized) runCatching { shutter.release() }
+
+        // 5) Call super
+        super.onDestroy()
     }
 
 
@@ -748,6 +2527,7 @@ class MainActivity : ComponentActivity() {
         stopSpeaking()
         super.onPause()
     }
+
 
 
     private fun requestAudioFocus(): Boolean {
@@ -769,6 +2549,87 @@ class MainActivity : ComponentActivity() {
     private fun abandonAudioFocus() {
         focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
         focusRequest = null
+    }
+
+    @Volatile private var asrSuppressedByTts: Boolean = false
+
+    private fun pauseAsrForTts(reason: String) {
+        if (asrSuppressedByTts) return
+        asrSuppressedByTts = true
+
+        ConversationTelemetry.emit(mapOf("type" to "ASR_PAUSE_FOR_TTS", "reason" to reason))
+
+        // Contract-safe: suppress + cancel any active ASR row
+        runCatching { asr?.setSpeaking(true) }
+    }
+
+
+
+
+    private fun initAzureTtsIfConfigured() {
+        val key = BuildConfig.AZURE_SPEECH_KEY
+        val region = BuildConfig.AZURE_SPEECH_REGION
+
+        if (key.isBlank() || region.isBlank()) {
+            Log.i("SudokuTTS", "Azure TTS disabled (missing key/region); using local Android TTS.")
+            azureTts = null
+            return
+        }
+
+        try {
+            azureTts = AzureCloudTtsEngine(
+                context = this,
+                subscriptionKey = key,
+                region = region
+            ).apply {
+                // IMPORTANT: AzureCloudTtsEngine must have:
+                //   var onStopped: ((ttsId: Int, source: String) -> Unit)? = null
+                onStopped = { ttsId, source ->
+                    runOnUiThread {
+                        val isPreempt = (source == "pre_new_tts" || source.startsWith("pre_"))
+
+                        // Bars must always stop (truthfulness), even on preempt.
+                        voiceBars?.stopSpeaking(
+                            source = "tts_azure_stop:$source",
+                            truthful = true
+                        )
+
+                        if (isPreempt) {
+                            // During preemption we are about to speak again.
+                            // Do NOT lift suppression and do NOT complete the turn here.
+                            ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "AZURE_STOP_CLEANUP_SKIPPED_PREEMPT",
+                                    "tts_id" to ttsId,
+                                    "source" to source
+                                )
+                            )
+                            return@runOnUiThread
+                        }
+
+                        // Terminal cleanup (real end):
+                        asrSuppressedByTts = false
+                        runCatching { asr?.setSpeaking(false) }
+
+                        // Conductor completion signal
+                        turnController.onTtsFinished()
+
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "AZURE_STOP_CLEANUP_RAN",
+                                "tts_id" to ttsId,
+                                "source" to source
+                            )
+                        )
+                    }
+                }
+            }
+
+            Log.i("SudokuTTS", "Azure TTS enabled ($region)")
+        } catch (t: Throwable) {
+            Log.e("SudokuTTS", "Azure TTS init failed; will use local Android TTS", t)
+            azureTts = null
+        }
     }
 
 
@@ -797,143 +2658,376 @@ class MainActivity : ComponentActivity() {
 
 
     // Speak Sudo's message (queued). Milestone 7 will set Locale per utterance.
-    private fun speakAssistant(message: String) {
-        // Build SSML (force voice + locale that Azure eastus accepts)
+    // Speak, and optionally auto-listen as soon as speech ends (Azure preferred).
+    private fun speakAssistant(message: String, listenAfter: Boolean = true) {
+
+        fun shortPreview(s: String, n: Int = 90): String {
+            val oneLine = s.replace("\n", " ").trim()
+            return if (oneLine.length <= n) oneLine else oneLine.take(n) + "…"
+        }
+
+        fun callerHint(): String {
+            val st = Throwable().stackTrace
+            val hit = st.firstOrNull { it.className.contains("MainActivity") && it.methodName != "speakAssistant" }
+            return if (hit != null) "${hit.methodName}:${hit.lineNumber}" else "unknown"
+        }
+
+        // Reflection helper: request listen via TurnController/ASR if method name differs.
+        fun invokeNoArgIfExists(target: Any?, methodName: String): Boolean {
+            if (target == null) return false
+            return runCatching {
+                val m = target::class.java.methods.firstOrNull { it.name == methodName && it.parameterTypes.isEmpty() }
+                if (m != null) {
+                    m.isAccessible = true
+                    m.invoke(target)
+                    true
+                } else false
+            }.getOrDefault(false)
+        }
+
+        fun invokeStringArgIfExists(target: Any?, methodName: String, arg: String): Boolean {
+            if (target == null) return false
+            return runCatching {
+                val m = target::class.java.methods.firstOrNull {
+                    it.name == methodName &&
+                            it.parameterTypes.size == 1 &&
+                            it.parameterTypes[0] == String::class.java
+                }
+                if (m != null) {
+                    m.isAccessible = true
+                    m.invoke(target, arg)
+                    true
+                } else false
+            }.getOrDefault(false)
+        }
+
+        fun requestListenCompat(reason: String) {
+            // Don’t fight the conductor; this is a compatibility fallback.
+            // It should be idempotent if your TurnController ignores duplicate requests.
+            runOnUiThread {
+                if (isSpeaking || asrSuppressedByTts) {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "REQUEST_LISTEN_SUPPRESSED",
+                            "reason" to reason,
+                            "isSpeaking" to isSpeaking,
+                            "asrSuppressedByTts" to asrSuppressedByTts
+                        )
+                    )
+                    return@runOnUiThread
+                }
+
+                val usedTurnController =
+                    invokeStringArgIfExists(turnController, "requestListen", reason) ||
+                            invokeStringArgIfExists(turnController, "onRequestListen", reason) ||
+                            invokeStringArgIfExists(turnController, "startListening", reason)
+
+                if (usedTurnController) {
+                    ConversationTelemetry.emit(mapOf("type" to "REQUEST_LISTEN_OK", "via" to "turnController", "reason" to reason))
+                    return@runOnUiThread
+                }
+
+                val usedAsr =
+                    invokeNoArgIfExists(asr, "start") ||
+                            invokeNoArgIfExists(asr, "startListening") ||
+                            invokeStringArgIfExists(asr, "start", reason) ||
+                            invokeStringArgIfExists(asr, "startListening", reason)
+
+                if (usedAsr) {
+                    ConversationTelemetry.emit(mapOf("type" to "REQUEST_LISTEN_OK", "via" to "asr", "reason" to reason))
+                } else {
+                    ConversationTelemetry.emit(mapOf("type" to "REQUEST_LISTEN_FAILED", "reason" to reason))
+                    Log.w("MainActivity", "listenAfter fallback: could not find a start/listen method on turnController or asr")
+                }
+            }
+        }
+
+        // -------- Single-flight: never overlap TTS --------
+        synchronized(speakLock) {
+            if (speakInFlight) {
+                // Keep only the latest message (last-write-wins)
+                queuedSpeak = Pair(message, listenAfter)
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_QUEUED_WHILE_SPEAKING",
+                        "len" to message.length,
+                        "hash" to message.hashCode(),
+                        "preview" to shortPreview(message),
+                        "listenAfter" to listenAfter,
+                        "caller" to callerHint()
+                    )
+                )
+                return
+            }
+            speakInFlight = true
+        }
+
+        ConversationTelemetry.emit(
+            mapOf(
+                "type" to "TTS_REQUEST",
+                "len" to message.length,
+                "hash" to message.hashCode(),
+                "preview" to shortPreview(message),
+                "listenAfter" to listenAfter,
+                "caller" to callerHint(),
+                "azure_ready" to (isAzureConfigured() && azureTts?.isReady() == true)
+            )
+        )
+
+        fun releaseAndMaybeDrainQueue() {
+            val next: Pair<String, Boolean>?
+            synchronized(speakLock) {
+                speakInFlight = false
+                next = queuedSpeak
+                queuedSpeak = null
+            }
+            if (next != null) {
+                ConversationTelemetry.emit(mapOf("type" to "TTS_DEQUEUED_NEXT"))
+                speakAssistant(next.first, next.second)
+            }
+        }
+
+        if (showCaptions) updateSudoMessage(message)
+
+        // Correlate this assistant speak with the last accepted user ASR row (if any)
+        val speakReqId = nextSpeakReqId++
+        val replyToRowId = turnController.consumeLastAcceptedRowId()
+        if (replyToRowId != null) {
+            ConversationTelemetry.emitTurnPair(rowId = replyToRowId, speakReqId = speakReqId)
+        }
+
+        // Log exactly what Sudo is about to say (before any engine starts)
+        logSudoSay(message, speakReqId = speakReqId, replyToRowId = replyToRowId)
+
         val (ssml, localeTag) = buildSsml(message)
 
-        // Stop anything currently talking
-        try { azureTts?.stop() } catch (_: Throwable) {}
-        try { tts.stop() } catch (_: Throwable) {}
-        voiceBars?.stopSpeaking()
+        val finishOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+        val didRealStart = java.util.concurrent.atomic.AtomicBoolean(false)
+        val barsStarted = java.util.concurrent.atomic.AtomicBoolean(false)
 
+        fun uiPrepareToSpeak(engineTag: String) {
+            isSpeaking = true
+            asrSuppressedByTts = true
+            runCatching { asr?.setSpeaking(true) }
 
+            pauseAsrForTts(reason = "tts_prepare:$engineTag")
+            requestAudioFocus()
+            // 🚫 Do NOT start bars here (truthfulness)
+        }
 
-        // Azure route (with clean fallback to Android TTS)
+        fun uiOnRealPlaybackStart(engineTag: String) {
+            if (barsStarted.compareAndSet(false, true)) {
+                voiceBars?.startSpeaking(source = "tts_$engineTag", truthful = true)
+            }
+        }
+
+        fun uiFinishSpeaking(engineTag: String, finishReason: String) {
+            if (!finishOnce.compareAndSet(false, true)) return
+
+            isSpeaking = false
+
+            if (barsStarted.compareAndSet(true, false)) {
+                voiceBars?.stopSpeaking(source = "tts_$engineTag", truthful = true)
+            } else {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "UI_BARS_STOP_SKIPPED_NOT_STARTED",
+                        "engine" to engineTag,
+                        "reason" to finishReason
+                    )
+                )
+            }
+
+            abandonAudioFocus()
+
+            asrSuppressedByTts = false
+            runCatching { asr?.setSpeaking(false) }
+
+            // IMPORTANT: onTtsFinished must be fired EXACTLY ONCE per actual playback.
+            if (didRealStart.get()) {
+                turnController.onTtsFinished()
+            } else {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_FINISH_SKIPPED_NOT_STARTED",
+                        "engine" to engineTag,
+                        "reason" to finishReason
+                    )
+                )
+            }
+
+            // Compatibility fallback:
+            // If your conductor relies only on Eff.Speak(listenAfter=true) and forgets to issue Eff.RequestListen,
+            // we still kick listening here. If the conductor ALSO issues RequestListen, your TurnController should
+            // ignore duplicates (idempotent).
+            if (listenAfter) {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "LISTEN_AFTER_COMPAT_REQUEST",
+                        "engine" to engineTag,
+                        "reason" to finishReason
+                    )
+                )
+                requestListenCompat(reason = "listenAfter:$engineTag:$finishReason")
+            }
+
+            releaseAndMaybeDrainQueue()
+        }
+
+        // Prefer Azure if configured and ready
         if (isAzureConfigured() && azureTts?.isReady() == true) {
-            Log.i("SudokuTTS", "speakAssistant: Azure path? ${isAzureConfigured()} & ${azureTts?.isReady()==true}")
             val engine = azureTts!!
             lifecycleScope.launch {
                 try {
+                    runOnUiThread {
+                        uiPrepareToSpeak(engineTag = "azure")
+                        Log.i("SudoVoice", "TTS_BEGIN engine=Azure locale=$localeTag")
+                    }
+
                     engine.speakSsml(
                         ssml = ssml,
-                        voiceName = "en-US-JennyNeural",   // must match buildSsml()
+                        voiceName = "en-US-JennyNeural",
                         localeTag = localeTag,
+                        speakReqId = speakReqId,
+                        replyToRowId = replyToRowId,
+
                         onStart = {
                             runOnUiThread {
-                                requestAudioFocus()
-                                voiceBars?.startSpeaking()
+                                didRealStart.set(true)
+                                Log.i("SudoVoice", "TTS_START engine=Azure locale=$localeTag")
+                                turnController.onSystemSpeaking("azure_tts_start")
+                                uiOnRealPlaybackStart(engineTag = "azure")
                             }
                         },
+
                         onDone = {
                             runOnUiThread {
-                                voiceBars?.stopSpeaking()
-                                abandonAudioFocus()
+                                Log.i("SudoVoice", "TTS_DONE engine=Azure")
+                                uiFinishSpeaking(engineTag = "azure", finishReason = "azure_tts_done")
                             }
                         },
+
                         onError = { err ->
-                            Log.w("SudokuTTS", "Azure speak error — falling back to Android TTS.", err)
-                            runOnUiThread { speakWithAndroidTts(message) }
+                            runOnUiThread {
+                                Log.w("SudoVoice", "TTS_ERROR engine=Azure; falling back to Android", err)
+                                uiFinishSpeaking(engineTag = "azure", finishReason = "azure_tts_error")
+                                speakWithAndroidTts(
+                                    message,
+                                    listenAfter = listenAfter,
+                                    speakReqId = speakReqId,
+                                    replyToRowId = replyToRowId
+                                )
+                            }
                         }
                     )
                 } catch (t: Throwable) {
-                    Log.w("SudokuTTS", "Azure threw before playback — falling back to Android TTS.", t)
-                    runOnUiThread { speakWithAndroidTts(message) }
+                    runOnUiThread {
+                        Log.w("SudoVoice", "Azure speak threw; falling back to Android", t)
+                        uiFinishSpeaking(engineTag = "azure", finishReason = "azure_tts_throw")
+                        speakWithAndroidTts(
+                            message,
+                            listenAfter = listenAfter,
+                            speakReqId = speakReqId,
+                            replyToRowId = replyToRowId
+                        )
+                    }
                 }
             }
-        } else {
-            // Fallback: local Android TTS (works offline)
-            Log.i("SudokuTTS", "speakAssistant: using Android TTS fallback")
-            speakWithAndroidTts(message)
+            return
         }
+
+        // Fallback: Android TTS
+        speakWithAndroidTts(
+            message,
+            listenAfter = listenAfter,
+            speakReqId = speakReqId,
+            replyToRowId = replyToRowId
+        )
     }
 
 
 
 
-
-
-
-
-
-
-
-    // MainActivity.kt — ADD THIS helper anywhere in the class
-    private fun toSimpleSsml(text: String): String {
-        // Mildly humanized prosody; safe for most neural engines
-        val escaped = text
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-
-        return """
-        <speak version="1.0" xml:lang="${java.util.Locale.getDefault().toLanguageTag()}">
-          <prosody rate="medium" pitch="+2st">
-            $escaped
-          </prosody>
-        </speak>
-    """.trimIndent()
+    private fun iou(a: RectF, b: RectF): Float {
+        val ix = maxOf(0f, minOf(a.right, b.right) - maxOf(a.left, b.left))
+        val iy = maxOf(0f, minOf(a.bottom, b.bottom) - maxOf(a.top, b.top))
+        val inter = ix * iy
+        val areaA = a.width() * a.height()
+        val areaB = b.width() * b.height()
+        val uni = areaA + areaB - inter
+        return if (uni <= 0f) 0f else inter / uni
     }
+
+    private fun centerDriftPx(a: RectF, b: RectF): Float {
+        val ax = a.centerX(); val ay = a.centerY()
+        val bx = b.centerX(); val by = b.centerY()
+        val dx = ax - bx; val dy = ay - by
+        return kotlin.math.sqrt(dx*dx + dy*dy)
+    }
+
+    private fun sizeDriftFrac(a: RectF, b: RectF): Float {
+        val dw = kotlin.math.abs(a.width()  - b.width())  / maxOf(1f, b.width())
+        val dh = kotlin.math.abs(a.height() - b.height()) / maxOf(1f, b.height())
+        return maxOf(dw, dh)
+    }
+
+
 
     // MainActivity.kt — ADD THIS if missing
-    private fun speakWithAndroidTts(text: String) {
+    // Android TTS fallback. Do NOT set your own listener here; initTtsListener() owns it.
+    // Android TTS fallback. initTtsListener() owns the TTS listener.
+    private fun speakWithAndroidTts(
+        text: String,
+        listenAfter: Boolean = false,
+        speakReqId: Int? = null,
+        replyToRowId: Int? = null
+    ) {
         if (!ttsReady) {
             Log.w("SudokuTTS", "Android TTS not ready; dropping line")
             return
         }
 
         val params = Bundle()
-        val uttId = "sudo-${System.currentTimeMillis()}"
 
-        tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                runOnUiThread {
-                    requestAudioFocus()
-                    voiceBars?.startSpeaking()
-                }
-            }
-            override fun onDone(utteranceId: String?) {
-                runOnUiThread {
-                    voiceBars?.stopSpeaking()
-                    abandonAudioFocus()
-                }
-            }
-            override fun onError(utteranceId: String?) {
-                runOnUiThread {
-                    voiceBars?.stopSpeaking()
-                    abandonAudioFocus()
-                }
-            }
-        })
+        // ✅ Encode correlation ids so initTtsListener can recover them reliably.
+        val sr = speakReqId?.toString() ?: "na"
+        val rr = replyToRowId?.toString() ?: "na"
+        val uttId = "sr${sr}_rr${rr}_${System.currentTimeMillis()}"
 
-        tts.speak(text, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, uttId)
+        lastUtteranceId = uttId
+        pendingListenAfterUtteranceId = if (listenAfter) uttId else null
+
+        // ✅ Suppress ASR (do not force-stop here; listener/conductor handles lifecycle)
+        pauseAsrForTts(reason = "android_tts_enqueue")
+
+        ConversationTelemetry.emit(
+            mapOf(
+                "type" to "TTS_ENQUEUE",
+                "engine" to "Android",
+                "utterance_id" to uttId,
+                "speak_req_id" to speakReqId,
+                "reply_to_row_id" to replyToRowId,
+                "listen_after" to listenAfter,
+                "text_len" to text.length
+            )
+        )
+
+        Log.i(
+            "SudoVoice",
+            "TTS_ENQUEUE engine=Android locale=${java.util.Locale.getDefault().toLanguageTag()} uttId=$uttId listenAfter=$listenAfter"
+        )
+
+        tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uttId)
     }
 
 
-    private fun speakWithLocalTts(message: String, utteranceId: String) {
-        val params = android.os.Bundle().apply {
-            putString(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
-        }
-        // Rate/pitch personalization can be handled elsewhere (e.g., your stylist)
-        tts.speak(message, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+
+    private fun postMainDelayed(delayMs: Long, block: () -> Unit) {
+        mainHandler.postDelayed({ block() }, delayMs)
     }
 
 
-    private fun speakAssistantWithAndroidTts(spokenText: String, styled: SudoVoiceStyler.Styled) {
-        try {
-            // apply per-line rate/pitch if present; else defaults (you already init them)
-            styled.speechRate?.let { tts.setSpeechRate(it) }
-            styled.pitch?.let { tts.setPitch(it) }
 
-            val id = "sudo_${System.currentTimeMillis()}"
-            lastUtteranceId = id
-            val params = android.os.Bundle()
-            params.putString("utteranceId", id)
-            tts.speak(spokenText, android.speech.tts.TextToSpeech.QUEUE_FLUSH, params, id)
-        } catch (t: Throwable) {
-            Log.e("SudokuTTS", "Local TTS failed", t)
-            voiceBars?.stopSpeaking()
-        }
-    }
 
 
 
@@ -950,31 +3044,17 @@ class MainActivity : ComponentActivity() {
         }
 
         // Make sure visuals stop even if we didn't get an onDone()
-        voiceBars?.stopSpeaking()
+        //voiceBars?.stopSpeaking()
+        voiceBars?.stopSpeaking(source = "tts_cleanup")
 
         // Release audio focus
         abandonAudioFocus()
     }
 
-    private fun resetCaptureForFreshScan() {
-        // Let the analyzer run again
-        locked = false
-        handoffInProgress = false
-
-        // Unlock and clear the HUD
-        overlay.setLocked(false)
-        overlay.updateBoxes(emptyList(), HUD_DET_THRESH, 0)
-        overlay.updateCorners(null, null)
-        overlay.updateCornerCropRect(null)
-
-        // Optional: if you track frames, you can reset it
-        // frameIndex = 0
-
-        // Go back to initial gate visuals
-        changeGate(GateState.L1, "retake")
-    }
 
 
+
+    // Create the results Overlay (board + buttons) and size/align them precisely.
     // Create the results Overlay (board + buttons) and size/align them precisely.
     private fun ensureResultsOverlay() {
         if (resultsRoot != null) return
@@ -1001,10 +3081,7 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-
-
-
-        // --- Voice-first header: centered voice bars + (optional) caption line ---
+        // --- Voice-first header (kept as you had it) ---
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -1013,74 +3090,18 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = 16.dp() }
         }
-
-        // 1) Centered voice bars (hero)
         voiceBars = SudoVoiceBarsView(this).apply {
             id = View.generateViewId()
             val screenW = resources.displayMetrics.widthPixels
-            val targetW = (screenW * 0.40f).toInt()   // ≈ 55% of screen width (hero, not edge-to-edge)
-            layoutParams = LinearLayout.LayoutParams(
-                targetW,
-                72.dp()
-            ).apply {
+            val targetW = (screenW * 0.40f).toInt()
+            layoutParams = LinearLayout.LayoutParams(targetW, 72.dp()).apply {
                 bottomMargin = 12.dp()
                 gravity = Gravity.CENTER_HORIZONTAL
             }
         }
         header.addView(voiceBars)
-
         voiceBars?.setMinMax(minFrac = 0.45f, maxFrac = 0.90f)
 
-        // Sudo personality tweaks
-        voiceBars?.apply {
-            // Color (pick one)
-            setBarColor(0xFFFFFFFF.toInt())          // Pure white
-            // setBarColor(0xFF00D3C0.toInt())       // Sudo teal (optional)
-
-            // Tempo: bigger = slower, calmer
-            setTempoMs(1600L)
-
-            // Breathing range: slightly restrained for elegance
-            setMinMax(minFrac = 0.30f, maxFrac = 0.85f)
-        }
-
-        // 2) Small “CC” pill to toggle captions on/off (below bars)
-        /*
-        ccToggle = TextView(this).apply {
-            text = "CC"
-            setTextColor(0xFF000000.toInt())
-            typeface = Typeface.DEFAULT_BOLD
-            textSize = 12f
-            gravity = Gravity.CENTER
-            setPadding(10.dp(), 6.dp(), 10.dp(), 6.dp())
-            // Glassy look (tiny visual tweak)
-            background = GradientDrawable().apply {
-                cornerRadius = 12.dp().toFloat()
-                setColor(0x22FFFFFF)              // translucent white
-                setStroke(1.dp(), 0x33FFFFFF)     // subtle white border
-            }
-            alpha = if (showCaptions) 1.0f else 0.55f
-
-            setOnClickListener {
-                showCaptions = !showCaptions
-                sudoMessageTextView?.visibility = if (showCaptions) View.VISIBLE else View.GONE
-                alpha = if (showCaptions) 1.0f else 0.55f
-                try { it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP) } catch (_: Throwable) {}
-            }
-
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 4.dp()
-                bottomMargin = 4.dp()
-                gravity = Gravity.CENTER_HORIZONTAL
-            }
-        }
-        header.addView(ccToggle)
-        */
-
-        // 3) Optional one-line caption (hidden by default)
         sudoMessageTextView = TextView(this).apply {
             id = View.generateViewId()
             text = ""
@@ -1092,37 +3113,32 @@ class MainActivity : ComponentActivity() {
             visibility = if (showCaptions) View.VISIBLE else View.GONE
         }
         header.addView(sudoMessageTextView)
-
-        // Place header as the first element
         container.addView(header)
-
-
-
-
-
-
 
         // 1) Board view
         val boardView = SudokuResultView(this).apply {
             id = View.generateViewId()
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                0, // we’ll override height/width later
+                0, // height overridden after layout to enforce square
                 1f
-            ).apply {
-                setMargins(0, 0, 0, 24.dp())
-            }
+            ).apply { setMargins(0, 0, 0, 24.dp()) }
 
-            // Tap handler directly on the overlay board
             setOnCellClickListener(object : SudokuResultView.OnCellClickListener {
                 override fun onCellClicked(row: Int, col: Int) {
                     onOverlayCellClicked(row, col)
                 }
             })
+
+            // Long-press anywhere on the board → share PNG
+            setOnLongClickListener {
+                shareCurrentBoardPng()
+                true
+            }
         }
         resultsSudokuView = boardView
 
-        // 2) Button row (Retake / Keep)
+        // 2) Button row (Retake / Share / Keep)
         val buttonsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -1134,11 +3150,10 @@ class MainActivity : ComponentActivity() {
 
         val retakeBtnCtx = ContextThemeWrapper(this, R.style.Sudoku_Button_Outline)
         val keepBtnCtx   = ContextThemeWrapper(this, R.style.Sudoku_Button_Primary)
+        //val shareBtnCtx  = ContextThemeWrapper(this, R.style.Sudoku_Button_Outline)
 
         val btnRetake = MaterialButton(
-            retakeBtnCtx,
-            null,
-            com.google.android.material.R.attr.materialButtonOutlinedStyle
+            retakeBtnCtx, null, com.google.android.material.R.attr.materialButtonOutlinedStyle
         ).apply {
             text = "Retake"
             isAllCaps = false
@@ -1151,8 +3166,12 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+
+
+
+
         val btnKeep = MaterialButton(keepBtnCtx).apply {
-            text = "Keep"   // later "Send to solver"
+            text = "Keep"
             isAllCaps = false
             layoutParams = LinearLayout.LayoutParams(0, 52.dp(), 1f).apply {
                 setMargins(12.dp(), 0, 0, 0)
@@ -1163,111 +3182,41 @@ class MainActivity : ComponentActivity() {
         buttonsRow.addView(btnRetake)
         buttonsRow.addView(btnKeep)
 
-        // 3) Digit picker container (2 rows) under the buttons,
-        // ALWAYS takes space, but starts INVISIBLE (so showing/hiding it does not move layout).
+        // 3) Digit picker container (unchanged)
         digitPickerRow = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 12.dp()  // small gap under the Retake / Keep row
-            }
-            visibility = View.INVISIBLE   // IMPORTANT: not GONE → no layout jump
+            ).apply { topMargin = 12.dp() }
+            visibility = View.INVISIBLE // do not use GONE → avoid layout jumps
         }
 
-        // --- Helper: build a single digit chip using TextView ---
-        fun makeDigitChip(label: String, value: Int): TextView {
-            val tv = TextView(this)
-            tv.text = label
-            tv.isAllCaps = false
-            tv.setTextColor(Color.WHITE)
-            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
-            tv.gravity = Gravity.CENTER
+        // ... makeDigitChip(...) + rows (unchanged) ...
 
-            // Oval white-stroke, transparent fill
-            val bg = GradientDrawable().apply {
-                shape = GradientDrawable.RECTANGLE
-                cornerRadius = 999f
-                setColor(Color.TRANSPARENT)
-                setStroke(2.dp(), Color.WHITE)
-            }
-            tv.background = bg
-
-            tv.layoutParams = LinearLayout.LayoutParams(0, 40.dp(), 1f).apply {
-                setMargins(4.dp(), 0, 4.dp(), 0)
-            }
-
-            tv.isClickable = true
-            tv.isFocusable = true
-            tv.setOnClickListener { onOverlayDigitPicked(value) }
-
-            return tv
-        }
-
-        // Row 1: Clear, 1, 2, 3, 4
-        val pickerRowTop = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
-        }
-        pickerRowTop.addView(makeDigitChip("Clear", 0))
-        for (d in 1..4) {
-            pickerRowTop.addView(makeDigitChip(d.toString(), d))
-        }
-
-        // Row 2: 5, 6, 7, 8, 9
-        val pickerRowBottom = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                topMargin = 4.dp()
-            }
-        }
-        for (d in 5..9) {
-            pickerRowBottom.addView(makeDigitChip(d.toString(), d))
-        }
-
-        digitPickerRow?.addView(pickerRowTop)
-        digitPickerRow?.addView(pickerRowBottom)
-
-        // Add everything to the container
+        // Add everything
         container.addView(boardView)
         container.addView(buttonsRow)
         container.addView(digitPickerRow)
         resultsRoot!!.addView(container)
         (findViewById<ViewGroup>(android.R.id.content)).addView(resultsRoot)
 
-        // ---- After layout: compute a centered square, align buttons & picker to grid ----
+        // After layout: compute centered square & align (unchanged)
         resultsRoot!!.post {
             val rootW = resultsRoot!!.width
             val rootH = resultsRoot!!.height
 
-            val screenMargin   = 24.dp()   // outer margin
-            val btnHeight      = 52.dp()   // Retake / Keep row
-            val pickerHeight   = 40.dp() * 2 + 4.dp()  // approx for two rows
-            val gapAboveBtns   = 24.dp()   // space between board & button row
-            val gapBetweenRows = 12.dp()   // space between button row & picker container
+            val screenMargin   = 24.dp()
+            val btnHeight      = 52.dp()
+            val pickerHeight   = 40.dp() * 2 + 4.dp()
+            val gapAboveBtns   = 24.dp()
+            val gapBetweenRows = 12.dp()
 
-            // We *reserve* max picker height so nothing moves when we toggle INVISIBLE ↔ VISIBLE
             val availW = rootW - 2 * screenMargin
-            val availH = rootH -
-                    2 * screenMargin -
-                    btnHeight -
-                    pickerHeight -
-                    gapAboveBtns -
-                    gapBetweenRows
-
+            val availH = rootH - 2 * screenMargin - btnHeight - pickerHeight - gapAboveBtns - gapBetweenRows
             val boardSize = minOf(availW, availH)
 
-            // Fix the board to a centered square
             (resultsSudokuView?.layoutParams as LinearLayout.LayoutParams).apply {
                 width = boardSize
                 height = boardSize
@@ -1277,18 +3226,15 @@ class MainActivity : ComponentActivity() {
             }
             resultsSudokuView?.requestLayout()
 
-            // Make the button row the same width as the board
             (buttonsRow.layoutParams as LinearLayout.LayoutParams).apply {
                 width = boardSize
                 height = LinearLayout.LayoutParams.WRAP_CONTENT
                 gravity = Gravity.CENTER_HORIZONTAL
             }
-
             val gridPad = kotlin.math.max((boardSize * 0.04f).toInt(), 16.dp())
             buttonsRow.setPadding(gridPad, 0, gridPad, 0)
             buttonsRow.requestLayout()
 
-            // Make the digit picker container match the same width & alignment
             (digitPickerRow?.layoutParams as? LinearLayout.LayoutParams)?.apply {
                 width = boardSize
                 height = LinearLayout.LayoutParams.WRAP_CONTENT
@@ -1299,157 +3245,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-
-
-
-    // Show / dismiss results overlay
-
-    /*
-    private fun showResults(boardBitmap: Bitmap?, digits81: IntArray?) {
-        ensureResultsOverlay()
-
-        resultsDigits = digits81
-        resultsSudokuView?.setDigits(digits81 ?: IntArray(81))
-
-        resultsRoot?.apply {
-            visibility = View.VISIBLE
-            alpha = 0f
-            animate().alpha(1f).setDuration(180).start()
+    // --- New helper in MainActivity: export current overlay board and share ---
+    private fun shareCurrentBoardPng() {
+        val view = resultsSudokuView ?: return
+        try {
+            val bmp = view.renderToBitmap()
+            val name = "sudoku_${System.currentTimeMillis()}"
+            val uri = PngShareUtils.savePngToCache(
+                context = this,
+                fileName = "$name.png",
+                bmp = bmp
+            )
+            PngShareUtils.shareImage(this, uri, "Share Sudoku Board")
+        } catch (t: Throwable) {
+            android.util.Log.e("Share", "Failed to share board", t)
+            android.widget.Toast.makeText(this, "Share failed", android.widget.Toast.LENGTH_SHORT).show()
         }
-        overlay.alpha = 1f
-        previewView.alpha = 1f
-        overlay.animate().alpha(0f).setDuration(120).start()
-        previewView.animate().alpha(0f).setDuration(120).start()
     }
 
-     */
 
-    private fun showResults(boardBitmap: Bitmap?, digits81: IntArray?, confs81: FloatArray?) {
-        ensureResultsOverlay()
+    // Compose & show the result overlay from flat 81-arrays.
+// If we already have lastCellReadouts (full 3-head semantics), we delegate to
+// showResultsFromReadouts to keep printed-vs-handwritten perfect.
 
-        // Reset per-capture overlay edit sequence
-        overlayEditSeq = 0
-
-        resultsDigits = digits81
-        resultsConfidences = confs81
-
-        // Feed the view
-        if (digits81 != null && confs81 != null) {
-            resultsSudokuView?.setDigitsAndConfidences(digits81, confs81)
-        } else {
-            resultsSudokuView?.setDigits(digits81 ?: IntArray(81))
-        }
-
-
-        // NEW: temporary placeholder message until LLM is wired
-        updateSudoMessage("Hi, I’m Sudo 👋 Let’s make sure I copied your puzzle correctly.")
-
-        // Apply logic annotations from the last auto-correction
-        lastAutoCorrectionResult?.let { ac ->
-            // Cells that logic still considers suspicious → red borders
-            overlayUnresolved = ac.unresolvedIndices.toMutableSet()
-
-            // Cells the user is allowed to edit in the overlay.
-            // editable = unresolved ∪ changed
-            overlayEditable.clear()
-            overlayEditable.addAll(ac.unresolvedIndices)
-            overlayEditable.addAll(ac.changedIndices)
-
-            // Apply annotations to the view:
-            //  - changedIndices  → cyan borders
-            //  - overlayUnresolved → red borders
-            resultsSudokuView?.setLogicAnnotations(
-                changed = ac.changedIndices,
-                unresolved = overlayUnresolved.toList()
-            )
-        } ?: run {
-            overlayUnresolved.clear()
-            overlayEditable.clear()
-            resultsSudokuView?.setLogicAnnotations(
-                changed = emptyList(),
-                unresolved = emptyList()
-            )
-        }
-
-        // NEW: notify the conversation coordinator of the initial post-auto-correction state
-        buildGridStateFromOverlay()?.let { state ->
-            gridConversationCoordinator.onAutoCorrectionCompleted(state)
-        }
-
-
-
-
-        // After auto-correction + overlay update, once digits are final:
-        val auto = lastAutoCorrectionResult
-        val digitsAfter = resultsDigits
-        val confsAfter = resultsConfidences
-
-        if (auto != null && digitsAfter != null) {
-            // Reuse the same conflict logic as for GridState
-            val conflictIndicesForLlm = findConflictIndicesForDigits(digitsAfter)
-
-            // NEW: compute low-confidence cells for the LLM, using the same threshold as GridConversationCoordinator
-            val lowConfidenceIndicesForLlm = mutableListOf<Int>()
-            if (confsAfter != null) {
-                for (idx in 0 until 81) {
-                    val digit = digitsAfter[idx]
-                    val conf = confsAfter[idx]
-                    if (digit != 0 && conf < SudokuConfidence.THRESH_HIGH) {
-                        lowConfidenceIndicesForLlm.add(idx)
-                    }
-                }
-            }
-
-            val llmGridState = llmCoordinator.buildLLMGridState(
-                auto = auto,
-                conflicts = conflictIndicesForLlm,
-                lowConfidenceCells = lowConfidenceIndicesForLlm
-            )
-
-            lastGridSeverity = llmGridState.severity
-
-            val humanSummary = llmCoordinator.buildHumanSummary(llmGridState)
-
-            android.util.Log.i(
-                "SudokuLLM",
-                "LLMGridState: severity=${llmGridState.severity} unique=${llmGridState.uniqueSolvable} " +
-                        "unresolved=${llmGridState.unresolvedCells.size} changed=${llmGridState.changedCells.size} " +
-                        "conflicts=${llmGridState.conflictCells.size} summary=\"${humanSummary.message}\""
-            )
-
-            lifecycleScope.launch {
-                try {
-                    val (assistantMessage, action) = llmCoordinator.sendToLLM(
-                        systemPrompt = SudokuLLMPrompts.SYSTEM_PROMPT,
-                        gridState = llmGridState,
-                        userMessage = ""  // system-initiated for now
-                    )
-
-                    android.util.Log.i(
-                        "SudokuLLM",
-                        "assistant_message=\"$assistantMessage\" action=$action"
-                    )
-
-                    handleAssistantUpdate(assistantMessage, action)
-                } catch (t: Throwable) {
-                    android.util.Log.e("SudokuLLM", "LLM call failed", t)
-                }
-            }
-        }
-
-
-
-        // Make sure overlay is actually visible before animating
-        resultsRoot?.apply {
-            visibility = View.VISIBLE
-            alpha = 0f
-            animate().alpha(1f).setDuration(180).start()
-        }
-
-        // Fade out camera + HUD underneath
-        overlay.animate().alpha(0f).setDuration(120).start()
-        previewView.animate().alpha(0f).setDuration(120).start()
-    }
 
 
     // Is Azure key/region present at build time?
@@ -1469,39 +3287,35 @@ class MainActivity : ComponentActivity() {
     private fun onKeepResults() {
         val digits = resultsDigits ?: return
 
-        val intent = Intent(this, ResultActivity::class.java).apply {
-            putExtra("digits", digits)
+        // Keep the validation mark (you already do it in the Keep click)
+        // SessionStore.markValidated()  // <- keep this ONLY in the button handler
 
-            resultsConfidences?.let { confs ->
-                putExtra("confidences", confs)
-            }
+        // Option A: do nothing here—overlay already shows the final board.
+        // Optionally speak a short confirmation or show a toast:
+        Toast.makeText(this, "Saved. You can edit or solve now.", Toast.LENGTH_SHORT).show()
 
-            lastAutoCorrectionResult?.changedIndices?.let { changed ->
-                putExtra("changedIndices", changed.toIntArray())
-            }
-
-            lastAutoCorrectionResult?.unresolvedIndices?.let { unresolved ->
-                putExtra("unresolvedIndices", unresolved.toIntArray())
-            }
-        }
-
-        startActivity(intent)
-        // overridePendingTransition(0, 0)  // keep commented if you don't want animation
+        // If you previously had: startActivity(Intent(this, ResultActivity::class.java))
+        // just delete it. Your existing overlay is the “result screen”.
     }
 
 
 
 
+
+
+
+
     fun dismissResults(resumePreview: Boolean = true) {
-        // Stop voice (both engines) + visuals immediately
-        stopSpeaking()                  // now stops Azure + local + bars
+        stopSpeaking()
         sudoMessageTextView?.visibility = View.GONE
 
         resultsRoot?.visibility = View.GONE
         lastBoardBitmap = null
         lastDigits81 = null
 
-        // RESET RESULT OVERLAY STATE (important when retaking)
+        try { SessionStore.reset() } catch (_: Throwable) {}
+        resetUiArrays()
+
         digitPickerRow?.visibility = View.INVISIBLE
         selectedOverlayIdx = null
         overlayEditable.clear()
@@ -1509,83 +3323,166 @@ class MainActivity : ComponentActivity() {
         resultsSudokuView?.stopConfirmationPulse()
 
         if (resumePreview) {
+            // HARD RESET of capture/detector cycle
             captureLocked = false
+            stableCount = 0
+            lastDetRect = null
+            frameIndex = 0
+            lastInferMs = 0L
+
+            // If your overlay uses "locked" visuals, force-clear them here too
+            runOnUiThread {
+                overlay.setLocked(false)   // if exists in your OverlayView
+                overlay.postInvalidateOnAnimation()
+            }
+
             resumeAnalyzer()
         }
 
-        // Put the HUD back into a neutral/ready state
         changeGate(GateState.L1, "retake_resume")
-
         previewView.alpha = 1f
         overlay.alpha = 1f
-        overlay.postInvalidateOnAnimation()
     }
+
+
 
 
 
     private fun initTtsListener() {
         try {
             tts.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+
+                fun parseSpeakReqId(utt: String): Int? {
+                    val m = Regex("""\bsr(\d+)\b""").find(utt) ?: return null
+                    return m.groupValues[1].toIntOrNull()
+                }
+
+                fun parseReplyToRowId(utt: String): Int? {
+                    val m = Regex("""\brr(\d+)\b""").find(utt) ?: return null
+                    return m.groupValues[1].toIntOrNull()
+                }
+
                 override fun onStart(utteranceId: String?) {
-                    android.util.Log.i("SudokuTTS", "onStart id=$utteranceId")
                     runOnUiThread {
-                        // ✅ Bars start ONLY when audio actually begins
-                        voiceBars?.startSpeaking()
+                        isSpeaking = true
+
+                        asrSuppressedByTts = true
+                        runCatching { asr?.setSpeaking(true) }
+
+                        requestAudioFocus()
+
+                        val utt = utteranceId.orEmpty()
+                        val listenAfter = (utteranceId != null && utteranceId == pendingListenAfterUtteranceId)
+
+                        val speakReqId = parseSpeakReqId(utt)
+                        val replyToRowId = parseReplyToRowId(utt)
+
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "TTS_START",
+                                "engine" to "Android",
+                                "utterance_id" to utt,
+                                "speak_req_id" to speakReqId,
+                                "reply_to_row_id" to replyToRowId,
+                                "listen_after" to listenAfter
+                            )
+                        )
+
+                        turnController.onSystemSpeaking("android_tts_start")
+                        voiceBars?.startSpeaking(source = "tts_android", truthful = true)
+
+                        Log.i("SudoVoice", "TTS_START engine=Android uttId=$utt listenAfter=$listenAfter sr=$speakReqId rr=$replyToRowId")
                     }
                 }
+
+                private fun finishAndroidTts(
+                    utteranceId: String?,
+                    reason: String,
+                    isError: Boolean,
+                    errorCode: Int? = null
+                ) {
+                    runOnUiThread {
+                        isSpeaking = false
+                        voiceBars?.stopSpeaking(source = "tts_android", truthful = true)
+
+                        abandonAudioFocus()
+
+                        asrSuppressedByTts = false
+                        runCatching { asr?.setSpeaking(false) }
+
+                        // ✅ Conductor does cooldown + start listening
+                        turnController.onTtsFinished()
+
+                        val utt = utteranceId.orEmpty()
+                        val shouldListen = (utteranceId != null && utteranceId == pendingListenAfterUtteranceId)
+
+                        val speakReqId = parseSpeakReqId(utt)
+                        val replyToRowId = parseReplyToRowId(utt)
+
+                        val base = mutableMapOf<String, Any?>(
+                            "type" to (if (isError) "TTS_ERROR" else "TTS_DONE"),
+                            "engine" to "Android",
+                            "utterance_id" to utt,
+                            "speak_req_id" to speakReqId,
+                            "reply_to_row_id" to replyToRowId,
+                            "listen_after" to shouldListen,
+                            "reason" to reason
+                        )
+                        if (errorCode != null) base["error_code"] = errorCode
+                        ConversationTelemetry.emit(base)
+
+                        if (isError) {
+                            Log.w("SudoVoice", "TTS_ERROR engine=Android code=${errorCode ?: -1} uttId=$utt listenAfter=$shouldListen")
+                        } else {
+                            Log.i("SudoVoice", "TTS_DONE engine=Android uttId=$utt listenAfter=$shouldListen")
+                        }
+
+                        if (shouldListen) {
+                            pendingListenAfterUtteranceId = null
+                            ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "LISTEN_AFTER_DEFERRED_TO_CONDUCTOR",
+                                    "engine" to "Android",
+                                    "utterance_id" to utt,
+                                    "speak_req_id" to speakReqId,
+                                    "reply_to_row_id" to replyToRowId,
+                                    "reason" to "android_tts_finished"
+                                )
+                            )
+                        }
+                    }
+                }
+
                 override fun onDone(utteranceId: String?) {
-                    android.util.Log.i("SudokuTTS", "onDone id=$utteranceId")
-                    runOnUiThread {
-                        // ✅ Stop the bars exactly when audio ends
-                        voiceBars?.stopSpeaking()
-                    }
+                    finishAndroidTts(utteranceId, reason = "android_tts_done", isError = false)
                 }
+
                 @Suppress("OVERRIDE_DEPRECATION")
                 override fun onError(utteranceId: String?) {
-                    android.util.Log.w("SudokuTTS", "onError id=$utteranceId")
-                    runOnUiThread { voiceBars?.stopSpeaking() }
+                    finishAndroidTts(utteranceId, reason = "android_tts_error_deprecated", isError = true)
                 }
+
                 override fun onError(utteranceId: String?, errorCode: Int) {
-                    android.util.Log.w("SudokuTTS", "onError id=$utteranceId code=$errorCode")
-                    runOnUiThread { voiceBars?.stopSpeaking() }
+                    finishAndroidTts(utteranceId, reason = "android_tts_error", isError = true, errorCode = errorCode)
                 }
             })
         } catch (t: Throwable) {
-            android.util.Log.e("SudokuTTS", "Failed to set TTS listener", t)
+            Log.e("SudokuTTS", "Failed to set TTS listener", t)
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "TTS_LISTENER_ERROR",
+                    "engine" to "Android",
+                    "message" to (t.message ?: t.toString())
+                )
+            )
         }
     }
-
-
-
-
-
-
-    private fun estimateTempoMsFor(message: String): Long {
-        // Rough speech model: ~13–16 chars/sec at TTS rate 1.0; clamp for extremes
-        val chars = message.length.coerceIn(20, 240)
-        val rate = try { tts.voice?.let { 1.0f } ?: 1.0f } catch (_: Throwable) { 1.0f } // customize if you let users change rate
-        val charsPerSec = 14f * rate
-        val estSec = chars / charsPerSec
-
-        // Aim for ~2.2–2.8 cycles per second for short lines, slower for long ones
-        val targetHz = when {
-            estSec < 2.0f -> 2.5f
-            estSec < 4.5f -> 2.0f
-            else -> 1.3f
-        }
-        val ms = (1000f / targetHz).toLong()
-
-        // Keep within pleasant bounds
-        return ms.coerceIn(350L, 900L)
-    }
-
-
-
-
-
 
 
     private fun resumeAnalyzer() {
+
+        turnController.onCameraActive()
+
         // Fully reset all scan gating
         locked = false
         handoffInProgress = false
@@ -1607,38 +3504,7 @@ class MainActivity : ComponentActivity() {
         overlay.postInvalidateOnAnimation()
     }
 
-    // Compose digits onto the board image
-    private fun composeBoardWithDigits(board: Bitmap, digits81: IntArray?): Bitmap {
-        val out = board.copy(Bitmap.Config.ARGB_8888, true)
-        val c = Canvas(out)
-        val n = 9
-        val cell = out.width / n.toFloat()
-        val textSize = cell * 0.6f
 
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            this.textSize = textSize
-            textAlign = Paint.Align.CENTER
-            setShadowLayer(4f, 0f, 0f, Color.BLACK)
-        }
-
-        val fm = paint.fontMetrics
-        val textOffset = (-(fm.ascent + fm.descent) / 2f)
-
-        if (digits81 != null && digits81.size == 81) {
-            for (r in 0 until n) {
-                for (cIdx in 0 until n) {
-                    val d = digits81[r * n + cIdx]
-                    if (d in 1..9) {
-                        val cx = cIdx * cell + cell / 2f
-                        val cy = r * cell + cell / 2f + textOffset
-                        c.drawText(d.toString(), cx, cy, paint)
-                    }
-                }
-            }
-        }
-        return out
-    }
 
 
     /**
@@ -1651,39 +3517,52 @@ class MainActivity : ComponentActivity() {
      * - Marks low-confidence cells using LOWCONF_CELL_THR.
      */
     private fun buildGridStateFromOverlay(): GridState? {
-        val digits = resultsDigits ?: return null
-        val confidences = resultsConfidences ?: return null
-        val auto = lastAutoCorrectionResult ?: return null
+        val digitsNow = resultsDigits ?: return null
+        val confsNow  = resultsConfidences ?: return null
+        val auto      = lastAutoCorrectionResult ?: return null
 
-        val digitsCopy = digits.copyOf()
-        val confidencesCopy = confidences.copyOf()
+        val digitsCopy = digitsNow.copyOf()
+        val confsCopy  = confsNow.copyOf()
 
-        // Unresolved cells for the conversation = overlayUnresolved
-        // (seeded from auto-correct, then updated by manual edits)
         val unresolvedIndices = overlayUnresolved.toList()
 
-        // Compute conflicts for this grid snapshot
-        val conflictIndices = findConflictIndicesForGridState(digitsCopy)
-
-        // Structural validity = "no Sudoku rule violation"
+        val conflictIndices = findConflictIndicesForDigits(digitsCopy)
         val isStructurallyValid = conflictIndices.isEmpty()
 
-        // Unique / multi-solution check using the solver (cap at 2 solutions)
-        val grid = SudokuGrid(digitsCopy)
-        val solutionCount = if (isStructurallyValid) {
-            sudokuSolver.countSolutions(grid.digits, maxCount = 2)
-        } else {
-            0
-        }
-        val hasUniqueSolution = (solutionCount == 1)
-        val hasMultipleSolutions = (solutionCount >= 2)
+        val solutionCountCapped = if (isStructurallyValid) {
+            sudokuSolver.countSolutions(digitsCopy, maxCount = 2)
+        } else 0
 
-        // Per-cell view
+        val hasUniqueSolution = (solutionCountCapped == 1)
+        val hasMultipleSolutions = (solutionCountCapped >= 2)
+        val hasNoSolution = isStructurallyValid && (solutionCountCapped == 0)
+
+        val conflictSet   = conflictIndices.toHashSet()
+        val unresolvedSet = unresolvedIndices.toHashSet()
+
+        val autoChangedSet = auto.changedIndices.toHashSet()
+        val manualSet = (0 until 81).filter { uiManual[it] }.toHashSet()
+
+        // Pre-autocorrect baseline (what was originally scanned/chosen by decidePick)
+        // This assumes you kept lastGridPrediction from attemptRectifyAndClassify()
+        val scannedDigits: IntArray? = lastGridPrediction?.digits
+        val scannedConfs: FloatArray? = lastGridPrediction?.confidences
+
+        // Auto-corrected target digits right after autocorrect (before manual edits)
+        val autoDigits: IntArray = auto.correctedGrid.digits
+
         val cells = (0 until 81).map { idx ->
             val row = idx / 9
             val col = idx % 9
+
             val digit = digitsCopy[idx]
-            val conf = confidencesCopy[idx]
+            val conf  = confsCopy[idx]
+
+            val scannedD = scannedDigits?.getOrNull(idx)
+            val scannedC = scannedConfs?.getOrNull(idx)
+
+            val wasAuto = autoChangedSet.contains(idx)
+            val wasManual = uiManual[idx]
 
             GridCellState(
                 index = idx,
@@ -1691,25 +3570,39 @@ class MainActivity : ComponentActivity() {
                 col = col,
                 digit = digit,
                 confidence = conf,
-                isConflict = conflictIndices.contains(idx),
-                wasChangedByLogic = auto.changedIndices.contains(idx),
-                isUnresolved = unresolvedIndices.contains(idx),
-                // "low confidence" here means: same threshold as your
-                // orange/red overlay (LOWCONF_CELL_THR).
-                isLowConfidence = (digit != 0 && conf < SudokuConfidence.THRESH_HIGH)
+
+                isConflict = conflictSet.contains(idx),
+                wasChangedByLogic = wasAuto,
+                wasManuallyCorrected = wasManual,
+                isUnresolved = unresolvedSet.contains(idx),
+                isLowConfidence = (digit != 0 && conf < SudokuConfidence.THRESH_HIGH),
+
+                scannedDigit = scannedD,
+                scannedConfidence = scannedC,
+
+                autoFromDigit = scannedD,
+                autoToDigit = autoDigits.getOrNull(idx),
+
+                manualFromDigit = if (wasManual) uiManualFrom[idx] else null,
+                manualToDigit   = if (wasManual) uiManualTo[idx] else null
             )
         }
 
         return GridState(
             cells = cells,
             digits = digitsCopy,
-            confidences = confidencesCopy,
+            confidences = confsCopy,
             conflictIndices = conflictIndices,
             changedByLogic = auto.changedIndices,
             unresolvedIndices = unresolvedIndices,
+
+            manuallyCorrected = manualSet.toList(),
+
             isStructurallyValid = isStructurallyValid,
             hasUniqueSolution = hasUniqueSolution,
-            hasMultipleSolutions = hasMultipleSolutions
+            hasMultipleSolutions = hasMultipleSolutions,
+            hasNoSolution = hasNoSolution,
+            solutionCountCapped = solutionCountCapped
         )
     }
 
@@ -1778,89 +3671,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        return conflicts.toList()
+        return conflicts.toList().sorted()
     }
-
-
-
-
-
-
-
-
-
-
-
-
-    /**
-     * For the LLM
-     * Build a GridState snapshot from the current overlay state:
-     *  - resultsDigits / resultsConfidences
-     *  - lastAutoCorrectionResult (changed + unresolved)
-     *  - overlayUnresolved (live user-edited unresolved set)
-     *  - sudokuSolver (for unique-solution check)
-     */
-    private fun findConflictIndicesForGridState(digits: IntArray): List<Int> {
-        val conflicts = mutableSetOf<Int>()
-
-        // Rows
-        for (row in 0 until 9) {
-            val seen = mutableMapOf<Int, MutableList<Int>>() // digit -> indices
-            for (col in 0 until 9) {
-                val idx = row * 9 + col
-                val v = digits[idx]
-                if (v == 0) continue
-                val list = seen.getOrPut(v) { mutableListOf() }
-                list.add(idx)
-            }
-            for ((_, idxList) in seen) {
-                if (idxList.size > 1) conflicts.addAll(idxList)
-            }
-        }
-
-        // Columns
-        for (col in 0 until 9) {
-            val seen = mutableMapOf<Int, MutableList<Int>>()
-            for (row in 0 until 9) {
-                val idx = row * 9 + col
-                val v = digits[idx]
-                if (v == 0) continue
-                val list = seen.getOrPut(v) { mutableListOf() }
-                list.add(idx)
-            }
-            for ((_, idxList) in seen) {
-                if (idxList.size > 1) conflicts.addAll(idxList)
-            }
-        }
-
-        // Boxes
-        for (boxRow in 0 until 3) {
-            for (boxCol in 0 until 3) {
-                val seen = mutableMapOf<Int, MutableList<Int>>()
-                val startRow = boxRow * 3
-                val startCol = boxCol * 3
-                for (dr in 0 until 3) {
-                    for (dc in 0 until 3) {
-                        val row = startRow + dr
-                        val col = startCol + dc
-                        val idx = row * 9 + col
-                        val v = digits[idx]
-                        if (v == 0) continue
-                        val list = seen.getOrPut(v) { mutableListOf() }
-                        list.add(idx)
-                    }
-                }
-                for ((_, idxList) in seen) {
-                    if (idxList.size > 1) conflicts.addAll(idxList)
-                }
-            }
-        }
-
-        return conflicts.toList()
-    }
-
-
-
 
 
 
@@ -1883,182 +3695,79 @@ class MainActivity : ComponentActivity() {
     }
 
 
-    // Called when user taps "Clear" or a digit in the bottom picker strip
-    private fun onOverlayDigitPicked(value: Int) {
-        val idx = selectedOverlayIdx ?: return
-        if (resultsDigits == null || resultsConfidences == null) return
+    private fun wireTurnControllerWorkers() {
+        turnController.attachWorkers(
+            startAsr = {
+                Log.i("SudoASR", "CMD_START_ASR invoked")
 
-        val currentDigits = resultsDigits!!
-        val currentConfs  = resultsConfidences!!
+                val a = asr
+                if (a == null) {
+                    Log.w("SudoASR", "CMD_START_ASR ignored: asr is null (mic permission?)")
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASR_CMD_START_SKIPPED",
+                            "reason" to "asr_null"
+                        )
+                    )
+                    return@attachWorkers
+                }
 
-        // Helper for rXcY formatting
-        fun idxToCell(i: Int): String {
-            val r = i / 9 + 1
-            val c = i % 9 + 1
-            return "r${r}c${c}"
-        }
+                // Optional defensive check: don't start if we *know* we're speaking/suppressed.
+                // (If SudoASR internally enforces this, keep or remove—either is fine.)
+                if (isSpeaking) {
+                    Log.w("SudoASR", "CMD_START_ASR blocked: isSpeaking=true")
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASR_CMD_START_SKIPPED",
+                            "reason" to "isSpeaking_true"
+                        )
+                    )
+                    return@attachWorkers
+                }
 
-        val oldDigit = currentDigits[idx]
+                runCatching {
+                    // Use your real API — keep asr?.start() if that's correct.
+                    a.start()
+                }.onFailure {
+                    Log.e("SudoASR", "CMD_START_ASR failed", it)
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASR_CMD_START_ERROR",
+                            "msg" to (it.message ?: it.toString())
+                        )
+                    )
+                }
+            },
+            stopAsr = {
+                Log.i("SudoASR", "CMD_STOP_ASR invoked")
 
-        // 1) Apply the user's edit
-        if (value == 0) {
-            // Clear the cell
-            currentDigits[idx] = 0
-            // Treat as "user confirmed as blank"
-            currentConfs[idx] = 1.0f
-        } else {
-            // Set new digit and mark as high confidence
-            currentDigits[idx] = value
-            currentConfs[idx] = 1.0f
-        }
+                val a = asr
+                if (a == null) {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASR_CMD_STOP_SKIPPED",
+                            "reason" to "asr_null"
+                        )
+                    )
+                    return@attachWorkers
+                }
 
-        // 2) Visually: this cell is no longer "unresolved" → remove red border.
-        //    IMPORTANT: we do NOT touch overlayEditable, so the cell remains tappable.
-        overlayUnresolved.remove(idx)
-
-        // 3) Re-check grid unique solvability after this edit.
-        //    We enforce SudokuRules + SudokuSolver.countSolutions==1.
-        var solvable = false
-        try {
-            val grid = com.contextionary.sudoku.logic.SudokuGrid(currentDigits.copyOf())
-            val consistent = com.contextionary.sudoku.logic.SudokuRules.isGridConsistent(grid.digits)
-            val count = sudokuSolver.countSolutions(grid.digits, maxCount = 2)
-            solvable = consistent && (count == 1)
-        } catch (e: Exception) {
-            android.util.Log.e(
-                "SudokuLogic",
-                "overlayEdit: error while checking solvability after edit",
-                e
-            )
-        }
-
-        // 4) If the grid is now uniquely solvable, clear any remaining unresolved cells
-        //    so the board is visually treated as fully resolved.
-        if (solvable) {
-            overlayUnresolved.clear()
-        }
-
-        // 5) Push updated digits + confidences + annotations to the overlay view
-        resultsSudokuView?.setDigitsAndConfidences(currentDigits, currentConfs)
-
-        // Use original auto-correction changedIndices for cyan borders,
-        // and our up-to-date overlayUnresolved for red borders.
-        val changedCellsIdx = lastAutoCorrectionResult?.changedIndices ?: emptyList()
-        lastAutoCorrectionResult?.let { ac ->
-            resultsSudokuView?.setLogicAnnotations(
-                changed = ac.changedIndices,
-                unresolved = overlayUnresolved.toList()
-            )
-        } ?: run {
-            resultsSudokuView?.setLogicAnnotations(
-                changed = emptyList(),
-                unresolved = overlayUnresolved.toList()
-            )
-        }
-
-        // 6) Increment edit sequence and log the state after this edit.
-        overlayEditSeq += 1
-        val editSeq = overlayEditSeq
-        val unresolvedIdx = overlayUnresolved.toList()
-
-        android.util.Log.i(
-            "SudokuLogic",
-            "overlayEdit: edit=$editSeq idx=$idx cell=${idxToCell(idx)} " +
-                    "old=$oldDigit new=$value solvable=$solvable " +
-                    "unresolved=${unresolvedIdx.size} " +
-                    "changedCells=${changedCellsIdx.map { idxToCell(it) }} " +
-                    "unresolvedCells=${unresolvedIdx.map { idxToCell(it) }}"
+                runCatching {
+                    a.stop()
+                }.onFailure {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASR_CMD_STOP_ERROR",
+                            "msg" to (it.message ?: it.toString())
+                        )
+                    )
+                }
+            }
         )
 
-        // 7) Notify conversation coordinator of this manual edit
-        buildGridStateFromOverlay()?.let { state ->
-            val editEvent = com.contextionary.sudoku.logic.GridEditEvent(
-                seq = editSeq,
-                cellIndex = idx,
-                row = idx / 9,
-                col = idx % 9,
-                oldDigit = oldDigit,
-                newDigit = value,
-                timestampMs = android.os.SystemClock.elapsedRealtime()
-            )
-            gridConversationCoordinator.onManualEditApplied(state, editEvent)
-        }
 
-
-
-        // If we were in an LLM-driven confirmation state, stop the pulse
-        resultsSudokuView?.stopConfirmationPulse()
-
-        // 8) Hide the picker strip after a choice, but keep its space reserved.
-        digitPickerRow?.visibility = View.INVISIBLE
-
-
-
-
-
-
-        // 9) Clear the selection
-        selectedOverlayIdx = null
+        //Log.i("TurnController", "Workers attached (asr_is_null=${asr == null})")
     }
-
-
-    // Optional rough warp from ROI to square board
-    // Uses the 4 outer corners. If the homography fails, we fall back to the raw ROI
-    private fun roughWarpBoard(roiBmp: Bitmap,
-                               tlx: Float, tly: Float, trx: Float, try_: Float,
-                               brx: Float, bry: Float, blx: Float, bly: Float): Bitmap {
-        return try {
-            val src = Mat()
-            Utils.bitmapToMat(roiBmp, src)  // RGBA
-            val dst = Mat(GRID_SIZE, GRID_SIZE, CvType.CV_8UC4)
-
-            val srcPts = MatOfPoint2f(
-                Point(tlx.toDouble(), tly.toDouble()),
-                Point(trx.toDouble(), try_.toDouble()),
-                Point(brx.toDouble(), bry.toDouble()),
-                Point(blx.toDouble(), bly.toDouble())
-            )
-            val dstPts = MatOfPoint2f(
-                Point(0.0, 0.0),
-                Point((GRID_SIZE - 1).toDouble(), 0.0),
-                Point((GRID_SIZE - 1).toDouble(), (GRID_SIZE - 1).toDouble()),
-                Point(0.0, (GRID_SIZE - 1).toDouble())
-            )
-
-            val H = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-            Imgproc.warpPerspective(src, dst, H, CvSize(GRID_SIZE.toDouble(), GRID_SIZE.toDouble()), Imgproc.INTER_LINEAR)
-
-            val out = Bitmap.createBitmap(GRID_SIZE, GRID_SIZE, Bitmap.Config.ARGB_8888)
-            Utils.matToBitmap(dst, out)
-
-            src.release(); dst.release(); srcPts.release(); dstPts.release()
-            out
-        } catch (t: Throwable) {
-            roiBmp
-        }
-    }
-
-    private fun toFlat(grid: Array<IntArray>): IntArray =
-        IntArray(81) { i -> grid[i / 9][i % 9] }
-
-    private fun toFlat(grid: Array<FloatArray>): FloatArray =
-        FloatArray(81) { i -> grid[i / 9][i % 9] }
-
-    private fun toGrid(flat: IntArray): Array<IntArray> =
-        Array(9) { r -> IntArray(9) { c -> flat[r * 9 + c] } }
-
-    private fun toGrid(flat: FloatArray): Array<FloatArray> =
-        Array(9) { r -> FloatArray(9) { c -> flat[r * 9 + c] } }
-
-    // Build and bind CameraX Preview and ImageAnalysis. Analyzer pipeline:
-    //  - Skip/throttle frames for consistent cadence.
-    //  - Convert ImageProxy -> RGBA Bitmap.
-    //  - Run Detector; choose the most-centered detection (if any).
-    //  - Run CornerRefiner on that ROI; obtain corners + peaks.
-    //  - Update OverlayView (source size, boxes, corners, crop ROI).
-    //  - Enforce all gates (peaks≥thr, convexity, side ratios, area vs red box, aspect tolerance, jitter in 128-space, cyan-guard border). If a frame passes, add to the passing deque; once N frames pass, attempt rectification + classification.
-
-
 
 
 
@@ -2072,6 +3781,7 @@ class MainActivity : ComponentActivity() {
     //  - Demotions: NONE when no pick; L1 when intersections/gates break
     // -------------------------------------------------------------------------
     private fun startCamera() {
+
         val providerFuture = ProcessCameraProvider.getInstance(this)
         providerFuture.addListener({
             val provider = providerFuture.get()
@@ -2088,6 +3798,7 @@ class MainActivity : ComponentActivity() {
                 .setTargetRotation(previewView.display.rotation)
                 .build()
 
+            // Analyzer core
             analysis.setAnalyzer(analyzerExecutor) { proxy ->
                 try {
                     if (locked || handoffInProgress) { proxy.close(); return@setAnalyzer }
@@ -2099,12 +3810,9 @@ class MainActivity : ComponentActivity() {
                     if (now - lastInferMs < minInferIntervalMs) { proxy.close(); return@setAnalyzer }
                     lastInferMs = now
 
-                    val bmp = proxy.toBitmapRGBA() ?: run {
-                        Log.w("MainActivity", "toBitmapRGBA() returned null (fmt=${proxy.format})")
-                        proxy.close(); return@setAnalyzer
-                    }
+                    val bmp = proxy.toBitmapRGBA() ?: run { proxy.close(); return@setAnalyzer }
 
-                    // 1) Detection
+                    // 1) Detector
                     val dets = detector.infer(bmp, scoreThresh = HUD_DET_THRESH, maxDets = HUD_MAX_DETS)
                     val cxImg = bmp.width / 2f
                     val cyImg = bmp.height / 2f
@@ -2118,197 +3826,53 @@ class MainActivity : ComponentActivity() {
                     runOnUiThread {
                         overlay.setSourceSize(bmp.width, bmp.height)
                         overlay.updateBoxes(if (picked != null) listOf(picked) else emptyList(), HUD_DET_THRESH, HUD_MAX_DETS)
+                        overlay.updateCornerCropRect(null)
+                        overlay.updateIntersections(null)
                     }
 
                     if (picked == null) {
-                        // No detection → NONE, clear histories
-                        passing.clear()
-                        jitterHistory.clear()
-                        runOnUiThread {
-                            overlay.updateCornerCropRect(null)
-                            overlay.updateIntersections(null)
-                        }
+                        lastDetRect = null
+                        stableCount = 0
                         changeGate(GateState.NONE, "no_detection")
                         proxy.close(); return@setAnalyzer
                     }
 
-                    // 2) Intersections (no dump on live frames)
-                    val inter = try {
-                        intersections.infer(
-                            src = bmp,
-                            roiSrc = picked.box,
-                            padFrac = ROI_PAD_FRAC,
-                            thrPred = INT_PEAK_THR,
-                            topK = 140,
-                            requireGridize = true,
-                            dumpDebug = false,
-                            dumpTag = null
-                        )
-                    } catch (t: Throwable) {
-                        Log.w("MainActivity", "Intersections infer failed", t); null
-                    }
+                    val roi = RectF(picked.box)
 
-                    // HUD: crop overlay + dots
-                    runOnUiThread {
-                        overlay.updateCornerCropRect(inter?.expandedRoiSrc)
-                        overlay.updateIntersections(inter?.points)
-                    }
-
-                    // 3) Gating snapshot for SM (pre-rectify)
-                    val haveGrid = (inter != null && inter.points.size >= 90)
-                    val ptsSrc = inter?.points ?: emptyList()
-
-                    // Jitter in 128-space
-                    val ex = inter?.expandedRoiSrc
-                    val jitterPx = if (haveGrid && ex != null) {
-                        val xs = FloatArray(ptsSrc.size) { i -> ((ptsSrc[i].x - ex.left) * 128f / max(1, ex.width())) }
-                        val ys = FloatArray(ptsSrc.size) { i -> ((ptsSrc[i].y - ex.top)  * 128f / max(1, ex.height())) }
-                        val grid128 = Grid128(xs, ys)
-                        val v = avgJitterPx128(grid128)
-                        jitterHistory.addLast(grid128)
-                        while (jitterHistory.size > JITTER_WINDOW) jitterHistory.removeFirst()
-                        v
-                    } else {
-                        jitterHistory.clear(); 999f
-                    }
-
-                    val jitterOk = jitterPx <= 7f
-
-                    // Geometry from outer intersections if we have them
-                    val geomOk = if (haveGrid) run {
-                        val tl = ptsSrc.minByOrNull { it.x + it.y }!!
-                        val br = ptsSrc.maxByOrNull { it.x + it.y }!!
-                        val tr = ptsSrc.minByOrNull { (bmp.width - it.x) + it.y }!!
-                        val bl = ptsSrc.minByOrNull { it.x + (bmp.height - it.y) }!!
-                        val roi = picked.box
-                        val areaQuad = quadArea(tl, tr, br, bl)
-                        val areaRed  = (roi.width() * roi.height()).coerceAtLeast(1f)
-                        val areaRatio = areaQuad / areaRed
-                        val areaOk = areaRatio >= AREA_RATIO_MIN && areaRatio <= AREA_RATIO_MAX
-                        val aspectQuad = quadAspectApprox(tl, tr, br, bl)
-                        val aspectRed  = aspect(RectF(roi))
-                        val aspectOk = kotlin.math.abs(ln((aspectQuad / aspectRed).toDouble())) <= ln(ASPECT_TOL.toDouble())
-                        val shapeOk = isConvexAndPositiveTLTRBRBL(tl, tr, br, bl) && sideLenRatio(tl, tr, br, bl) <= SIDE_RATIO_MAX
-                        areaOk && aspectOk && shapeOk
-                    } else false
-
-                    // Cyan guard
+                    // 2) Cyan-guard clearance (in source space)
                     val guardSrc = overlay.getGuardRectInSource()
-                    val roiSrc = RectF(picked.box)
                     val tolSrc = (min(bmp.width, bmp.height) / 120f).coerceAtLeast(2f)
-                    val guardOk = if (guardSrc != null) !touchesBorder(roiSrc, guardSrc, tolSrc) else true
+                    val guardOk = if (guardSrc != null) !touchesBorder(roi, guardSrc, tolSrc) else true
+                    if (!guardOk) {
+                        stableCount = 0
+                        lastDetRect = roi
+                        changeGate(GateState.L1, "guard_touch")
+                        proxy.close(); return@setAnalyzer
+                    }
 
-                    val minPeak = inter?.scores?.minOrNull() ?: 0f
-                    val allHigh = haveGrid && (minPeak >= INT_PEAK_THR)
+                    // 3) Temporal stability vs previous detection
+                    val stableNow = lastDetRect?.let { prev ->
+                        val i = iou(prev, roi)
+                        val driftPx = centerDriftPx(prev, roi)
+                        val sDrift = sizeDriftFrac(prev, roi)
+                        (i >= IOU_THR && driftPx <= CENTER_DRIFT_PX && sDrift <= SIZE_DRIFT_FRAC)
+                    } ?: false
 
-                    // Feed SM with pre-rectify snapshot (rectifyOk=false)
-                    val pre = GateSnapshot(
-                        hasDetectorLock = true,
-                        gridizedOk      = haveGrid,
-                        validPoints     = inter?.points?.size ?: 0,
-                        jitterPx128     = jitterPx,
-                        rectifyOk       = false,
-                        avgConf         = 0f,
-                        lowConfCells    = Int.MAX_VALUE
-                    )
-                    val sm = gate.update(pre)
-                    if (sm != gateState) changeGate(sm, "preRectify")
+                    if (stableNow) stableCount++ else stableCount = 1
+                    lastDetRect = roi
 
-                    // Build "good" predicate (for streak buffer)
-                    val good = haveGrid && allHigh && geomOk && guardOk && jitterOk
+                    if (stableCount >= 2 && gateState == GateState.L1) changeGate(GateState.L2, "stable_seen")
+                    if (gateState == GateState.NONE) changeGate(GateState.L1, "got_detection")
 
-                    if (good && inter != null) {
-                        // Capture the exact ROI bitmap now (for per-frame overlay saving later)
-                        val leftI   = inter.expandedRoiSrc.left.coerceIn(0, bmp.width - 1)
-                        val topI    = inter.expandedRoiSrc.top.coerceIn(0, bmp.height - 1)
-                        val rightI  = inter.expandedRoiSrc.right.coerceIn(leftI + 1, bmp.width)
-                        val bottomI = inter.expandedRoiSrc.bottom.coerceIn(topI + 1, bmp.height)
-                        val roiBitmap = Bitmap.createBitmap(bmp, leftI, topI, rightI - leftI, bottomI - topI)
+                    // 4) Lock when we've reached the target stability window
+                    if (stableCount >= STABLE_FRAMES) {
+                        changeGate(GateState.L3, "lock_on_stability")
+                        runOnUiThread { overlay.setLocked(true) }
 
-                        // Maintain a buffer of last N good frames
-                        passing.addLast(
-                            PassingFrame(
-                                ptsSrc      = inter.points,
-                                roi         = RectF(picked.box),
-                                minPeak     = minPeak,
-                                tsMs        = now,
-                                expandedRoi = inter.expandedRoiSrc,
-                                roiBmp      = roiBitmap,
-                                jitterPx128 = jitterPx         // <-- store per-frame jitter
-                            )
+                        attemptRectifyAndClassify(
+                            srcBmp = bmp,
+                            detectorRoi = picked.box.toAndroidRect()
                         )
-                        while (passing.size > STREAK_N) passing.removeFirst()
-
-                        // Stay visually in Amber while collecting
-                        if (gateState != GateState.L2) changeGate(GateState.L2, "good_frame")
-
-                        if (passing.size >= STREAK_N) {
-                            // --- Score all N; save images + CSV for audit; pick best ---
-                            val guard = overlay.getGuardRectInSource()
-                            val frames = passing.toList()
-
-                            var bestIdx = -1
-                            var bestScore = Float.NEGATIVE_INFINITY
-
-                            for (i in frames.indices) {
-                                val pf = frames[i]
-                                val bd = computeFrameScore(
-                                    ptsSrc       = pf.ptsSrc,
-                                    ex           = pf.expandedRoi,
-                                    roi          = pf.roi,
-                                    jitterPx128  = pf.jitterPx128,   // <-- use the frame’s stored jitter
-                                    minPeak      = pf.minPeak,
-                                    guardRect    = guard,
-                                    imgW         = bmp.width,
-                                    imgH         = bmp.height
-                                )
-                                pf.score = bd
-                                if (bd.total > bestScore) { bestScore = bd.total; bestIdx = i }
-                            }
-
-                            // Save debug pack before clearing
-                            val debugRoot = getRectifyDebugDir()
-                            saveBestOfNDebugPack(debugRoot, frames, bestIdx.coerceAtLeast(0))
-
-                            // Recycle bitmaps & clear
-                            frames.forEach { f -> try { f.roiBmp.recycle() } catch (_: Throwable) {} }
-                            passing.clear()
-
-                            // Provisional green immediately
-                            handoffInProgress = true
-                            changeGate(GateState.L3, "lock_provisional_green")
-                            runOnUiThread { overlay.setLocked(true) }
-
-                            // Re-run intersections with dump on the same live frame
-                            val dumpRes = try {
-                                intersections.infer(
-                                    src = bmp,
-                                    roiSrc = picked.box,
-                                    padFrac = ROI_PAD_FRAC,
-                                    thrPred = INT_PEAK_THR,
-                                    topK = 140,
-                                    requireGridize = true,
-                                    dumpDebug = DUMP_LOCKED_INTERSECTIONS,
-                                    dumpTag = if (DUMP_LOCKED_INTERSECTIONS) "locked_${SystemClock.uptimeMillis()}" else null
-                                )
-                            } catch (t: Throwable) {
-                                Log.w("MainActivity", "Intersections dump infer failed; using current inter", t)
-                                inter
-                            } ?: inter
-
-                            attemptRectifyAndClassify(
-                                ptsSrc = dumpRes.points,
-                                detectorRoi = RectF(picked.box),
-                                srcBmp = bmp,
-                                expandedRoiSrc = dumpRes.expandedRoiSrc
-                            )
-                        }
-                    } else {
-                        // bad frame → drop to L1 (or stay None if no lock)
-                        passing.clear()
-                        if (picked != null) {
-                            changeGate(GateState.L1, "not_good")
-                        }
                     }
                 } catch (t: Throwable) {
                     Log.e("Detector", "Analyzer error on frame $frameIndex", t)
@@ -2319,8 +3883,8 @@ class MainActivity : ComponentActivity() {
                         overlay.updateIntersections(null)
                         overlay.setLocked(false)
                     }
-                    passing.clear()
-                    jitterHistory.clear()
+                    lastDetRect = null
+                    stableCount = 0
                     changeGate(GateState.NONE, "exception")
                 } finally {
                     proxy.close()
@@ -2334,322 +3898,43 @@ class MainActivity : ComponentActivity() {
                 preview,
                 analysis
             )
+
+            // ✅ Notify camera active only once the pipeline is actually bound/active.
+            turnController.onCameraActive()
+
         }, ContextCompat.getMainExecutor(this))
     }
 
 
 
-    // -------------------------------------------------------------------------
-// Save Best-of-N debug pack:
-//  - frame_1_points.png ... frame_N_points.png (points drawn on ROI)
-//  - bestofN.csv with per-frame scoring breakdown and metadata
-// -------------------------------------------------------------------------
-    private fun saveBestOfNDebugPack(
-        parentDir: java.io.File,
-        frames: List<PassingFrame>,
-        chosenIdx: Int
-    ) {
-        runCatching {
-            val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
-                .format(java.util.Date())
 
-            val dir = java.io.File(
-                parentDir,
-                "bestofN${STREAK_N}_${ts}_${android.os.SystemClock.uptimeMillis()}"
-            )
-            if (!dir.exists()) dir.mkdirs()
 
-            // locale-stable formatters
-            fun f6(x: Float) = String.format(java.util.Locale.US, "%.6f", x)
-            fun f2(x: Float) = String.format(java.util.Locale.US, "%.2f", x)
 
-            // --- helpers (local to this method) --------------------------------
+    // --- Safe ROI clip + crop helpers (prevents Bitmap.createBitmap OOB crashes) ---
+    private fun clipRectToBitmap(r: Rect, bmp: Bitmap): Rect? {
+        if (bmp.width <= 1 || bmp.height <= 1) return null
 
-            // Order 100 points into a 10×10 grid (row-major) by banding on Y then sorting by X.
-            fun orderIntoGrid10(ptsLocal: List<PointF>): Array<Array<PointF>> {
-                require(ptsLocal.size >= 100) { "Need at least 100 points" }
+        val x0 = r.left.coerceIn(0, bmp.width - 1)
+        val y0 = r.top.coerceIn(0, bmp.height - 1)
+        val x1 = r.right.coerceIn(0, bmp.width)   // right/bottom as exclusive bounds
+        val y1 = r.bottom.coerceIn(0, bmp.height)
 
-                // sort by Y asc, then partition into 10 consecutive bands of ~10
-                val sorted = ptsLocal.sortedBy { it.y }
-                val rows = Array(10) { ArrayList<PointF>(10) }
-                for (r in 0 until 10) {
-                    val start = (r * sorted.size) / 10
-                    val end = ((r + 1) * sorted.size) / 10
-                    val band = sorted.subList(start, end).sortedBy { it.x }
-                    // keep exactly 10 by trimming or padding with nearest endpoints
-                    val row = when {
-                        band.size == 10 -> band
-                        band.size > 10  -> band.take(10)
-                        else -> {
-                            val need = 10 - band.size
-                            val padLeft  = generateSequence { band.first() }.take(need / 2).toList()
-                            val padRight = generateSequence { band.last()  }.take(need - need / 2).toList()
-                            (padLeft + band + padRight)
-                        }
-                    }
-                    rows[r].addAll(row)
-                }
-                return Array(10) { r -> Array(10) { c -> rows[r][c] } }
-            }
+        // Require a real area (at least 2x2) to keep later math healthy
+        if (x1 - x0 < 2 || y1 - y0 < 2) return null
 
-            // Per row, resample to 10 evenly spaced X positions from minX..maxX.
-            // Y is linearly interpolated between the row endpoints.
-            fun resampleRowsEvenX(grid: Array<Array<PointF>>): Array<Array<PointF>> {
-                val out = Array(10) { Array(10) { PointF() } }
-                for (r in 0 until 10) {
-                    val row = grid[r]
-                    val left  = row.first()
-                    val right = row.last()
-                    val minX = left.x
-                    val maxX = right.x
-                    val dx = (maxX - minX).coerceAtLeast(1e-3f)
+        return Rect(x0, y0, x1, y1)
+    }
 
-                    for (c in 0 until 10) {
-                        val t = c / 9f  // 0..1
-                        val x = minX + t * dx
-                        val y = left.y + t * (right.y - left.y)
-                        out[r][c] = PointF(x, y)
-                    }
-                }
-                return out
-            }
-
-            // Column-mean nudge: pull each point's X a fraction toward its column mean.
-            fun nudgeColumnsToMeans(grid: Array<Array<PointF>>, frac: Float = 0.20f): Array<Array<PointF>> {
-                val out = Array(10) { r -> Array(10) { c -> PointF(grid[r][c].x, grid[r][c].y) } }
-                for (c in 0 until 10) {
-                    var sumX = 0f
-                    for (r in 0 until 10) sumX += grid[r][c].x
-                    val meanX = sumX / 10f
-                    for (r in 0 until 10) {
-                        val p = out[r][c]
-                        p.x = p.x + frac * (meanX - p.x)
-                    }
-                }
-                return out
-            }
-
-            // Render the processed lattice onto a copy of roiBmp.
-            fun drawProcessedGridOverlay(base: Bitmap, grid: Array<Array<PointF>>): Bitmap {
-                val bmp = base.copy(Bitmap.Config.ARGB_8888, true)
-                val canvas = Canvas(bmp)
-
-                val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.WHITE
-                    style = Paint.Style.STROKE
-                    strokeWidth = (bmp.width.coerceAtMost(bmp.height) / 360f).coerceAtLeast(1.5f)
-                }
-                val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.CYAN
-                    style = Paint.Style.FILL
-                }
-                val dotR = (bmp.width.coerceAtMost(bmp.height) / 140f).coerceAtLeast(2.5f)
-
-                // rows
-                for (r in 0 until 10) {
-                    for (c in 0 until 9) {
-                        val a = grid[r][c]; val b = grid[r][c + 1]
-                        canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
-                    }
-                }
-                // columns
-                for (c in 0 until 10) {
-                    for (r in 0 until 9) {
-                        val a = grid[r][c]; val b = grid[r + 1][c]
-                        canvas.drawLine(a.x, a.y, b.x, b.y, linePaint)
-                    }
-                }
-                // dots
-                for (r in 0 until 10) {
-                    for (c in 0 until 10) {
-                        val p = grid[r][c]
-                        canvas.drawCircle(p.x, p.y, dotR, dotPaint)
-                    }
-                }
-                return bmp
-            }
-
-            // --------------------------------------------------------------------
-
-            // CSV header
-            val csv = StringBuilder().apply {
-                appendLine(
-                    "index,timestamp_ms,total,confPct,lineStraightness,orthogonality,cellUniformity,clearance,jitterScore,minPeak,validPoints,roi_left,roi_top,roi_right,roi_bottom,chosen"
-                )
-            }
-
-            frames.forEachIndexed { idx, pf ->
-                // Localize points to ROI
-                val localPts = pf.ptsSrc.map { p ->
-                    PointF(p.x - pf.expandedRoi.left, p.y - pf.expandedRoi.top)
-                }
-
-                // 1) Save annotated ROI (raw intersections)
-                val annotated = drawPointsOverlayOnBitmap(pf.roiBmp, localPts)
-                saveBitmapPng(java.io.File(dir, "frame_${idx + 1}_points.png"), annotated)
-
-                // 2) Save raw ROI
-                saveBitmapPng(java.io.File(dir, "frame_${idx + 1}_raw.png"), pf.roiBmp)
-
-                // 3) CSV row
-                val bd = pf.score ?: ScoreBreakdown(
-                    total = 0f, confPct = 0f, lineStraightness = 0f, orthogonality = 0f,
-                    cellUniformity = 0f, clearance = 0f, jitterScore = 0f
-                )
-                val r = pf.roi
-                csv.appendLine(
-                    listOf(
-                        (idx + 1).toString(),
-                        pf.tsMs.toString(),
-                        f6(bd.total),
-                        f6(bd.confPct),
-                        f6(bd.lineStraightness),
-                        f6(bd.orthogonality),
-                        f6(bd.cellUniformity),
-                        f6(bd.clearance),
-                        f6(bd.jitterScore),
-                        f6(pf.minPeak),
-                        pf.ptsSrc.size.toString(),
-                        f2(r.left), f2(r.top), f2(r.right), f2(r.bottom),
-                        if (idx == chosenIdx) "1" else "0"
-                    ).joinToString(",")
-                )
-            }
-
-            // Write CSV + chosen index
-            java.io.File(dir, "scores.csv").writeText(csv.toString())
-            java.io.File(dir, "chosen_idx.txt").writeText(chosenIdx.toString())
-
-            // --- NEW: write processed lattice overlay for the chosen frame only ---
-            if (chosenIdx in frames.indices) {
-                val pf = frames[chosenIdx]
-
-                // ROI-local points for the chosen frame
-                val localPts = pf.ptsSrc.map { p ->
-                    PointF(p.x - pf.expandedRoi.left, p.y - pf.expandedRoi.top)
-                }
-
-                // Rebuild the lattice exactly like rectification (ordering → resample → nudge)
-                val g0 = orderIntoGrid10(localPts)
-                val g1 = resampleRowsEvenX(g0)
-                val g2 = nudgeColumnsToMeans(g1, frac = 0.20f)   // use same factor as rectifier
-
-                val processedOverlay = drawProcessedGridOverlay(pf.roiBmp, g2)
-                saveBitmapPng(java.io.File(dir, "frame_${chosenIdx + 1}_points_resampled.png"), processedOverlay)
-            }
-
-            android.util.Log.i("BestOfN", "Saved Best-of-N debug to ${dir.absolutePath}")
-        }.onFailure {
-            android.util.Log.e("BestOfN", "Failed saving Best-of-N pack", it)
+    private fun safeCropBitmap(src: Bitmap, r: Rect): Bitmap? {
+        val rr = clipRectToBitmap(r, src) ?: return null
+        return try {
+            Bitmap.createBitmap(src, rr.left, rr.top, rr.width(), rr.height())
+        } catch (_: Throwable) {
+            null
         }
     }
 
 
-
-
-
-    // -------------------------------------------------------------------------
-    // New helper: score a frame's "grid-likeness" (0..1-ish, higher is better)
-    // Uses only data we already have (intersections, ROI, jitter, guard clearance).
-    // -------------------------------------------------------------------------
-    private fun computeFrameScore(
-        ptsSrc: List<PointF>,
-        ex: Rect,
-        roi: RectF,
-        jitterPx128: Float,
-        minPeak: Float,
-        guardRect: RectF?,
-        imgW: Int,
-        imgH: Int
-    ): ScoreBreakdown {
-        if (ptsSrc.size < 90) {
-            return ScoreBreakdown(
-                total = -1f, confPct = 0f, lineStraightness = 0f,
-                orthogonality = 0f, cellUniformity = 0f, clearance = 0f, jitterScore = 0f
-            )
-        }
-
-        fun to128(p: PointF): PointF {
-            val x = ((p.x - ex.left) * 128f / max(1, ex.width()))
-            val y = ((p.y - ex.top)  * 128f / max(1, ex.height()))
-            return PointF(x, y)
-        }
-
-        val g = Array(10) { r -> Array(10) { c -> to128(ptsSrc[r * 10 + c]) } }
-
-        fun lineResidual(points: Array<PointF>): Float {
-            val p0 = points.first(); val p1 = points.last()
-            val vx = p1.x - p0.x; val vy = p1.y - p0.y
-            val vlen = kotlin.math.sqrt(vx*vx + vy*vy).coerceAtLeast(1e-3f)
-            val nx = -vy / vlen; val ny =  vx / vlen
-            var sum = 0f
-            for (p in points) sum += kotlin.math.abs((p.x - p0.x) * nx + (p.y - p0.y) * ny)
-            return (sum / points.size)
-        }
-
-        var straight = 0f
-        for (r in 0 until 10) straight += lineResidual(g[r])
-        for (c in 0 until 10) {
-            val col = Array(10) { r -> g[r][c] }
-            straight += lineResidual(col)
-        }
-        val lineStraightness = (1f - (straight / (20f * 2.0f))).coerceIn(0f, 1f)
-
-        fun dir(p0: PointF, p1: PointF): PointF {
-            val vx = p1.x - p0.x; val vy = p1.y - p0.y
-            val l = kotlin.math.sqrt(vx*vx + vy*vy).coerceAtLeast(1e-3f)
-            return PointF(vx / l, vy / l)
-        }
-        val rowDir = dir(g[0].first(), g[0].last())
-        val colDir = dir(g.first()[0], g.last()[0])
-        val dot = kotlin.math.abs(rowDir.x * colDir.x + rowDir.y * colDir.y)
-        val orthogonality = (1f - dot).coerceIn(0f, 1f)
-
-        fun meanStd(values: FloatArray): Pair<Float, Float> {
-            val m = values.average().toFloat()
-            var v = 0f; for (v0 in values) { val d = v0 - m; v += d * d }
-            v /= values.size.coerceAtLeast(1)
-            return m to kotlin.math.sqrt(v)
-        }
-        val widths = FloatArray(9 * 10) { i ->
-            val r = i / 9; val c = i % 9
-            val a = g[r][c]; val b = g[r][c+1]
-            kotlin.math.sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y))
-        }
-        val heights = FloatArray(10 * 9) { i ->
-            val r = i / 10; val c = i % 10
-            val a = g[r][c]; val b = g[r+1][c]
-            kotlin.math.sqrt((a.x-b.x)*(a.x-b.x) + (a.y-b.y)*(a.y-b.y))
-        }
-        val wStd = meanStd(widths).second
-        val hStd = meanStd(heights).second
-        val cellUniformity = (1f - ((wStd + hStd) / 10f)).coerceIn(0f, 1f)
-
-        val clearance = if (guardRect != null) {
-            val dL = kotlin.math.abs(roi.left   - guardRect.left)
-            val dT = kotlin.math.abs(roi.top    - guardRect.top)
-            val dR = kotlin.math.abs(guardRect.right - roi.right)
-            val dB = kotlin.math.abs(guardRect.bottom - roi.bottom)
-            val dMin = min(min(dL, dR), min(dT, dB))
-            (dMin / (min(imgW, imgH) * 0.10f)).coerceIn(0f, 1f)
-        } else 1f
-
-        val confPct = minPeak.coerceIn(0f, 1f)
-        val jitterScore = (1f - (jitterPx128 / 7f)).coerceIn(0f, 1f)
-
-        val w1=0.25f; val w2=0.20f; val w3=0.15f; val w4=0.15f; val w5=0.10f; val w6=0.15f
-        val total = w1*confPct + w2*lineStraightness + w3*orthogonality + w4*cellUniformity + w5*clearance + w6*jitterScore
-
-        return ScoreBreakdown(
-            total = total,
-            confPct = confPct,
-            lineStraightness = lineStraightness,
-            orthogonality = orthogonality,
-            cellUniformity = cellUniformity,
-            clearance = clearance,
-            jitterScore = jitterScore
-        )
-    }
 
 
 
@@ -2695,188 +3980,220 @@ class MainActivity : ComponentActivity() {
 // This keeps point->ROI-local mapping aligned and fixes the cyan points offset.
 
 
-    private fun attemptRectifyAndClassify(
-        ptsSrc: List<PointF>,
-        detectorRoi: RectF,
-        srcBmp: Bitmap,
-        expandedRoiSrc: Rect
-    ) {
-        val GREEN_TO_SHUTTER_MS = 150L
-        val shutterCanceled = AtomicBoolean(false)
 
-        // schedule shutter; runnable won't do anything if canceled
-        val shutterRunnable = Runnable {
-            if (!shutterCanceled.get()) {
-                overlay.playShutter(null)
-            }
-        }
-        overlay.postDelayed(shutterRunnable, GREEN_TO_SHUTTER_MS)
+    private fun attemptRectifyAndClassify(
+        srcBmp: Bitmap,
+        detectorRoi: android.graphics.Rect
+    ) {
+        if (handoffInProgress) return
+        handoffInProgress = true
 
         Thread {
             var err: String? = null
-            var digitsFlat: IntArray? = null
-            var probsFlat: FloatArray? = null
+            var lockedLocal = false
+
             var boardBmpOut: Bitmap? = null
 
+            // Raw readouts from CellInterpreter (pre-autocorrect)
+            var readouts9x9: Array<Array<CellReadout>>? = null
+
+            // Corrected UI state to display
+            var correctedReadouts9x9: Array<Array<CellReadout>>? = null
+            var digitsFlat: IntArray? = null
+            var probsFlat: FloatArray? = null
+            var givenFlags: BooleanArray? = null
+            var solFlags: BooleanArray? = null
+            var autoFlags: BooleanArray? = null
+            var candMaskFlat: IntArray? = null
+
             try {
-                val debugDir = getRectifyDebugDir()
-                if (!debugDir.exists()) debugDir.mkdirs()
-                clearDirectory(debugDir)
-
-                // exact crop used by intersections
-                val leftI   = expandedRoiSrc.left.coerceIn(0, srcBmp.width - 1)
-                val topI    = expandedRoiSrc.top.coerceIn(0, srcBmp.height - 1)
-                val rightI  = expandedRoiSrc.right.coerceIn(leftI + 1, srcBmp.width)
-                val bottomI = expandedRoiSrc.bottom.coerceIn(topI + 1, srcBmp.height)
-
-                val roiBitmap = Bitmap.createBitmap(
-                    srcBmp,
-                    leftI,
-                    topI,
-                    rightI - leftI,
-                    bottomI - topI
-                )
-                saveBitmapPng(java.io.File(debugDir, "roi.png"), roiBitmap)
-
-                fun toLocal(p: PointF) = PointF(p.x - leftI, p.y - topI)
-                val ptsLocal = ptsSrc.map { toLocal(it) }
-
-                val grid10 = orderPointsInto10x10(ptsLocal)
-                    ?: throw IllegalStateException("Could not form 10×10 grid (points=${ptsLocal.size})")
-
-                // Visualize ordered grid points on ROI
-                saveBitmapPng(
-                    java.io.File(debugDir, "roi_points.png"),
-                    drawPointsOverlayOnBitmap(roiBitmap, grid10.flatten())
+                // --- Parity/debug options ---
+                val opts = Rectifier.Options(
+                    tileSize = 64,
+                    shrink = 0.0f,
+                    precompress = true,
+                    targetKb = 120,
+                    maxSide = 1600,
+                    minJpegQuality = 45,
+                    robust = true
                 )
 
-                // --- TILE WARP + CENTER CROP -------------------------------------------
-                val CELL_SIZE = 64
-                val GRID_SIZE = 576
-                val INNER_FRAC = 0.07f   // trim ~7% from each side of the warped tile
+                // ✅ Pass caseId 3rd, options 4th (named) to match the single signature
+                val caseDir = saveRoiForParity(
+                    fullFrame = srcBmp,
+                    detectorRoi = detectorRoi,
+                    caseId = System.currentTimeMillis().toString(),
+                    options = opts
+                )
+                Log.i("Rectify", "caseDir=${caseDir.absolutePath}")
 
-                val tiles = Array(9) { rIdx ->
-                    Array(9) { cIdx ->
-                        val tl = grid10[rIdx][cIdx]
-                        val tr = grid10[rIdx][cIdx + 1]
-                        val br = grid10[rIdx + 1][cIdx + 1]
-                        val bl = grid10[rIdx + 1][cIdx]
+                // 1) Safe crop of the detector ROI (this becomes our "board")
+                val boardRoi = safeCropBitmap(srcBmp, detectorRoi)
+                if (boardRoi == null) {
+                    err = "ROI outside image bounds"
+                    runOnUiThread {
+                        overlay.setLocked(false)
+                        changeGate(GateState.L2, "roi_invalid")
+                        Toast.makeText(this, "Rectify failed: ROI invalid", Toast.LENGTH_SHORT).show()
+                    }
+                    return@Thread
+                }
 
-                        // 1) Warp full quad to square
-                        val rawTile = warpQuadToSquare(
-                            roiBitmap,
-                            tl, tr, br, bl,
-                            CELL_SIZE, CELL_SIZE
-                        )
-
-                        // 2) Center-crop inner region and resize back to 64×64
-                        val croppedTile = centerCropAndResize(
-                            rawTile,
-                            INNER_FRAC,
-                            CELL_SIZE
-                        )
-
-                        // We no longer need the raw tile bitmap
-                        try { rawTile.recycle() } catch (_: Throwable) {}
-
-                        croppedTile
+                // 2) TEMP tiling: 9×9 equal tiles + gentle inner crop to mimic shrink
+                val tiles = Array(9) { r ->
+                    Array(9) { c ->
+                        val x0 = (c * boardRoi.width) / 9
+                        val y0 = (r * boardRoi.height) / 9
+                        val x1 = ((c + 1) * boardRoi.width) / 9
+                        val y1 = ((r + 1) * boardRoi.height) / 9
+                        val w  = (x1 - x0).coerceAtLeast(1)
+                        val h  = (y1 - y0).coerceAtLeast(1)
+                        val raw = Bitmap.createBitmap(boardRoi, x0, y0, w, h)
+                        centerCropAndResize(raw, innerFrac = 0.0f, outSize = 64)
                     }
                 }
 
-                // Save final tiles for inspection (these are *post* center-crop tiles)
-                for (rr in 0 until 9) {
-                    for (cc in 0 until 9) {
-                        saveBitmapPng(
-                            java.io.File(debugDir, "cell_r${rr + 1}c${cc + 1}.png"),
-                            tiles[rr][cc]
-                        )
-                    }
-                }
+                Log.i("Rectify", "tiles=9x9 size=${tiles[0][0].width}x${tiles[0][0].height} innerCrop")
 
-                // Build mosaic board (also using post-crop tiles)
-                val mosaic = Bitmap.createBitmap(GRID_SIZE, GRID_SIZE, Bitmap.Config.ARGB_8888)
-                val can = Canvas(mosaic)
-                for (rr in 0 until 9) {
-                    for (cc in 0 until 9) {
-                        can.drawBitmap(
-                            tiles[rr][cc],
-                            (cc * CELL_SIZE).toFloat(),
-                            (rr * CELL_SIZE).toFloat(),
-                            null
-                        )
-                    }
-                }
-                boardBmpOut = mosaic
-
-                // --- Digit classification -------------------------------------------
-                ensureDigitClassifier()
-                val (digits, confs, fullProbs) = digitClassifier!!.classifyTilesWithProbs(tiles)
-
-                // Flatten 9×9 -> 81 (row-major)
-                val flatDigits = IntArray(81) { i -> digits[i / 9][i % 9] }
-                val flatConfs  = FloatArray(81) { i -> confs[i / 9][i % 9] }
-
-                // Build GridPrediction summary (for Sudoku logic & auto-correction).
-                val gridPrediction = GridPrediction.fromFlat(
-                    flatDigits,
-                    flatConfs,
-                    lowConfThreshold = 0.60f
-                )
-                lastGridPrediction = gridPrediction
-
-                // Run auto-correction / validation layer with full per-class probs.
-                val autoResult = sudokuAutoCorrector.autoCorrect(gridPrediction, fullProbs)
-                lastAutoCorrectionResult = autoResult
-
-                // --- Logging: Sudoku validity & uncertainty -------------------------
-                run {
-                    val tag = "SudokuLogic"
-
-                    val initialConflicts = autoResult.hadConflictsInitially
-                    val initialSolvable  = autoResult.initiallySolvable
-                    val finalSolvable    = autoResult.wasSolvable
-
-                    val changedCount = autoResult.changedIndices.size
-                    val changedSample = autoResult.changedIndices
-                        .take(10)
-                        .joinToString(",") { idx ->
-                            val r = idx / 9 + 1
-                            val c = idx % 9 + 1
-                            "r${r}c${c}"
+                runCatching {
+                    val cellsDir = java.io.File(caseDir, "cells").apply { mkdirs() }
+                    for (r in 0 until 9) for (c in 0 until 9) {
+                        val f = java.io.File(cellsDir, "cell_${r}_${c}.png")
+                        java.io.FileOutputStream(f).use { out ->
+                            tiles[r][c].compress(Bitmap.CompressFormat.PNG, 100, out)
                         }
+                    }
+                    Log.i("Rectify", "saved 81 cells to ${cellsDir.absolutePath}")
+                }.onFailure { t ->
+                    Log.w("Rectify", "saving cells failed", t)
+                }
 
-                    val unresolvedCount = autoResult.unresolvedIndices.size
-                    val unresolvedSample = autoResult.unresolvedIndices
-                        .take(10)
-                        .joinToString(",") { idx ->
-                            val r = idx / 9 + 1
-                            val c = idx % 9 + 1
-                            "r${r}c${c}"
-                        }
+                // 3) Run CellInterpreter on 9×9 tiles  →  9×9 CellReadout
+                ensureCellInterpreter()
+                val grid: Array<Array<CellReadout>> = cellInterpreter!!.interpretTiles(tiles)
+                readouts9x9 = grid
 
-                    android.util.Log.i(
-                        tag,
-                        "autoCorrect: " +
-                                "before={hadConflicts=$initialConflicts, solvable=$initialSolvable} " +
-                                "after={solvable=$finalSolvable, changed=$changedCount, unresolved=$unresolvedCount} " +
-                                "changedCells=[$changedSample] " +
-                                "unresolvedCells=[$unresolvedSample]"
+                // 4) Build autocorrect inputs USING decidePick() (single policy!)
+                val inputs = buildAutocorrectInputsFromReadouts(grid)
+
+                // ✅ always log the detailed verifier output
+                val verify = verifyAutocorrectInputMatchesCaptured(grid, inputs, AUTOCORR_LOWCONF_THR)
+                Log.i("SudokuLogic", verify)
+
+                // Strict verifier: ensure inputs == decidePick(grid) + candidates
+                if (!verifyAutocorrectInputsAgainstReadouts(grid, inputs)) {
+                    err = "AutocorrectInputs mismatch vs captured readouts (decidePick policy). Aborting autocorrect."
+                    Log.e("SudokuLogic", err!!)
+                    throw IllegalStateException(err)
+                }
+
+                val prediction = GridPrediction.fromFlat(
+                    digits = inputs.digits,
+                    confidences = inputs.confidences,
+                    lowConfThreshold = AUTOCORR_LOWCONF_THR
+                )
+                lastGridPrediction = prediction
+
+                // --- DEBUG: dump interpreter heads vs chosen input-to-autocorrect ---
+                dumpInterpreterDebug(
+                    caseDir = caseDir,
+                    grid = grid,
+                    chosenDigits = prediction.digits,
+                    chosenConfs = prediction.confidences
+                )
+
+                // 5) Run autocorrect
+                // IMPORTANT: classProbs here are the PICKED HEAD probs when available (else heuristic fallback)
+                val auto = sudokuAutoCorrector.autoCorrect(
+                    prediction = prediction,
+                    classProbs = inputs.classProbs
+                )
+                lastAutoCorrectionResult = auto
+
+                val correctedDigits = auto.correctedGrid.digits
+
+                // Display confidence should reflect the chosen head distribution (and thus autocorrect decisions).
+                // computeDisplayConfsFromClassProbs reads p[d] from inputs.classProbs.
+                val correctedConfs = computeDisplayConfsFromClassProbs(correctedDigits, inputs.classProbs)
+
+
+                // Build AUTOCORRECTED provenance flags from changedIndices
+                val asAuto = buildAutoFlags(auto)
+
+
+                // Then GIVEN/SOLUTION flags but excluding auto-changed cells
+                val (asGiven, asSol) = buildGivenSolFlagsFromHeadsExcludingAuto(
+                    correctedDigits = correctedDigits,
+                    headsFlat = inputs.headsFlat,
+                    autoFlags = asAuto
+                )
+
+                givenFlags = asGiven
+                solFlags   = asSol
+                autoFlags  = asAuto
+
+                correctedReadouts9x9 = applyAutocorrectToReadouts(
+                    original = grid,
+                    correctedDigits = correctedDigits,
+                    correctedConfs = correctedConfs,
+                    headsFlat = inputs.headsFlat
+                )
+
+                // Keep for UI display
+                boardBmpOut  = boardRoi
+                digitsFlat   = correctedDigits
+                probsFlat    = correctedConfs
+                givenFlags   = asGiven
+                solFlags     = asSol
+                autoFlags    = asAuto
+                candMaskFlat = inputs.candMask
+
+                // 6) Debug artifacts for autocorrect
+                dumpAutoCorrectDebug(
+                    caseDir = caseDir,
+                    prediction = prediction,
+                    auto = auto,
+                    inputs = inputs,
+                    correctedConfs = correctedConfs
+                )
+
+                // 7) Save to SessionStore (still keeps full 3-head detail)
+                try {
+                    val flatReadouts = Array(81) { i ->
+                        val r = i / 9
+                        val c = i % 9
+                        correctedReadouts9x9!![r][c]
+                    }
+                    SessionStore.ingestCapture(
+                        runPath = caseDir.absolutePath,
+                        readouts = flatReadouts,
+                        p10x10 = null,
+                        tiles = null
                     )
+                } catch (t: Throwable) {
+                    android.util.Log.w("SessionStore", "ingestCapture failed (non-fatal)", t)
                 }
 
-                // Use the corrected grid for UI & navigation.
-                val correctedDigits = autoResult.correctedGrid.digits
-                digitsFlat = correctedDigits
-                probsFlat  = flatConfs
+                // 8) Optional snapshot log
+                try {
+                    if (SessionStore.isReadyForValidation()) {
+                        val snap = SessionStore.snapshot()
+                        android.util.Log.i(
+                            "SessionStore",
+                            "snapshot: digitsForDisplay.size=${snap.digitsForDisplay.size} nonZero=${snap.nonZeroDigitsCount}"
+                        )
+                    }
+                } catch (t: Throwable) {
+                    android.util.Log.w("SessionStore", "snapshot() failed (non-fatal)", t)
+                }
 
-                // post-rectify gates (still driven by confidences only)
-                val avgConf = gridPrediction.avgConfidence
-                val lowConfCells = gridPrediction.lowConfidenceCount
-
+                // 9) Post checks for provisional green (use corrected confidences)
+                val avgConf = probsFlat!!.average().toFloat()
+                val lowConfCells = probsFlat!!.count { it < MIN_AVG_CELL_CONF }
                 val postSnap = GateSnapshot(
                     hasDetectorLock = true,
                     gridizedOk      = true,
-                    validPoints     = ptsSrc.size,
+                    validPoints     = 100,
                     jitterPx128     = 0f,
                     rectifyOk       = true,
                     avgConf         = avgConf,
@@ -2885,24 +4202,57 @@ class MainActivity : ComponentActivity() {
                 val sm = gate.update(postSnap)
                 runOnUiThread { changeGate(sm, "postRectify") }
 
-                // success path → keep provisional green, shutter will fire (already scheduled)
                 locked = true
+                lockedLocal = true
 
             } catch (t: Throwable) {
                 err = t.message ?: "$t"
                 Log.e("MainActivity", "attemptRectifyAndClassify failed", t)
             } finally {
                 handoffInProgress = false
-                if (locked && boardBmpOut != null && digitsFlat != null && probsFlat != null) {
-                    // OK → go to results; shutter already scheduled/fired (or will fire)
+                if (lockedLocal &&
+                    boardBmpOut != null &&
+                    correctedReadouts9x9 != null &&
+                    digitsFlat != null &&
+                    probsFlat != null &&
+                    givenFlags != null &&
+                    solFlags != null &&
+                    autoFlags != null &&
+                    candMaskFlat != null
+                ) {
                     runOnUiThread {
-                        showResults(boardBmpOut!!, digitsFlat!!, probsFlat!!)
+                        try {
+                            // Keep lastCellReadouts aligned with what the user sees (post-autocorrect)
+                            lastCellReadouts = correctedReadouts9x9
+                            resultsDigits = digitsFlat
+                            resultsConfidences = probsFlat
+
+                            showResultsFromReadouts(
+                                boardBitmap = boardBmpOut!!,
+                                readouts9x9 = correctedReadouts9x9!!,
+                                uiDigitsIn = digitsFlat!!,
+                                uiConfsIn  = probsFlat!!,
+                                uiGivenIn  = givenFlags!!,
+                                uiSolIn    = solFlags!!,
+                                uiAutoIn   = autoFlags!!,
+                                uiCandIn   = candMaskFlat!!
+                            )
+                        } catch (t: Throwable) {
+                            Log.e("MainActivity", "CRASH in showResultsFromReadouts()", t)
+
+                            // Demote gate + unlock so you can keep using the app
+                            overlay.setLocked(false)
+                            changeGate(GateState.L2, "showResults_crash")
+
+                            Toast.makeText(
+                                this,
+                                "UI crash after capture: ${t.javaClass.simpleName}: ${t.message}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
                 } else {
-                    // FAIL → cancel shutter and softly demote to Amber
-                    shutterCanceled.set(true)
                     runOnUiThread {
-                        overlay.removeCallbacks(shutterRunnable)
                         overlay.setLocked(false)
                         changeGate(GateState.L2, "demote_after_fail")
                         if (err != null) {
@@ -2919,110 +4269,673 @@ class MainActivity : ComponentActivity() {
 
 
 
+    private fun showResultsFromReadouts(
+        boardBitmap: Bitmap,
+        readouts9x9: Array<Array<CellReadout>>,
+        uiDigitsIn: IntArray,
+        uiConfsIn: FloatArray,
+        uiGivenIn: BooleanArray,
+        uiSolIn: BooleanArray,
+        uiAutoIn: BooleanArray,
+        uiCandIn: IntArray
+    ) {
+        ensureResultsOverlay()
 
-    // Lazy-init the TFLite digit classifier; avoids upfront load on app start.
-    private fun ensureDigitClassifier() {
-        if (digitClassifier == null) {
-            val dc = DigitClassifier(this, "models/digit_cnn_fp32.tflite", 2).apply {
-                dumpParity = false
-                dumpSessionTag = "crop_test"
+        runCatching {
+            resultsSudokuView?.setFromCellGrid(CellGridReadout(cells = readouts9x9))
+        }
 
-                // Parity capture settings
-                dumpWhitelist = emptySet()     // capture all 81 cells
-                innerCrop = 0.92f              // ← ensures same crop as Python
+
+        // ✅ "Corrected" highlight = auto OR manual (manual likely false at capture time,
+// but this keeps the meaning consistent across the app)
+        val correctedShown = BooleanArray(81) { i -> uiAutoIn[i] || uiManual[i] }
+
+        resultsSudokuView?.setUiData(
+            displayDigits        = uiDigitsIn,
+            displayConfs         = uiConfsIn,
+            shownIsGiven         = uiGivenIn,
+            shownIsSolution      = uiSolIn,
+            candidatesMask       = uiCandIn,
+            shownIsAutoCorrected = correctedShown
+        )
+
+        // Persist explicit UI arrays for later edits
+        for (i in 0 until 81) {
+            uiDigits[i] = uiDigitsIn[i]
+            uiConfs[i]  = uiConfsIn[i]
+            uiGiven[i]  = uiGivenIn[i]
+            uiSol[i]    = uiSolIn[i]
+            uiAuto[i]   = uiAutoIn[i]
+            uiCand[i]   = uiCandIn[i]
+        }
+
+        resultsDigits = uiDigits.copyOf()
+        resultsConfidences = uiConfs.copyOf()
+        lastCellReadouts = readouts9x9
+
+        //updateSudoMessage("Hi, I’m Sudo 👋 Let’s make sure I copied your puzzle correctly.")
+
+        // Seed overlay unresolved/editable sets from autocorrect
+        lastAutoCorrectionResult?.let { ac ->
+            overlayUnresolved = ac.unresolvedIndices.toMutableSet()
+            overlayEditable.clear()
+            overlayEditable.addAll(ac.unresolvedIndices)
+            overlayEditable.addAll(ac.changedIndices)
+            resultsSudokuView?.setLogicAnnotations(ac.changedIndices, overlayUnresolved.toList())
+        } ?: run {
+            overlayUnresolved.clear()
+            overlayEditable.clear()
+            resultsSudokuView?.setLogicAnnotations(emptyList(), emptyList())
+        }
+
+        // -----------------------------
+        // ✅ Step-2 baseline state setup (stored in SessionStore) — keep as-is
+        // -----------------------------
+        val gs = buildGridStateFromOverlay()
+        if (gs != null) {
+            val solvability = when {
+                !gs.isStructurallyValid -> SessionStore.Solvability.NONE
+                gs.hasUniqueSolution -> SessionStore.Solvability.UNIQUE
+                gs.hasMultipleSolutions -> SessionStore.Solvability.MULTIPLE
+                else -> SessionStore.Solvability.NONE
             }
-            digitClassifier = dc
+
+            val conflicts = gs.conflictIndices.size
+            val retakeRec = when {
+                conflicts >= 8 -> SessionStore.RetakeRec.STRONG
+                conflicts in 4..7 -> SessionStore.RetakeRec.SOFT
+                else -> SessionStore.RetakeRec.NONE
+            }
+
+            SessionStore.setStep2Baseline(
+                phase = SessionStore.Step2Phase.CONFIRMING,
+                mediationMode = true,
+                pendingKind = null,
+                pendingCellIdx = null,
+                pendingDigit = null,
+                lastRetakeRec = retakeRec,
+                lastSolvability = solvability
+            )
         } else {
-            // Update existing classifier flags in case of reuse
-            digitClassifier?.apply {
-                dumpParity = false // set it to true when you want to DEBUG with parity pack
-                dumpSessionTag = "crop_test"
-                dumpWhitelist = emptySet()
-                innerCrop = 0.92f
+            SessionStore.setStep2Baseline(
+                phase = SessionStore.Step2Phase.CONFIRMING,
+                mediationMode = true
+            )
+        }
+
+        // Make overlay visible
+        resultsRoot?.apply {
+            visibility = View.VISIBLE
+            alpha = 0f
+            animate().alpha(1f).setDuration(180).start()
+        }
+        overlay.animate().alpha(0f).setDuration(120).start()
+        previewView.animate().alpha(0f).setDuration(120).start()
+
+        // -----------------------------
+        // ✅ NEW: Conductor entry point (NO direct LLM call here)
+        // -----------------------------
+        ensureSudoStore() // defensive: guarantees store exists even if code path changes later
+
+        val snapGs = buildGridStateFromOverlay()
+        if (snapGs != null) {
+            val llmGrid = buildLLMGridStateFromOverlay(snapGs)
+            val gridSnap = com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
+
+            sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridCaptured(gridSnap))
+        } else {
+            sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.CameraActive)
+            val msg = "I received something, but I don’t have a usable grid yet. Try retaking with the full page flat in frame."
+            updateSudoMessage(msg)
+            speakAssistant(msg, listenAfter = true)
+        }
+    }
+
+
+    // Compact, consistent log lines for voice I/O
+    private fun logSudoSay(text: String, speakReqId: Int? = null, replyToRowId: Int? = null) {
+        // Logcat (unchanged)
+        Log.i("SudoVoice", "SAY: \"${text.replace("\n"," ")}\"")
+
+        // Telemetry JSONL (single source of truth)
+        ConversationTelemetry.emitAssistantSay(
+            text = text,
+            source = "logSudoSay",
+            speakReqId = speakReqId,
+            replyToRowId = replyToRowId
+            // Optional (only if you have them at this call-site):
+            // mode = currentConversationMode,   // "FREE_TALK" or "GRID"
+            // engine = if (isAzureConfigured()) "azure" else "android",
+            // locale = localeTag
+        )
+    }
+
+    private fun logAsrHeard(kind: String, text: String, confidence: Float? = null) {
+        val base = "$kind: \"${text.replace("\n"," ")}\""
+        if (confidence != null) {
+            Log.i("SudoASR", "$base (conf=${"%.2f".format(confidence)})")
+        } else {
+            Log.i("SudoASR", base)
+        }
+    }
+
+
+
+
+
+
+    private fun handleUserUtterance(userText: String) {
+        lifecycleScope.launch {
+            try {
+                // Ensure store is ready (if you rely on lazy init)
+                ensureSudoStore()
+
+                val text = userText.trim()
+                if (text.isBlank()) return@launch
+
+                val mode = decideConversationMode()
+
+                // Optional telemetry: keep your route event, but it no longer implies MainActivity calls LLM.
+                runCatching {
+                    ConversationTelemetry.emitKv(
+                        "USER_UTTERANCE_ROUTE",
+                        "session_id" to convoSessionId,
+                        "mode" to mode.name,
+                        "text_len" to text.length
+                    )
+                }
+
+                when (mode) {
+
+                    ConversationMode.FREE_TALK -> {
+                        // If you already have a full FREE_TALK pipeline inside SudoStore/Conductor,
+                        // you can route free talk through the store too.
+                        //
+                        // If not, keep your existing behavior.
+                        //
+                        // Recommended (single brain):
+                        sudoStore.dispatch(
+                            com.contextionary.sudoku.conductor.Evt.AsrFinal(
+                                text = text,
+                                confidence = 1.0f // or your ASR confidence if you have it
+                            )
+                        )
+                    }
+
+                    ConversationMode.GRID -> {
+                        // ✅ IMPORTANT:
+                        // Remove the old "pending confirmation interceptor" here.
+                        // Pending is now handled deterministically inside SudoConductor.handlePending().
+                        //
+                        // Also remove:
+                        // - buildGridStateFromOverlay()
+                        // - buildLLMGridStateFromOverlay()
+                        // - llmCoordinator.sendToLLMTools()
+                        // - handleAssistantUpdate(...)
+                        //
+                        // MainActivity's only job is to dispatch user text into the store.
+
+                        sudoStore.dispatch(
+                            com.contextionary.sudoku.conductor.Evt.AsrFinal(
+                                text = text,
+                                confidence = 1.0f // or ASR confidence
+                            )
+                        )
+                    }
+                }
+
+            } catch (t: Throwable) {
+                Log.e("SudokuLLM", "handleUserUtterance failed", t)
             }
         }
     }
 
-    // Called once when we decide the grid is good & stable.
-    // Deprecated/alternate capture path that does rectification/classification after 'locked'. Shows shutter and results on success; otherwise toasts an error.
-    private fun onLockedGridCaptured(lockedRoiBitmap: Bitmap) {
-        // MM1 TEMP: Layer 3 (rectify/classify/navigate) disabled.
-        Logx.d("Gate", "skip" to "L3_disabled_MM1", "note" to "stubbing onLockedGridCaptured")
+
+
+
+
+    private fun buildLLMGridStateFromOverlay(
+        state: com.contextionary.sudoku.logic.GridState
+    ): LLMGridState {
+
+        val correctedGrid = state.digits.copyOf()
+
+        SessionStore.ensureTruthInitializedFromCanonicalIfPossible()
+        val truthSnap = SessionStore.truthSnapshotOrNull()
+
+        fun safeBool81(x: BooleanArray?, fallback: BooleanArray): BooleanArray {
+            return if (x != null && x.size == 81) x.copyOf() else fallback.copyOf()
+        }
+
+        fun safeInt81(x: IntArray?, fallback: IntArray): IntArray {
+            return if (x != null && x.size == 81) x.copyOf() else fallback.copyOf()
+        }
+
+        val truthGiven = safeBool81(truthSnap?.isGiven, uiGiven)
+        val truthSol = safeBool81(truthSnap?.isSolution, uiSol)
+        val truthCand = safeInt81(truthSnap?.candidateMask, uiCand)
+
+        // ✅ Confirmed indices (handled already; should not be re-asked)
+        fun isConfirmed(idx: Int): Boolean = (idx in 0..80 && uiConfirmed[idx])
+
+        // ✅ NEW: explicit confirmed list for LLMGridState (facts for coordinator prompt)
+        val confirmedCells = (0 until 81)
+            .asSequence()
+            .filter { uiConfirmed[it] }
+            .toList()
+            .sorted()
+
+        val unresolvedCells = state.unresolvedIndices
+            .toSet()
+            .toList()
+            .sorted()
+            .filterNot { isConfirmed(it) }  // ✅ keeps "next-check" from looping
+
+        val changedCells = state.changedByLogic.toSet().toList().sorted()
+        val conflictCells = state.conflictIndices.toSet().toList().sorted()
+
+        val lowConfidenceCells = state.cells
+            .asSequence()
+            .filter { it.isLowConfidence }
+            .map { it.index }
+            .toSet()
+            .toList()
+            .sorted()
+
+        val manuallyCorrectedCells = (0 until 81)
+            .asSequence()
+            .filter { uiManual[it] }
+            .toList()
+
+        val manualEdits = manualEditLog
+            .sortedBy { it.seq }
+            .toList()
+
+        // Deduced solution from GIVENS ONLY
+        val givensOnly = IntArray(81) { idx -> if (truthGiven[idx]) correctedGrid[idx].coerceIn(0, 9) else 0 }
+        val solveRes = com.contextionary.sudoku.logic.DeterministicSudokuSolver
+            .solveCountCapped(givensOnly, maxCount = 2)
+        val deducedSolution = if (solveRes.solutionCount == 1) solveRes.solutionGrid else null
+
+        // Mismatch detection (only meaningful when unique)
+        val mismatchCellsRaw = mutableListOf<Int>()
+        if (deducedSolution != null) {
+            for (idx in 0 until 81) {
+                if (!truthSol[idx]) continue
+                val userVal = correctedGrid[idx].coerceIn(0, 9)
+                if (userVal == 0) continue
+                val expected = deducedSolution[idx].coerceIn(0, 9)
+                if (expected != 0 && userVal != expected) mismatchCellsRaw += idx
+            }
+        }
+
+        // ✅ filter mismatch by confirmed (prevents asking same mismatch cell again)
+        val mismatchCellsSorted = mismatchCellsRaw
+            .distinct()
+            .sorted()
+            .filterNot { isConfirmed(it) }
+
+        val mismatchDetails = mutableListOf<String>()
+        if (deducedSolution != null) {
+            for (idx in mismatchCellsSorted) {
+                val r = (idx / 9) + 1
+                val c = (idx % 9) + 1
+                val userVal = correctedGrid[idx].coerceIn(0, 9)
+                val expected = deducedSolution[idx].coerceIn(0, 9)
+                mismatchDetails += "r${r}c${c} expected=$expected user=$userVal"
+            }
+        }
+
+        val solvability = when {
+            state.hasUniqueSolution -> "unique"
+            state.hasMultipleSolutions -> "multiple"
+            else -> "none"
+        }
+
+        val isStructurallyValid = state.isStructurallyValid
+        val unresolvedCount = unresolvedCells.size
+
+        // Retake policy aligned with "Sudo solves only unique"
+        val retakeRecommendation = when {
+            conflictCells.size >= 8 -> "strong"
+            conflictCells.size in 4..7 -> "soft"
+            solvability == "multiple" -> "soft"
+            unresolvedCells.size > 6 -> "soft"
+            else -> "none"
+        }
+
+        // Severity: treat multiple as serious (not acceptable for solving)
+        val severity = when {
+            solvability == "none" -> "serious"
+            solvability == "multiple" -> "serious"
+            conflictCells.isNotEmpty() -> "serious"
+            unresolvedCells.isNotEmpty() -> "serious"
+            lowConfidenceCells.isNotEmpty() -> "mild"
+            changedCells.isNotEmpty() -> "mild"
+            else -> "ok"
+        }
+
+        return LLMGridState(
+            correctedGrid = correctedGrid,
+
+            truthIsGiven = truthGiven,
+            truthIsSolution = truthSol,
+            candidateMask81 = truthCand,
+
+            unresolvedCells = unresolvedCells,
+            changedCells = changedCells,
+            conflictCells = conflictCells,
+            lowConfidenceCells = lowConfidenceCells,
+
+            manuallyCorrectedCells = manuallyCorrectedCells,
+            manualEdits = manualEdits,
+
+            deducedSolutionGrid = deducedSolution,
+            deducedSolutionCountCapped = solveRes.solutionCount,
+            mismatchCells = mismatchCellsSorted,
+            mismatchDetails = mismatchDetails,
+
+            // ✅ NEW: pass confirmations through to coordinator prompt
+            confirmedCells = confirmedCells,
+
+            solvability = solvability,
+            isStructurallyValid = isStructurallyValid,
+            unresolvedCount = unresolvedCount,
+            severity = severity,
+            retakeRecommendation = retakeRecommendation
+        )
+    }
+
+
+
+    private fun applyTruthReclassification(idx: Int, kind: String, source: String) {
+        val ok = SessionStore.reclassifyCell(idx, kind)
+        if (!ok) return
+
+        // Reflect truth back into UI flags for rendering
+        val snap = SessionStore.truthSnapshotOrNull() ?: return
+        for (i in 0 until 81) {
+            uiGiven[i] = snap.isGiven[i]
+            uiSol[i] = snap.isSolution[i]
+        }
+
+        // Re-render
+        resultsSudokuView?.setUiData(
+            displayDigits = uiDigits,
+            displayConfs = uiConfs,
+            shownIsGiven = uiGiven,
+            shownIsSolution = uiSol,
+            candidatesMask = uiCand,
+            shownIsAutoCorrected = uiAuto
+        )
+
+        // Send fresh grid snapshot to conductor
+        val gs = buildGridStateFromOverlay() ?: return
+        val llmGrid = buildLLMGridStateFromOverlay(gs)
+        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
+            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
+        ))
+    }
+
+    private fun applyCandidatesSet(idx: Int, mask: Int, source: String) {
+        val ok = SessionStore.setCandidates(idx, mask)
+        if (!ok) return
+
+        val snap = SessionStore.truthSnapshotOrNull() ?: return
+        for (i in 0 until 81) {
+            uiCand[i] = snap.candidateMask[i]
+        }
+
+        resultsSudokuView?.setUiData(
+            displayDigits = uiDigits,
+            displayConfs = uiConfs,
+            shownIsGiven = uiGiven,
+            shownIsSolution = uiSol,
+            candidatesMask = uiCand,
+            shownIsAutoCorrected = uiAuto
+        )
+
+        val gs = buildGridStateFromOverlay() ?: return
+        val llmGrid = buildLLMGridStateFromOverlay(gs)
+        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
+            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
+        ))
+    }
+
+    private fun applyCandidatesToggle(idx: Int, digit: Int, source: String) {
+        val ok = SessionStore.toggleCandidate(idx, digit)
+        if (!ok) return
+        val snap = SessionStore.truthSnapshotOrNull() ?: return
+
+        for (i in 0 until 81) {
+            uiCand[i] = snap.candidateMask[i]
+        }
+
+        resultsSudokuView?.setUiData(
+            displayDigits = uiDigits,
+            displayConfs = uiConfs,
+            shownIsGiven = uiGiven,
+            shownIsSolution = uiSol,
+            candidatesMask = uiCand,
+            shownIsAutoCorrected = uiAuto
+        )
+
+        val gs = buildGridStateFromOverlay() ?: return
+        val llmGrid = buildLLMGridStateFromOverlay(gs)
+        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
+            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
+        ))
+    }
+
+
+
+    private fun extractDigit1to9(text: String): Int? {
+        val t = text.lowercase()
+
+        // A) Prefer explicit "to X" / "equals X" / "is X" / "= X"
+        Regex("""\b(?:to|equals|equal|is|=)\s*([1-9])\b""")
+            .find(t)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.let { return it }
+
+        // B) Prefer explicit "to six" etc
+        val wordToDigit = mapOf(
+            "one" to 1,
+            "two" to 2,
+            "three" to 3,
+            "four" to 4,
+            "for" to 4,     // common ASR
+            "five" to 5,
+            "six" to 6,
+            "sex" to 6,     // common ASR
+            "seven" to 7,
+            "eight" to 8,
+            "ate" to 8,     // common ASR
+            "nine" to 9
+        )
+        Regex("""\b(?:to|equals|equal|is|=)\s*(one|two|three|four|for|five|six|sex|seven|eight|ate|nine)\b""")
+            .find(t)?.groupValues?.getOrNull(1)
+            ?.let { w -> wordToDigit[w]?.let { return it } }
+
+        // C) Otherwise, take the LAST standalone numeric digit 1..9 (avoid grabbing "r1c1" because no word-boundary)
+        Regex("""\b([1-9])\b""").findAll(t).toList().lastOrNull()
+            ?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.let { return it }
+
+        // D) Otherwise, take the LAST number-word occurrence
+        val hits = wordToDigit.entries
+            .filter { (k, _) -> Regex("""\b$k\b""").containsMatchIn(t) }
+        hits.lastOrNull()?.value?.let { return it }
+
+        return null
+    }
+
+
+
+    private fun applyManualDigitEdit(idx: Int, newDigit: Int) {
+        if (idx !in 0..80) return
+        if (newDigit !in 1..9) return
+        if (resultsDigits == null || resultsConfidences == null || resultsSudokuView == null) return
+
+        val oldDigit = uiDigits[idx]
+        if (oldDigit == newDigit) {
+            // No-op is safe
+            overlayUnresolved.remove(idx)
+            resultsSudokuView?.stopConfirmationPulse()
+            return
+        }
+
+        // 1) Update canonical UI arrays (what is displayed)
+        uiDigits[idx] = newDigit
+        uiConfs[idx] = 1.0f
+
+        // Bold is driven by corrected flags, not "given/solution" booleans
+        uiGiven[idx] = false
+        uiSol[idx] = false
+        uiCand[idx] = 0
+
+        // 2) Mark manual provenance
+        uiManual[idx] = true
+
+        // 3) Append manual edit history for the LLM (epoch time; stable)
+        manualEditSeqGlobal += 1
+        manualEditLog.add(
+            com.contextionary.sudoku.logic.LLMCellEditEvent(
+                seq = manualEditSeqGlobal,
+                index = idx,
+                cellLabel = "r${(idx / 9) + 1}c${(idx % 9) + 1}",
+                fromDigit = oldDigit,
+                toDigit = newDigit,
+                whenEpochMs = System.currentTimeMillis(),
+                source = "manual"
+            )
+        )
+
+        // 4) Keep resultsDigits/resultsConfidences consistent (canonical for solver + GridState)
+        System.arraycopy(uiDigits, 0, resultsDigits!!, 0, 81)
+        System.arraycopy(uiConfs, 0, resultsConfidences!!, 0, 81)
+
+        // 5) Remove from unresolved
+        overlayUnresolved.remove(idx)
+
+        // 6) Repaint with boldCorrected = auto OR manual
+        val boldCorrected = BooleanArray(81) { i -> uiAuto[i] || uiManual[i] }
+
+        resultsSudokuView?.setUiData(
+            displayDigits = uiDigits,
+            displayConfs = uiConfs,
+            shownIsGiven = uiGiven,
+            shownIsSolution = uiSol,
+            candidatesMask = uiCand,
+            // NOTE: View param is misnamed; you're using it as "corrected => bold"
+            shownIsAutoCorrected = boldCorrected
+        )
+
+        // 7) Re-apply logic annotations (cyan=auto-changed, red=unresolved)
+        val changedCellsIdx = lastAutoCorrectionResult?.changedIndices ?: emptyList()
+        resultsSudokuView?.setLogicAnnotations(
+            changed = changedCellsIdx,
+            unresolved = overlayUnresolved.toList()
+        )
+
+        resultsSudokuView?.stopConfirmationPulse()
+
+        // 8) Optional: notify GridConversationCoordinator + log event (your existing pattern)
+        buildGridStateFromOverlay()?.let { state ->
+            val editEvent = com.contextionary.sudoku.logic.GridEditEvent(
+                seq = manualEditSeqGlobal,
+                cellIndex = idx,
+                row = idx / 9,
+                col = idx % 9,
+                oldDigit = oldDigit,
+                newDigit = newDigit,
+                timestampMs = android.os.SystemClock.elapsedRealtime()
+            )
+            gridConversationCoordinator.onManualEditApplied(state, editEvent)
+        }
+    }
+
+
+
+
+    private fun updateProfileFrom(userText: String) {
+        lifecycleScope.launch {
+            runCatching {
+                val delta = llmCoordinator.extractProfileClues(userText)
+                val current = UserProfileStore.load(this@MainActivity)
+                UserProfileStore.mergeAndSave(this@MainActivity, current, delta)
+            }.onFailure {
+                android.util.Log.w("SudoProfile", "Profile extraction failed (non-fatal): ${it.message}")
+            }
+        }
+    }
+
+
+    private fun RectF.toAndroidRect(): Rect =
+        Rect(left.toInt(), top.toInt(), right.toInt(), bottom.toInt())
+
+    // Flat → 9×9 helpers
+    private fun to9x9Int(flat: IntArray): Array<IntArray> {
+        require(flat.size == 81) { "Expected 81 ints" }
+        return Array(9) { r -> IntArray(9) { c -> flat[r * 9 + c] } }
+    }
+
+    private fun to9x9Float(flat: FloatArray): Array<FloatArray> {
+        require(flat.size == 81) { "Expected 81 floats" }
+        return Array(9) { r -> FloatArray(9) { c -> flat[r * 9 + c] } }
+    }
+
+
+
+
+
+    // Drop ALL other overloads. Keep ONLY this one.
+    // Drop ALL other overloads. Keep ONLY this one.
+    private fun saveRoiForParity(
+        fullFrame: Bitmap,
+        detectorRoi: android.graphics.Rect,
+        caseId: String,
+        options: Rectifier.Options? = null   // ← default provided so callers may omit it
+    ): java.io.File {
+        val opts = options ?: Rectifier.Options()
+
+        val root = java.io.File(filesDir, "runs/grid_rectification/$caseId")
+        root.mkdirs()
+
+        val left   = detectorRoi.left.coerceAtLeast(0)
+        val top    = detectorRoi.top.coerceAtLeast(0)
+        val right  = detectorRoi.right.coerceAtMost(fullFrame.width)
+        val bottom = detectorRoi.bottom.coerceAtMost(fullFrame.height)
+        val w = (right - left).coerceAtLeast(1)
+        val h = (bottom - top).coerceAtLeast(1)
+        val roiBmp = Bitmap.createBitmap(fullFrame, left, top, w, h)
+
+        java.io.File(root, "roi.png").outputStream().use { out ->
+            roiBmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+
+        val manifest = """
+      {
+        "tile_size": ${opts.tileSize},
+        "shrink": ${opts.shrink},
+        "precompress": ${opts.precompress},
+        "target_kb": ${opts.targetKb},
+        "max_side": ${opts.maxSide},
+        "min_jpeg_quality": ${opts.minJpegQuality},
+        "robust": ${opts.robust},
+        "roi": {"x0": $left, "y0": $top, "x1": $right, "y1": $bottom},
+        "source": {"w": ${fullFrame.width}, "h": ${fullFrame.height}},
+        "engine_hint": "android",
+        "case_id": "$caseId"
+      }
+    """.trimIndent()
+        java.io.File(root, "manifest.json").writeText(manifest, Charsets.UTF_8)
+
+        return root
     }
 
 
     // --- Debug I/O helpers ------------------------------------------------------
 
-
-    // Where to write debug images (VISIBLE in Device File Explorer for a debuggable build)
-    private fun getDebugDir(): java.io.File {
-        val dir = java.io.File(filesDir, "rectify_debug")
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
-
-    private fun saveBitmapDebug(bmp: Bitmap, name: String) {
-        try {
-            val dir = getDebugDir()
-            val file = java.io.File(dir, name)
-            java.io.FileOutputStream(file).use { out ->
-                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
-            Log.i("RectifyDebug", "Saved: ${file.absolutePath}")
-        } catch (t: Throwable) {
-            Log.e("RectifyDebug", "saveBitmapDebug failed for $name", t)
-        }
-    }
-
-
-    // Use INTERNAL app storage so it’s visible in Device File Explorer:
-// Device File Explorer → data → data → com.contextionary.sudoku → files → rectify_debug
-    private fun getRectifyDebugDir(): java.io.File {
-        val dir = java.io.File(filesDir, "rectify_debug")
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
-
-    private fun clearDirectory(dir: java.io.File) {
-        if (!dir.exists()) return
-        dir.listFiles()?.forEach { f ->
-            try {
-                if (f.isDirectory) {
-                    // Keep intersections parity packs AND Best-of-N audit packs
-                    val keep = f.name.startsWith("intersections_") || f.name.startsWith("bestofN")
-                    if (!keep) f.deleteRecursively()
-                } else {
-                    // Remove loose files (roi.png, cell_*.png, etc.)
-                    f.delete()
-                }
-            } catch (_: Throwable) { /* ignore */ }
-        }
-    }
-
-    private fun saveBitmapPng(file: java.io.File, bmp: Bitmap) {
-        try {
-            file.parentFile?.mkdirs()
-            java.io.FileOutputStream(file).use { out ->
-                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-            }
-        } catch (t: Throwable) {
-            Log.w("MainActivity", "saveBitmapPng failed: ${file.absolutePath}", t)
-        }
-    }
-
-    private fun drawPointsOverlayOnBitmap(base: Bitmap, pointsLocal: List<PointF>): Bitmap {
-        val out = base.copy(Bitmap.Config.ARGB_8888, true)
-        val c = Canvas(out)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            color = Color.CYAN
-        }
-        val r = (2.0f * resources.displayMetrics.density).coerceAtLeast(2f) // ~2dp
-        pointsLocal.forEach { pt ->
-            c.drawCircle(pt.x, pt.y, r, p)
-        }
-        return out
-    }
 
 
     // ===== Rectify debug saving =====
@@ -3036,83 +4949,8 @@ class MainActivity : ComponentActivity() {
     }
 
 
-    /** Draws the given points onto a copy of 'base' and returns the annotated bitmap. */
-    private fun drawPointsOverlay(
-        base: android.graphics.Bitmap,
-        points: List<android.graphics.PointF>,
-        radiusPx: Float = 3f
-    ): android.graphics.Bitmap {
-        val out = base.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-        val c = android.graphics.Canvas(out)
-        val p = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            style = android.graphics.Paint.Style.FILL
-            color = android.graphics.Color.CYAN
-        }
-        for (pt in points) c.drawCircle(pt.x, pt.y, radiusPx, p)
-        return out
-    }
 
     // ===== Geometry helpers (PointF versions) =====
-
-    private fun quadArea(tl: PointF, tr: PointF, br: PointF, bl: PointF): Float {
-        fun cross(ax: Float, ay: Float, bx: Float, by: Float) = ax * by - ay * bx
-        val sum =
-            cross(tl.x, tl.y, tr.x, tr.y) +
-                    cross(tr.x, tr.y, br.x, br.y) +
-                    cross(br.x, br.y, bl.x, bl.y) +
-                    cross(bl.x, bl.y, tl.x, tl.y)
-        return kotlin.math.abs(sum) * 0.5f
-    }
-
-    private fun isConvexAndPositiveTLTRBRBL(
-        tl: PointF, tr: PointF, br: PointF, bl: PointF
-    ): Boolean {
-        fun cross(ax: Float, ay: Float, bx: Float, by: Float) = ax * by - ay * bx
-        val z1 = cross(tr.x - tl.x, tr.y - tl.y, br.x - tl.x, br.y - tl.y)
-        val z2 = cross(br.x - tr.x, br.y - tr.y, bl.x - tr.x, bl.y - tr.y)
-        val z3 = cross(bl.x - br.x, bl.y - br.y, tl.x - br.x, tl.y - br.y)
-        val z4 = cross(tl.x - bl.x, tl.y - bl.y, tr.x - bl.x, tr.y - bl.y)
-        val allPos = z1 > 0 && z2 > 0 && z3 > 0 && z4 > 0
-        val allNeg = z1 < 0 && z2 < 0 && z3 < 0 && z4 < 0
-        val area = quadArea(tl, tr, br, bl)
-        return (allPos || allNeg) && area > 1e-3f
-    }
-
-    private fun sideLenRatio(tl: PointF, tr: PointF, br: PointF, bl: PointF): Float {
-        fun d(a: PointF, b: PointF): Float {
-            val dx = a.x - b.x; val dy = a.y - b.y
-            return kotlin.math.sqrt(dx*dx + dy*dy)
-        }
-        val s1 = d(tl, tr); val s2 = d(tr, br); val s3 = d(br, bl); val s4 = d(bl, tl)
-        val mx = maxOf(s1, s2, s3, s4)
-        val mn = minOf(s1, s2, s3, s4)
-        return if (mn <= 1e-6f) Float.POSITIVE_INFINITY else mx / mn
-    }
-
-    private fun quadAspectApprox(tl: PointF, tr: PointF, br: PointF, bl: PointF): Float {
-        fun d(a: PointF, b: PointF): Float {
-            val dx = a.x - b.x; val dy = a.y - b.y
-            return kotlin.math.sqrt(dx*dx + dy*dy)
-        }
-        val top = d(tl, tr); val bottom = d(bl, br)
-        val left = d(tl, bl); val right = d(tr, br)
-        val w = (top + bottom) * 0.5f
-        val h = (left + right) * 0.5f
-        return if (h <= 1e-6f) Float.POSITIVE_INFINITY else w / h
-    }
-
-    private fun aspect(r: RectF): Float {
-        val w = r.width().coerceAtLeast(1f)
-        val h = r.height().coerceAtLeast(1f)
-        return w / h
-    }
-
-
-
-
-
-
-
 
 
     private fun updateSudoMessage(text: String?) {
@@ -3130,44 +4968,14 @@ class MainActivity : ComponentActivity() {
 
 
 
-
-
-
-    private fun handleAssistantUpdate(assistantMessage: String, action: LLMAction) {
-        // Voice-first: captions (if any) are updated inside speakAssistant()
-        speakAssistant(assistantMessage)
-
-        // Handle the structured action
-        when (action) {
-            is LLMAction.RetakePhoto -> {
-                Toast.makeText(this, "Sudo suggests retaking the photo.", Toast.LENGTH_SHORT).show()
-            }
-            is LLMAction.ValidateGrid -> {
-                Toast.makeText(this, "Sudo thinks the grid looks good!", Toast.LENGTH_SHORT).show()
-            }
-            is LLMAction.ChangeCell -> {
-                Log.i("SudokuLLM", "ChangeCell suggested but not yet wired to UI: $action")
-            }
-            is LLMAction.AskUserConfirmation -> {
-                handleAskUserConfirmation(action)
-            }
-            is LLMAction.NoAction -> { /* no-op */ }
-            is LLMAction.Unknown -> {
-                Log.w("SudokuLLM", "Unknown LLMAction from model: ${action.raw}")
-            }
-        }
-    }
-
-
-
     /**
      * Handle an AskUserConfirmation action from the LLM:
      *  - highlight the target cell with a pulsing border
      *  - show the bottom digit picker strip
      *  - select that cell for the next digit tap
      */
-    private fun handleAskUserConfirmation(action: LLMAction.AskUserConfirmation) {
-        var idx = action.row * 9 + action.col
+    private fun handleAskUserConfirmation(cellIndex: Int) {
+        var idx = cellIndex
         if (idx !in 0..80) return
         if (resultsDigits == null || resultsConfidences == null || resultsSudokuView == null) return
 
@@ -3178,7 +4986,6 @@ class MainActivity : ComponentActivity() {
         val isLowConf = (digit != 0 && conf < SudokuConfidence.THRESH_HIGH)
 
         if (!isChangedByLogic && !isLowConf) {
-            // Prefer: first low-confidence, else first logic-changed, else keep original
             val betterIdx =
                 (0 until 81).firstOrNull { i ->
                     val d = resultsDigits!![i]
@@ -3189,75 +4996,16 @@ class MainActivity : ComponentActivity() {
             if (betterIdx != null) idx = betterIdx
         }
 
-        // Allow user to edit/tap this cell, but DO NOT mark as "unresolved" (no red border)
         overlayEditable.add(idx)
-
-        // Track selection for the digit picker
         selectedOverlayIdx = idx
 
-        // Pulse highlight only (keeps the visual distinct from true unresolved/red)
         resultsSudokuView?.startConfirmationPulse(idx)
-
-        // Show the picker strip at the bottom (we reuse the existing Clear/1–9 row)
         digitPickerRow?.visibility = View.VISIBLE
     }
 
 
 
 
-
-
-    /**
-     * Convert the raw intersection detections into a strict 10×10 grid [row][col].
-     * Strategy:
-     *  - Cluster into 10 horizontal bands by Y using the 9 largest gaps.
-     *  - Within each band, sort by X; if the band has != 10 points, linearly
-     *    interpolate to produce 10 evenly spaced points between the band’s min/max.
-     *  - Finally, column-align by averaging X across rows to reduce jitter.
-     *
-     * Returns null if we really can’t form a proper grid.
-     */
-    private fun orderPointsInto10x10(points: List<PointF>): Array<Array<PointF>>? {
-        if (points.size < 90) return null
-
-        // 1) Sort by Y
-        val byY = points.sortedBy { it.y }
-
-        // 2) Split into 10 rows by cutting at the 9 largest Y gaps
-        val gaps = mutableListOf<Pair<Int, Float>>() // (index, gapValue) between byY[i] and byY[i+1]
-        for (i in 0 until byY.size - 1) {
-            gaps += i to (byY[i + 1].y - byY[i].y)
-        }
-        val cutIndices = gaps.sortedByDescending { it.second }.take(9).map { it.first }.sorted()
-        val rows = ArrayList<List<PointF>>(10)
-        var start = 0
-        for (cut in cutIndices) {
-            rows += byY.subList(start, cut + 1)
-            start = cut + 1
-        }
-        rows += byY.subList(start, byY.size)
-        if (rows.size != 10) return null
-
-        // 3) Within each row, sort by X and expand/shrink to exactly 10 points via interpolation
-        val row10 = Array(10) { Array(10) { PointF() } }
-        for (r in 0 until 10) {
-            val row = rows[r].sortedBy { it.x }
-            row10[r] = interpolateRowToTen(row)
-        }
-
-        // 4) Column alignment pass: average X per column & nudge points slightly toward that mean
-        for (c in 0 until 10) {
-            var sumX = 0f
-            for (r in 0 until 10) sumX += row10[r][c].x
-            val meanX = sumX / 10f
-            for (r in 0 until 10) {
-                val p = row10[r][c]
-                // Gentle pull to column mean to reduce jitter while keeping row order
-                row10[r][c] = PointF((p.x * 0.8f + meanX * 0.2f), p.y)
-            }
-        }
-        return row10
-    }
 
     /** Ensure a row contains exactly 10 points by linear interpolation along X. */
     private fun interpolateRowToTen(sortedRow: List<PointF>): Array<PointF> {
@@ -3298,94 +5046,10 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    /** Warp a source-space quadrilateral to a WxH square bitmap (OpenCV). */
-    private fun warpQuadToSquare(
-        src: Bitmap,
-        tl: PointF, tr: PointF, br: PointF, bl: PointF,
-        w: Int, h: Int
-    ): Bitmap {
-        val srcMat = Mat()
-        Utils.bitmapToMat(src, srcMat) // RGBA
-
-        val dstMat = Mat(h, w, CvType.CV_8UC4)
-
-        val srcPts = MatOfPoint2f(
-            org.opencv.core.Point(tl.x.toDouble(), tl.y.toDouble()),
-            org.opencv.core.Point(tr.x.toDouble(), tr.y.toDouble()),
-            org.opencv.core.Point(br.x.toDouble(), br.y.toDouble()),
-            org.opencv.core.Point(bl.x.toDouble(), bl.y.toDouble())
-        )
-        val dstPts = MatOfPoint2f(
-            org.opencv.core.Point(0.0, 0.0),
-            org.opencv.core.Point((w - 1).toDouble(), 0.0),
-            org.opencv.core.Point((w - 1).toDouble(), (h - 1).toDouble()),
-            org.opencv.core.Point(0.0, (h - 1).toDouble())
-        )
-
-        val H = Imgproc.getPerspectiveTransform(srcPts, dstPts)
-        Imgproc.warpPerspective(srcMat, dstMat, H, CvSize(w.toDouble(), h.toDouble()), Imgproc.INTER_LINEAR)
-
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(dstMat, out)
-
-        srcMat.release(); dstMat.release(); srcPts.release(); dstPts.release()
-        return out
-    }
-
-    // ==== View-space mapping & cyan guard helpers ====
-
-    // Compute view mapping used if you ever need to reproduce guard mapping math here.
-    private fun computeViewMapping(
-        viewW: Int,
-        viewH: Int,
-        srcW: Int,
-        srcH: Int,
-        useFillCenter: Boolean
-    ): Quadruple /* (s, dw, dh, offX, offY) */ {
-        val vw = viewW.toFloat()
-        val vh = viewH.toFloat()
-        val sx = vw / srcW
-        val sy = vh / srcH
-        val s: Float
-        val dw: Float
-        val dh: Float
-        val offX: Float
-        val offY: Float
-        if (useFillCenter) {
-            s = max(sx, sy)
-        } else {
-            s = min(sx, sy)
-        }
-        dw = srcW * s
-        dh = srcH * s
-        offX = (vw - dw) / 2f
-        offY = (vh - dh) / 2f
-        return Quadruple(s, dw, dh, offX, offY)
-    }
 
     private data class Quadruple(val s: Float, val dw: Float, val dh: Float, val offX: Float, val offY: Float)
 
-    // Map bitmap-space RectF to view-space RectF given scale and offsets.
-    private fun mapRectToView(r: RectF, s: Float, offX: Float, offY: Float): RectF {
-        return RectF(
-            offX + r.left * s,
-            offY + r.top * s,
-            offX + r.right * s,
-            offY + r.bottom * s
-        )
-    }
 
-    // Compute the centered cyan square guide for a mapped bitmap rect.
-    private fun computeCyanGuide(mappedBmp: RectF): RectF {
-        val side = min(mappedBmp.width(), mappedBmp.height())
-        return if (mappedBmp.width() <= mappedBmp.height()) {
-            val top = mappedBmp.centerY() - side / 2f
-            RectF(mappedBmp.left, top, mappedBmp.left + side, top + side)
-        } else {
-            val left = mappedBmp.centerX() - side / 2f
-            RectF(left, mappedBmp.top, left + side, mappedBmp.top + side)
-        }
-    }
 
     // Check if a rect "touches" the border (stroke) of a square, within tolerance.
     // Determine if the detection box touches the guard border within a tolerance (source space).

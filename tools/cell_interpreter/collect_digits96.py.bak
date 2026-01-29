@@ -1,0 +1,369 @@
+# tools/collect_digits96.py
+# ------------------------------------------------------------
+# Collect handwritten digits (0–9) from:
+#   - EMNIST MATLAB folders under datasets/digits/matlab/*
+#   - NIST SD-19 by_class under datasets/digits/nist_sd19/by_class
+#   - NIST SD-19 by_write under datasets/digits/nist_sd19/by_write
+#
+# Outputs:
+#   - 96x96 white-background PNGs into: <out_root>/<source>/<digit>/...
+#   - JSONL manifest with records:
+#         {"path": "<relative path>", "digit": int, "source": "<source>"}
+#
+# Requires: pillow, numpy, scipy, tqdm
+#   pip install pillow numpy scipy tqdm
+# ------------------------------------------------------------
+
+import argparse, json, sys, re
+from pathlib import Path
+from typing import Iterable, List, Tuple
+
+import numpy as np
+from PIL import Image, ImageOps
+from tqdm import tqdm
+
+# Lazy import for EMNIST .mat
+try:
+    from scipy.io import loadmat
+except Exception:
+    loadmat = None
+
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pct"}
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def to_grayscale(im: Image.Image) -> Image.Image:
+    if im.mode == "L":
+        return im
+    if im.mode in ("RGB", "RGBA", "LA", "P"):
+        return im.convert("L")
+    return im.convert("L")
+
+def maybe_invert(arr: np.ndarray) -> np.ndarray:
+    """
+    Heuristic: ensure digit strokes are dark on a lighter background.
+    If the image is mostly dark (median < 128), invert.
+    """
+    med = np.median(arr)
+    if med < 128:
+        return 255 - arr
+    return arr
+
+def tight_crop(arr: np.ndarray, thr: int = 250, pad_frac: float = 0.06) -> np.ndarray:
+    """
+    Find non-white bbox (values < thr). Add padding as fraction of max(H,W).
+    If no ink, return original.
+    """
+    h, w = arr.shape
+    mask = arr < thr
+    if not mask.any():
+        return arr
+    ys, xs = np.where(mask)
+    y0, y1 = ys.min(), ys.max()
+    x0, x1 = xs.min(), xs.max()
+    pad = int(round(max(h, w) * pad_frac))
+    y0 = max(0, y0 - pad)
+    y1 = min(h - 1, y1 + pad)
+    x0 = max(0, x0 - pad)
+    x1 = min(w - 1, x1 + pad)
+    return arr[y0:y1+1, x0:x1+1]
+
+def normalize_to_96(im: Image.Image, size: int = 96) -> Image.Image:
+    """
+    Convert to grayscale, make digits dark on white, crop to content, then
+    fit into a square 96×96 white canvas preserving aspect ratio.
+    """
+    im = to_grayscale(im)
+    arr = np.array(im, dtype=np.uint8)
+    arr = maybe_invert(arr)
+    arr = tight_crop(arr, thr=250, pad_frac=0.08)
+
+    # Resize to fit within square while preserving aspect
+    h, w = arr.shape
+    scale = min(size / h, size / w)
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+
+    arr_resized = np.array(Image.fromarray(arr).resize((new_w, new_h), Image.BICUBIC), dtype=np.uint8)
+
+    # Paste centered on white canvas
+    canvas = np.full((size, size), 255, dtype=np.uint8)
+    y0 = (size - new_h) // 2
+    x0 = (size - new_w) // 2
+    canvas[y0:y0+new_h, x0:x0+new_w] = arr_resized
+
+    return Image.fromarray(canvas, mode="L")
+
+# ----------------------------
+# EMNIST (.mat) loaders
+# ----------------------------
+
+def find_emnist_mat_files(root: Path) -> List[Path]:
+    if not root.exists():
+        return []
+    # common EMNIST files like emnist-digits.mat or emnist-digits/… (some distributions unpack differently)
+    mats = []
+    for p in root.rglob("*.mat"):
+        # keep all; we'll try to parse gracefully
+        mats.append(p)
+    return sorted(mats)
+
+def emnist_extract_images_and_labels(mat_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (images[N,28,28], labels[N]) if possible.
+    EMNIST 'dataset' struct often contains 'train' and 'test' with 'images' and 'labels'.
+    Some packs flatten as 28*28 per row, need reshape/transpose/rotate.
+    """
+    if loadmat is None:
+        raise RuntimeError("scipy is required to read EMNIST .mat files (pip install scipy).")
+
+    md = loadmat(str(mat_path))
+    # Find something that looks like images/labels
+    # Common schema: md['dataset'][0,0]['train'][0,0]['images'], labels; same for 'test'
+    def _maybe_get(ds, key):
+        try:
+            return ds[key]
+        except Exception:
+            return None
+
+    images_all = []
+    labels_all = []
+
+    # Try the common nested structure
+    dataset = md.get("dataset", None)
+    if dataset is not None:
+        for split in ("train", "test"):
+            try:
+                node = dataset[0,0][split][0,0]
+                imgs = node["images"]
+                labs = node["labels"].reshape(-1)
+                # imgs shape (N, 784) or (784, N)
+                if imgs.ndim == 2:
+                    if imgs.shape[1] == 784:
+                        imgs = imgs.reshape((-1, 28, 28))
+                    elif imgs.shape[0] == 784:
+                        imgs = imgs.T.reshape((-1, 28, 28))
+                elif imgs.ndim == 3:
+                    # already (N, 28, 28)?
+                    pass
+                else:
+                    continue
+
+                # EMNIST is typically transposed & inverted relative to MNIST
+                # Common fix:
+                # 1) rotate 90° counter-clockwise and flip horizontally OR
+                # 2) transpose then flip
+                # We'll use: imgs = np.rot90(imgs, 1, axes=(1,2)) then flip LR
+                imgs = np.rot90(imgs, k=1, axes=(1,2))
+                imgs = np.fliplr(imgs)
+
+                images_all.append(imgs.astype(np.uint8))
+                labels_all.append(labs.astype(np.int64))
+            except Exception:
+                pass
+
+    # Fallback: try any top-level arrays that look like images/labels
+    if not images_all:
+        for k, v in md.items():
+            if not isinstance(v, np.ndarray):
+                continue
+            # try paired keys like *_images / *_labels
+            if "images" in k and v.ndim >= 2:
+                imgs = v
+                labs = None
+                # try find sibling labels key
+                k2 = k.replace("images", "labels")
+                if k2 in md:
+                    labs = md[k2].reshape(-1)
+                if labs is None:
+                    continue
+
+                if imgs.ndim == 2:
+                    if imgs.shape[1] == 784:
+                        imgs = imgs.reshape((-1, 28, 28))
+                    elif imgs.shape[0] == 784:
+                        imgs = imgs.T.reshape((-1, 28, 28))
+                elif imgs.ndim == 3 and imgs.shape[1:] == (28,28):
+                    pass
+                else:
+                    continue
+
+                imgs = np.rot90(imgs, k=1, axes=(1,2))
+                imgs = np.fliplr(imgs)
+
+                images_all.append(imgs.astype(np.uint8))
+                labels_all.append(labs.astype(np.int64))
+
+    if not images_all:
+        raise RuntimeError(f"Could not parse EMNIST .mat structure in {mat_path}")
+
+    images = np.concatenate(images_all, axis=0)
+    labels = np.concatenate(labels_all, axis=0)
+    return images, labels
+
+def is_digit_label(l) -> bool:
+    try:
+        li = int(l)
+        return 0 <= li <= 9
+    except Exception:
+        return False
+
+# ----------------------------
+# NIST SD-19 loaders
+# ----------------------------
+
+def scan_images_with_digit_label(root: Path) -> Iterable[Tuple[Path, int]]:
+    """
+    Walk a directory tree and yield (image_path, digit) whenever a parent
+    directory name is a single digit '0'..'9'.
+    Works for both by_class and by_write variants, as long as one path
+    component is exactly '0'..'9'.
+    """
+    if not root.exists():
+        return
+    for p in root.rglob("*"):
+        if p.suffix.lower() in IMG_EXTS and p.is_file():
+            # find digit in its parents
+            d = None
+            for part in p.parts[::-1]:
+                if part.isdigit() and len(part) == 1:
+                    d = int(part)
+                    break
+            if d is not None and 0 <= d <= 9:
+                yield p, d
+
+# ----------------------------
+# Main pipeline
+# ----------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--emnist-root", type=Path, default=Path("datasets/digits/matlab"),
+                    help="Folder containing EMNIST .mat files (any depth).")
+    ap.add_argument("--nist-byclass-root", type=Path, default=Path("datasets/digits/nist_sd19/by_class"))
+    ap.add_argument("--nist-bywrite-root", type=Path, default=Path("datasets/digits/nist_sd19/by_write"))
+    ap.add_argument("--out-root", type=Path, default=Path("datasets/digits96"),
+                    help="Output root for normalized 96x96 PNGs.")
+    ap.add_argument("--manifest", type=Path, default=Path("datasets/digits96/digits96_manifest.jsonl"))
+    ap.add_argument("--max-per-digit", type=int, default=0,
+                    help="Optional cap per digit per source (0 = no cap).")
+    ap.add_argument("--overwrite", action="store_true", help="Recreate files even if they exist.")
+    ap.add_argument("--append", action="store_true",
+                help="Append to an existing manifest (de-dupe by path).")
+    args = ap.parse_args()
+
+    ensure_dir(args.out_root)
+    ensure_dir(args.manifest.parent)
+
+    records = []
+
+    # 1) EMNIST
+    emnist_mats = find_emnist_mat_files(args.emnist_root)
+    if emnist_mats and loadmat is None:
+        print("[warn] EMNIST .mat found but scipy not installed; skipping EMNIST.", file=sys.stderr)
+
+    if emnist_mats and loadmat is not None:
+        cap = {d: 0 for d in range(10)}
+        for matp in emnist_mats:
+            try:
+                imgs, labs = emnist_extract_images_and_labels(matp)
+            except Exception as e:
+                print(f"[warn] skipping {matp}: {e}", file=sys.stderr)
+                continue
+
+            src = f"emnist:{matp.name}"
+            for i in tqdm(range(len(labs)), desc=f"[EMNIST] {matp.name}", unit="img"):
+                lab = int(labs[i])
+                if not is_digit_label(lab):
+                    continue
+                if args.max_per_digit > 0 and cap[lab] >= args.max_per_digit:
+                    continue
+
+                arr = imgs[i]
+                # EMNIST is usually white-on-black → invert to black-on-white handled by normalize
+                im = Image.fromarray(arr, mode="L")
+                out_im = normalize_to_96(im, size=96)
+
+                out_dir = args.out_root / "emnist" / str(lab)
+                ensure_dir(out_dir)
+                fname = f"emnist_{matp.stem}_{lab}_{cap[lab]:06d}.png"
+                out_path = out_dir / fname
+                if args.overwrite or not out_path.exists():
+                    out_im.save(out_path, format="PNG")
+
+                rel = out_path.as_posix()
+                records.append({"path": rel, "digit": lab, "source": "emnist"})
+                cap[lab] += 1
+
+    # 2) NIST SD-19 by_class
+    if args.nist_byclass_root.exists():
+        cap = {d: 0 for d in range(10)}
+        for p, d in tqdm(list(scan_images_with_digit_label(args.nist_byclass_root)),
+                         desc="[NIST by_class]", unit="img"):
+            if args.max_per_digit > 0 and cap[d] >= args.max_per_digit:
+                continue
+            try:
+                im = Image.open(p)
+            except Exception:
+                continue
+            out_im = normalize_to_96(im, size=96)
+            out_dir = args.out_root / "nist_by_class" / str(d)
+            ensure_dir(out_dir)
+            fname = f"nist_byclass_{d}_{cap[d]:06d}.png"
+            out_path = out_dir / fname
+            if args.overwrite or not out_path.exists():
+                out_im.save(out_path, format="PNG")
+            records.append({"path": out_path.as_posix(), "digit": d, "source": "nist_by_class"})
+            cap[d] += 1
+
+    # 3) NIST SD-19 by_write
+    if args.nist_bywrite_root.exists():
+        cap = {d: 0 for d in range(10)}
+        for p, d in tqdm(list(scan_images_with_digit_label(args.nist_bywrite_root)),
+                         desc="[NIST by_write]", unit="img"):
+            if args.max_per_digit > 0 and cap[d] >= args.max_per_digit:
+                continue
+            try:
+                im = Image.open(p)
+            except Exception:
+                continue
+            out_im = normalize_to_96(im, size=96)
+            out_dir = args.out_root / "nist_by_write" / str(d)
+            ensure_dir(out_dir)
+            fname = f"nist_bywrite_{d}_{cap[d]:06d}.png"
+            out_path = out_dir / fname
+            if args.overwrite or not out_path.exists():
+                out_im.save(out_path, format="PNG")
+            records.append({"path": out_path.as_posix(), "digit": d, "source": "nist_by_write"})
+            cap[d] += 1
+
+    # Write manifest
+    # De-dup and (optionally) append to existing manifest
+    existing = {}
+    if args.append and args.manifest.exists():
+        with args.manifest.open("r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = json.loads(ln)
+                    p = obj.get("path", "")
+                    if p:
+                        existing[p] = obj
+                except Exception:
+                    pass
+
+    # merge new records
+    for r in records:
+        existing[r["path"]] = r
+
+    # write back
+    ensure_dir(args.manifest.parent)
+    mode = "w"  # we always rewrite fully to keep it clean
+    with args.manifest.open(mode, encoding="utf-8") as f:
+        for r in existing.values():
+            f.write(json.dumps(r) + "\n")
+
+    print(f"[done] wrote {len(existing)} total records to {args.manifest}")
