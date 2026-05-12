@@ -2,8 +2,6 @@ package com.contextionary.sudoku.logic
 
 import android.os.SystemClock
 import android.util.Log
-import com.contextionary.sudoku.conductor.SudoToolJsonSchema
-import com.contextionary.sudoku.telemetry.ConversationTelemetry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -14,28 +12,69 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
+import com.contextionary.sudoku.telemetry.ConversationTelemetry
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.delay
+import java.io.IOException
+
+import com.contextionary.sudoku.conductor.policy.IntentEnvelopeV1
 
 /**
- * Real LLM client using OpenAI's chat completions endpoint.
+ * Phase 4 — Option A (Universe A -> Universe B):
+ * - Telemetry-silent: NO ConversationTelemetry emissions here.
+ * - ID-silent: does NOT generate authoritative chain IDs (modelCallId/toolplanId/policyReqSeq/turnId/etc).
+ * - Pure network adapter + parsing:
+ *   build payload -> call model -> parse -> return results only.
  *
- * GRID MODE:
- * - Uses Structured Outputs (json_schema strict) to force a tool plan every time.
- * - Parses tool_calls only (no free-form assistant_message).
- * - If parsing fails or tool_calls missing, falls back to a mission-aligned repair plan.
- *
- * FREE-TALK MODE:
- * - Kept as-is (uses regular text response).
+ * NOTE: We keep ModelCallTelemetryCtx because call sites pass it around.
+ * RealSudokuLLMClient only uses it to emit MODEL_PAYLOAD_OUT/IN when provided.
  */
+data class ModelCallTelemetryCtx(
+    val modelCallId: String? = null,
+    val turnId: Long? = null,
+    val turnSeq: Int? = null,
+    val tickId: Int? = null,
+    val policyReqSeq: Long? = null,
+    val toolplanId: String? = null,
+    val correlationId: String? = null,
+    val mode: String = "GRID",
+    val stateHeaderSha12: String? = null,
+
+    // Phase 8 — reply payload audit context
+    val demandCategory: String? = null,
+    val rolloutMode: String? = null
+)
+
+private data class HttpAttemptResult(
+    val ok: Boolean,
+    val code: Int,
+    val body: String,
+    val retryAfterMs: Long? = null
+)
+
 class RealSudokuLLMClient(
     private val apiKey: String,
     private val model: String
 ) : SudokuLLMClient {
 
-    private val httpClient = OkHttpClient()
+    // Network policy:
+    // - Fail fast on timeouts (avoid blocking a turn for ~30s)
+    // - Retry only when it makes sense (429, some 5xx), with backoff + jitter
+    // - Keep timeouts bounded so UI remains responsive
+    private val httpClient = OkHttpClient.Builder()
+        .callTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .build()
+
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
 
     // -------------------------------------------------------------------------
-    // Step 2 — Expert invariants + glossary + grounding contract (pinned).
+    // Expert contract block (kept as-is — this is "real job": prompt shaping)
     // -------------------------------------------------------------------------
 
     private val SUDOKU_EXPERT_BLOCK = """
@@ -109,7 +148,6 @@ If you emit apply_user_edit_rc/apply_user_edit in a response:
    - Otherwise speak conditionally (“This should remove that contradiction; next we’ll re-check the grid state.”)
 3) Provide ONE next step in the same response (ask_confirm_cell_rc OR recommend_validate OR recommend_retake).
 
-
 F) Corrections & edits (MANDATORY TOOL EMISSION)
 - If you need the user to verify a specific cell: use ask_confirm_cell_rc(row, col, prompt).
 
@@ -127,33 +165,10 @@ F) Corrections & edits (MANDATORY TOOL EMISSION)
 - Never claim you changed a digit unless you also emitted apply_user_edit_rc (or apply_user_edit legacy) in the same response.
 
 G) CORRECTION / NEXT-CHECK POLICY (STRICT PRIORITY + 4 CASES)
-
 Allowed sets for proposing a next check (HARD):
 1) mismatch_indices_vs_deduced (HIGHEST priority; if non-empty)
 2) unresolved_indices (ONLY when solvability == "none")
 You MUST NOT propose next-check cells from low_confidence_indices or auto_changed_indices.
-
-Case 1 — mismatch_indices_vs_deduced is not empty:
-- Pick ONE cell from mismatch_indices_vs_deduced (one at a time).
-- Explain: printed clues force a different value here.
-- You MAY propose the specific digit ONLY if GRID_CONTEXT provides it.
-- Ask the user to confirm what’s on paper using ask_confirm_cell_rc.
-
-Case 2 — solvability == "none" AND mismatch list is empty:
-- Pick ONE cell from unresolved_indices (one at a time).
-- Justify why you picked it (conflict explanation if available, otherwise uncertainty).
-- Do NOT invent a replacement digit unless GRID_CONTEXT provides a target digit.
-- Ask the user what the correct digit is (or whether it should be blank).
-
-Case 3 — solvability == "unique" AND mismatch list is empty:
-- STOP corrections. Do NOT propose cell checks.
-- Ask if the on-screen grid matches paper exactly (recommend_validate).
-
-Case 4 — solvability == "multiple" AND mismatch list is empty:
-- Do NOT do cell-by-cell loops.
-- Ask if on-screen grid is a 100% match (recommend_validate).
-- If user says YES and it remains multiple -> recommend_retake.
-- If user says NO -> ask for one specific differing cell; apply_user_edit_rc on request.
 
 H) ONE-STEP DISCIPLINE
 - Only propose ONE actionable step per turn.
@@ -163,179 +178,144 @@ H) ONE-STEP DISCIPLINE
 I) Tool usage reminder (GRID MODE)
 - Every response MUST include reply(text="...") with non-empty text.
 - Use ask_confirm_cell_rc for targeted verification.
-- Use recommend_validate for “does it match / are we good to proceed?” (especially Case 3 and Case 4).
+- Use ask_user_to_confirm_validation to ask if the on-screen grid matches the paper.
+- If the user’s response is unclear, use clarify_validation (do NOT repeat ask_user_to_confirm_validation).
+- If the user confirms match while pending:confirm_validate, emit finalize_validation_presentation + start_solving.
 - Use recommend_retake when the state cannot be made solve-ready without a better scan.
 
+PLAYER-LANGUAGE / JARGON RULE (HARD)
+- The app may provide a fact bundle of type GLOSSARY_BUNDLE.
+- You MUST use it to translate internal terms and UI cues into natural Sudoku-player speech.
 
-TECHNICAL JARGON (APP INTERNAL — DO NOT SAY THESE WORDS TO THE USER)
-You will receive GRID_CONTEXT blocks from the app. They contain internal vocabulary.
-You must understand these definitions to interpret the grid correctly, but you must not use these labels in your conversation. Instead, translate to normal Sudoku language (e.g., “given,” “filled-in number,” “pencil marks,” “row 1 column 2,” “there’s a contradiction,” “please confirm this cell,” etc.).
-0) Core objects
-•	cell / square: One position in the 9×9 grid.
-•	digit: A value in a cell. Allowed digits are 1–9.
-•	blank: A cell whose digit is 0 (meaning empty / not filled).
-1) Coordinates & indexing
-•	row / r1..r9: Row number 1 to 9.
-•	col / c1..c9: Column number 1 to 9.
-•	rXcY: Cell coordinate (X,Y in 1..9). Example: r4c7 = row 4, column 7.
-•	index / idx (0..80): Zero-based cell index:
-o	idx = (row-1)*9 + (col-1)
-o	row = idx/9 + 1, col = idx%9 + 1
-2) Digits and blanks
-•	digit: A value 0..9 where:
-o	0 means blank (empty cell)
-o	1..9 are normal Sudoku digits
-When you describe a row/column to the user, use row/col language, not “idx”.
-3) The 3 “heads” from the CellInterpreter (IMPORTANT)
-The vision model predicts three independent outputs (“heads”) per cell:
-A) GIVEN head (printed givens)
-•	Meaning: What digit is printed in the puzzle’s original grid (the puzzle’s immutable starting clues).
-•	In the app: This is part of the puzzle DNA.
-•	In GRID_CONTEXT: appears as TRUTH_LAYER_GIVENS (FACTS / DNA).
-B) SOLUTION head (placed answers)
-•	Meaning: A digit that is an answer placed in the cell (not a tiny pencil mark).
-•	At grid capture: usually a handwritten user answer detected from the scanned source.
-•	After capture: the app may also contain solver-provided placed answers (they are still “placed answers” even if not handwritten).
-•	Important: In the current pipeline, this head is “solution/answer head” — not strictly “handwritten” forever.
-•	In GRID_CONTEXT: appears as TRUTH_LAYER_USER_SOLUTIONS (USER CLAIMS / OPINIONS) when the origin is the user.
-o	Treat it as a claim unless confirmed.
-o	If later the app marks solver origin separately, treat solver-origin placed answers as higher-trust than user-origin answers.
-C) CANDIDATES head (pencil marks)
-•	Meaning: Tiny candidate digits the user penciled in as possibilities, not final answers.
-•	Output form: a candidateMask (bitmask for digits 1..9) derived from sigmoid probabilities with a threshold.
-•	This is a separate head from solutions and givens.
-•	In GRID_CONTEXT: appears under CANDIDATES (USER THOUGHT PROCESS; MAY BE NOISY).
-4) “Truth layers” vs “Current display”
-The app keeps multiple representations:
-•	CURRENT_DISPLAY_DIGITS_0_MEANS_BLANK
-o	What is currently shown on screen in the grid.
-o	This is the authoritative answer to “what do you see in row 1?” because it’s what the user is looking at.
-•	TRUTH_LAYER_GIVENS (FACTS / DNA)
-o	The model’s belief of which digits are printed givens.
-o	Treated as “facts” for reasoning, but the user can override if scan error.
-•	TRUTH_LAYER_USER_SOLUTIONS (USER CLAIMS / OPINIONS)
-o	The model’s belief of which digits are user-placed answers (usually handwritten at capture).
-o	Treat as “user claims”, may be wrong.
-•	CANDIDATES
-o	Candidate marks (pencil marks), noisy and incomplete.
-5) Conflict vs unresolved (do NOT confuse these)
-conflict (conflict_indices)
-A hard Sudoku rule violation in the current display:
-•	The same non-zero digit appears twice in a row, column, or 3×3 box.
-•	Conflicts imply the grid is structurally invalid.
-User-facing translation:
-•	Say: “I’m seeing a contradiction: there are two 7s in this row/column/box.”
-unresolved (unresolved_indices)
-An app-specific “needs verification” set used when the app did not reach a clean trustworthy state.
-In the current auto-corrector logic, unresolved typically includes:
-•	cells that are still in conflict, and/or
-•	low-confidence cells that were not changed by auto-correction,
-•	especially when the final grid is not a consistent unique-solution state.
-User-facing translation:
-•	Say: “A few cells look uncertain — can you quickly confirm them?”
-6) Auto-correction & edit provenance
-•	auto_changed_indices
-o	Cells where auto-correction changed the digit (app made a guess).
-o	User-facing translation: “I adjusted a couple of cells as a best guess—let’s verify them.”
-•	manual_corrected_indices / manualEdits
-o	Cells the user explicitly edited/confirmed inside the app.
-o	Treat as higher-trust than auto-changes.
-7) Solver facts from givens only (separate from “current display solvability”)
-•	deduced_solution_count_capped (0/1/2)
-o	0 = no solution from givens only
-o	1 = unique solution from givens only
-o	2 = multiple solutions (2+), capped at 2
-•	deduced_is_unique
-o	True when givens-only solution is unique and a full solution grid is provided.
-•	DEDUCED_UNIQUE_SOLUTION_GRID
-o	Present only when deduced_is_unique = true.
-•	mismatch_indices_vs_deduced / mismatchDetails
-o	Only relevant when givens-only solution is unique.
-o	Marks where user-placed answers conflict with the deduced solution.
-User-facing translation:
-•	“One of the numbers you entered doesn’t match what the printed clues force. Let’s verify that cell.”
-8) Status fields
-•	solvability_of_current_display: unique | multiple | none
-o	Applies to the current display grid.
-•	is_structurally_valid
-o	True if there are no conflicts in current display.
-•	severity: ok | mild | serious
-o	App seriousness score used to guide whether to verify vs retake.
-•	retake_recommendation: none | soft | strong
-o	Internal suggestion about rescanning quality.
-9) Rule: never expose jargon
-In conversation:
-•	Do NOT say: “truth layer”, “DNA”, “idx”, “candidateMask”, “deduced_solution_count_capped”, “structurally valid”, “severity=serious”, etc.
-•	DO say: “printed clues”, “numbers you already filled”, “pencil marks”, “contradiction”, “can you confirm row X column Y”.
-""${'"'}.
+DO NOT say these internal words/phrases as-is:
+- "unresolved", "low confidence", "severity", "conflict scoop", "mismatch scoop", "hiding" (for visible digits)
+
+Preferred phrasing:
+- low confidence -> "the scan isn’t sure"
+- unresolved -> "needs your confirmation / question-mark cell"
+- conflict -> "breaks Sudoku rules right now (duplicate in a row/column/box)"
+- mismatch -> "one of your filled-in answers is wrong (compared to the correct solution implied by the clues)"
+- autoCorrect/changed -> "I made a safe scan correction (cyan outline)"
+
+COORDINATE SPEECH (HARD)
+- Speak as "row X column Y". Use rXcY only if the user asks for coordinates explicitly.
+
+BOX NAMING (HARD)
+- Use: top-left, top-middle, top-right, middle-left, center, middle-right, bottom-left, bottom-middle, bottom-right.
+- Do not say "box 7" unless you also provide the position name and you have defined the numbering rule once.
+
+PHASE RULE:
+                - Use only the 'phase' field to choose your posture:
+                  * CONFIRMING: focus on making on-screen grid match paper/book (resolve conflicts, uncertain cells, answer grid questions).
+                  * SEALING: summarize clean grid + confirm readiness to start solving (ask for the user's go-ahead).
+                  * SOLVING: coach next move using solver/coach evidence; keep the user moving step-by-step.
+
+(unchanged)
 """.trimIndent()
-
-
 
     private fun augmentSystemPrompt(base: String): String {
         val b = base.trim()
 
         val hardOverride = """
-        HARD OVERRIDE (takes precedence over any earlier instructions)
-        
-        
-        0) MANDATORY PENDING RESOLUTION (HARD — NO EXCEPTIONS)
+HARD OVERRIDE (takes precedence over any earlier instructions)
 
-        If STATE_HEADER / pending_ctx indicates ask_cell_value with a specific (row,col),
-        and the user message contains a clear digit (1..9) or clearly says blank/empty:
+0) USER-FIRST PRIORITY LADDER (HARD — NEVER VIOLATE)
+The user is the driver. ALWAYS respond to what the user just said, even if pending exists.
+Pending is context only, never a higher-priority instruction.
 
-        - You MUST emit confirm_cell_value_rc(row,col,digit_or_blank) in this same response.
-        - If the confirmed value differs from CURRENT_DISPLAY at that cell, you MUST ALSO emit apply_user_edit_rc(row,col,digit_or_blank,source=...).
-        - You MUST NOT proceed to the next check (ask_confirm_cell_rc) unless confirm_cell_value_rc has been emitted for the pending cell first.
-        - If the digit is not clear, you MUST emit ask_clarifying_question (do not “guess”).
+If the user asks ANY direct question or requests ANY action (even non-Sudoku, e.g. “what’s the weather in Moscow?”):
+- Answer that FIRST using reply(text=...).
+- You MAY optionally ask “Want to continue the grid check?” as your ONE next step.
 
-        This rule overrides any softer instruction about “only apply edits when explicitly requested” for the pending cell.
-        
-        
-        1) HARD RULE — Reply must verbalize the control tool
+PENDING RESOLUTION (ONLY WHEN THE USER IS CLEARLY ANSWERING IT)
+If pending_ctx indicates ask_cell_value for a specific cell (row/col or idx→row/col),
+you may treat the user’s message as answering the pending question ONLY if:
+- The user does NOT explicitly mention a DIFFERENT row/col, and
+- The user’s intent is clearly “this cell is X/blank”.
 
-        If you emit any of these tools: ask_confirm_cell_rc, confirm_interpretation, ask_clarifying_question, switch_to_tap, recommend_validate, recommend_retake
-        then reply.text MUST include the same next-step question/instruction in natural language.
+When you DO treat it as an answer to the pending cell:
+- emit confirm_cell_value_rc(row,col,digit_or_blank) in this same response.
+- If digit_or_blank differs from CURRENT_DISPLAY at that cell, ALSO emit apply_user_edit_rc(row,col,digit_or_blank,source=...).
+- If the digit is not clear, emit ask_clarifying_question (do not guess).
 
-        reply.text must explicitly include the same row/col for ask_confirm_cell_rc.
+EXPLICIT OVERRIDE OF PENDING (HARD)
+If the user explicitly references a different cell than the pending cell (e.g., user says “r3c8 is 5” while pending is r3c9):
+- Do NOT resolve the pending cell in that turn.
+- Treat the user statement as the new priority:
+  - If it is a clear edit/confirmation for that referenced cell: emit confirm_cell_value_rc and (if mismatch) apply_user_edit_rc for THAT cell.
+  - Otherwise ask one clarifying question about THAT cell.
+- Keep the original pending item pending unless the user explicitly cancels it.
 
-        reply.text must end with that one question/instruction.
+VALIDATION DECISION (LLM-FIRST, HARD)
+If STATE_HEADER indicates pending:confirm_validate, you MUST decide what the user meant.
 
-        2) NEXT-CHECK ALLOWED SETS (STRICT)
-           You may ONLY propose/ask a cell-check from:
-           - mismatch_indices_vs_deduced (highest priority)
-           - unresolved_indices (only when solvability == "none")
-           You MUST NOT drive checks using low_confidence_indices or auto_changed_indices.
+You must choose exactly ONE path:
 
-        3) FOUR-CASE POLICY (STRICT)
-           Case 1 — mismatch_indices_vs_deduced is not empty:
-             - Pick ONE mismatch cell, explain “printed clues force a different number here.”
-             - Ask that cell with ask_confirm_cell_rc.
-             - Only propose a replacement digit if GRID_CONTEXT explicitly provides it.
+Path A — User validated (clear confirmation that grid matches paper):
+- You MUST emit BOTH:
+    - finalize_validation_presentation(reason="validated")
+    - start_solving
+- reply.text MUST:
+    - confirm validation in one sentence
+    - announce SOLVING mode in one sentence (what changes: hints/techniques/next moves)
 
-           Case 2 — solvability == "none" AND mismatch empty:
-             - Pick ONE cell from unresolved_indices.
-             - If it is also a conflict cell, explain using CONFLICTS_DETAILS.
-             - Otherwise say it needs quick verification.
-             - Ask that cell with ask_confirm_cell_rc.
-             - Do NOT invent a replacement digit.
+Path B — User did NOT validate OR meaning is unclear:
+- do NOT emit start_solving
+- If the previous turn already asked for validation (pending:confirm_validate is set):
+    - DO NOT repeat ask_user_to_confirm_validation.
+    - Emit clarify_validation(reason=ASR_GARBLED|MIXED_SIGNAL|OFF_TOPIC|PARTIAL_CONFIRM, style=YES_NO|SPOT_CHECK_3|ASK_WHICH_CELL_MISMATCHES, prompt="...")
+- Else (not yet pending confirm_validate):
+    - Emit ask_user_to_confirm_validation (one clear yes/no question in reply.text).
 
-           Case 3 — solvability == "unique" AND mismatch empty:
-             - STOP all correction/check behavior immediately.
-             - Do NOT ask for unresolved/conflict checks.
-             - Offer the grid “as-is” and ask whether the on-screen grid matches the paper (recommend_validate).
+Never rely on literal words like "yes/no". Use context and meaning.
+If the user’s message contains both affirmation and doubt, treat it as NOT validated and ask a clarifying question.
 
-           Case 4 — solvability == "multiple" AND mismatch empty:
-             - Do NOT run cell-by-cell verification.
-             - Tell the user the grid admits multiple solutions and Sudo can only assist on unique grids.
-             - Ask: “Is the on-screen grid a 100% match with your paper?”
-             - If user says YES and solvability remains multiple -> recommend a retake.
-             - If user says NO -> the user will identify a specific differing cell; apply_user_edit_rc on request.
+TOOLPLAN RATIONALE (INTERNAL META — LOGGING ONLY)
+- Include toolplan_rationale as the FIRST tool call in every response.
+- toolplan_rationale.summary must be <= 600 characters.
+- In summary, briefly mention:
+  (a) key grid facts you used (from GRID_CONTEXT),
+  (b) the rule(s) you followed from this prompt,
+  (c) why you chose the control tool you chose.
+- This is NOT user-facing; keep it concise and factual.
 
-        4) CONFLICT GROUNDING (STRICT)
-           - You may ONLY claim a contradiction if it appears in CONFLICTS_DETAILS.
-           - If CONFLICTS_DETAILS says “(none)”, you MUST NOT claim any contradiction.
-    """.trimIndent()
+1) HARD RULE — Reply must verbalize the control tool
+If you emit any of these tools: ask_confirm_cell_rc, confirm_interpretation, ask_clarifying_question, switch_to_tap, recommend_validate, recommend_retake
+then reply.text MUST include the same next-step question/instruction in natural language.
+reply.text must explicitly include the same row/col for ask_confirm_cell_rc.
+reply.text must end with that one question/instruction.
+
+2) NEXT-CHECK ALLOWED SETS (STRICT)
+You may ONLY propose/ask a cell-check from:
+- mismatch_indices_vs_deduced (highest priority)
+- unresolved_indices (only when solvability == "none")
+You MUST NOT drive checks using low_confidence_indices or auto_changed_indices.
+
+3) FOUR-CASE POLICY (STRICT)
+(unchanged)
+
+4) CONFLICT GROUNDING (STRICT)
+- You may ONLY claim a contradiction if it appears in CONFLICTS_DETAILS.
+- If CONFLICTS_DETAILS says “(none)”, you MUST NOT claim any contradiction.
+""".trimIndent()
+
+        val solvingRules = """
+SOLVING MODE (STRICT) — applies when stateHeader contains phase=SOLVING or grid_phase=SOLVING
+
+1) SOLVING mission
+- You are now a Sudoku coach: give the next best action / technique based on the solver engine step(s).
+
+2) Truth contract (HARD)
+- The engine-provided step is authoritative.
+- Do NOT invent a technique/pattern not supported by the engine output.
+- If the engine output is missing/empty, ask for refresh_solve_step (do not guess).
+
+3) Tools preference in SOLVING (when available)
+- show_solve_overlay(style="full") when user asks: “show me / draw it / make it visual”
+- show_solve_overlay(style="mini") when user asks: “quick hint”
+- refresh_solve_step when user asks: “another technique / different approach / next step”
+- recommend_validate is FORBIDDEN in SOLVING (never propose validate talk again)
+""".trimIndent()
 
         return buildString {
             appendLine(b)
@@ -345,379 +325,444 @@ In conversation:
             appendLine()
             appendLine("-----")
             appendLine(hardOverride)
-        }.trim()
-    }
-
-    // -------------------------------------------------------------------------
-    // Step 1 — GridContext pinning helpers
-    // -------------------------------------------------------------------------
-
-    private fun extractBlockOrNull(
-        text: String,
-        begin: String,
-        end: String
-    ): String? {
-        val bi = text.indexOf(begin)
-        val ei = text.indexOf(end)
-        if (bi < 0 || ei < 0 || ei <= bi) return null
-        return text.substring(bi + begin.length, ei).trim()
-    }
-
-    private fun buildPinnedGridContextSystemMessage(developerPrompt: String): String {
-        val devTrim = developerPrompt.trim()
-        val marked = extractBlockOrNull(devTrim, "BEGIN_GRID_CONTEXT", "END_GRID_CONTEXT")
-        val payload = (marked ?: devTrim).trim()
-        val capped = capChars(payload, 8000)
-
-        return buildString {
-            appendLine("GRID CONTEXT (AUTHORITATIVE):")
-            appendLine("- The following block describes the CURRENT captured grid from the user's scan.")
-            appendLine("- Treat it as ground truth and do not contradict it.")
-            appendLine("- If you need a detail not present here, ask the user to confirm a specific cell.")
             appendLine()
-            appendLine(capped)
+            appendLine(solvingRules)
         }.trim()
     }
 
-    private fun buildPinnedCaptureOriginSystemMessage(developerPrompt: String): String {
-        val devTrim = developerPrompt.trim()
-        val origin = extractBlockOrNull(devTrim, "BEGIN_CAPTURE_ORIGIN", "END_CAPTURE_ORIGIN")
-        val payload = (origin ?: "User scanned a real Sudoku grid using the phone camera.").trim()
-        return buildString {
-            appendLine("CAPTURE ORIGIN (CONTEXT):")
-            appendLine(payload)
-        }.trim()
+    // -------------------------------------------------------------------------
+    // Helpers (pure parsing / shaping, no telemetry)
+    // -------------------------------------------------------------------------
+
+    private fun parseRetryAfterMs(h: String?): Long? {
+        val s = h?.trim().orEmpty()
+        if (s.isEmpty()) return null
+        val seconds = s.toLongOrNull() ?: return null
+        return (seconds * 1000L).coerceAtMost(15_000L)
     }
 
-    private fun capChars(s: String, maxChars: Int): String {
-        val normalized = s.replace("\r\n", "\n").trimEnd()
+    /**
+     * Executes request with:
+     * - FAIL FAST on SocketTimeoutException (NO retries)
+     * - Retry with exponential backoff on 429 (honor Retry-After if present)
+     * - Optional short retry on 5xx
+     */
+    private suspend fun executeWithRetryPolicy(
+        request: Request,
+        reqId: String,
+        tag: String,
+        payloadSha12: String,
+        maxRetries429: Int = 2,
+        maxRetries5xx: Int = 1
+    ): HttpAttemptResult {
+
+        var attempt429 = 0
+        var attempt5xx = 0
+        var attemptIo = 0
+
+        while (true) {
+            var call: okhttp3.Call? = null
+            val ctx = currentCoroutineContext()
+            val ctxActiveAtAttemptStart = ctx.isActive
+
+            try {
+                if (!ctxActiveAtAttemptStart) {
+                    Log.w("SudokuLLM", "$tag coroutine NOT active before call start req_id=$reqId payload_sha12=$payloadSha12")
+                    return HttpAttemptResult(ok = false, code = -3, body = "cancelled")
+                }
+
+                call = httpClient.newCall(request)
+
+                Log.i("SudokuLLM", "$tag call_start req_id=$reqId payload_sha12=$payloadSha12 ctxActive=$ctxActiveAtAttemptStart")
+
+                call.execute().use { resp ->
+                    val code = resp.code
+                    val body = resp.body?.string().orEmpty()
+
+                    if (resp.isSuccessful) {
+                        return HttpAttemptResult(ok = true, code = code, body = body)
+                    }
+
+                    if (code == 429 && attempt429 < maxRetries429) {
+                        attempt429++
+                        val retryAfterMs = parseRetryAfterMs(resp.header("Retry-After"))
+                        val base = retryAfterMs ?: (400L shl (attempt429 - 1))
+                        val jitter = kotlin.random.Random.nextLong(0L, 250L)
+                        val delayMs = (base + jitter).coerceAtMost(2500L)
+
+                        Log.w("SudokuLLM", "$tag HTTP 429 retry=$attempt429 req_id=$reqId delayMs=$delayMs payload_sha12=$payloadSha12")
+                        delay(delayMs)
+                        return@use
+                    }
+
+                    if (code in 500..599 && attempt5xx < maxRetries5xx) {
+                        attempt5xx++
+                        val base = 250L shl (attempt5xx - 1)
+                        val jitter = kotlin.random.Random.nextLong(0L, 200L)
+                        val delayMs = (base + jitter).coerceAtMost(1200L)
+
+                        Log.w("SudokuLLM", "$tag HTTP $code retry=$attempt5xx req_id=$reqId delayMs=$delayMs payload_sha12=$payloadSha12")
+                        delay(delayMs)
+                        return@use
+                    }
+
+                    return HttpAttemptResult(ok = false, code = code, body = body)
+                }
+
+                continue
+
+            } catch (e: CancellationException) {
+                val canceledFlag = (call?.isCanceled() == true)
+                Log.w(
+                    "SudokuLLM",
+                    "$tag coroutine CancellationException req_id=$reqId ctxActive=${currentCoroutineContext().isActive} " +
+                            "callExists=${call != null} callCanceledFlag=$canceledFlag payload_sha12=$payloadSha12",
+                    e
+                )
+                try { call?.cancel() } catch (_: Exception) {}
+                return HttpAttemptResult(ok = false, code = -3, body = "cancelled")
+
+            } catch (e: java.net.SocketTimeoutException) {
+                Log.e("SudokuLLM", "$tag timeout FAIL-FAST req_id=$reqId payload_sha12=$payloadSha12", e)
+                return HttpAttemptResult(ok = false, code = -1, body = "timeout")
+
+            } catch (e: java.io.InterruptedIOException) {
+                val canceledFlag = (call?.isCanceled() == true)
+                val ctxActiveNow = currentCoroutineContext().isActive
+
+                Log.w(
+                    "SudokuLLM",
+                    "$tag InterruptedIOException req_id=$reqId ctxActive=$ctxActiveNow canceledFlag=$canceledFlag " +
+                            "msg='${e.message}' cause='${e.cause?.message}' payload_sha12=$payloadSha12",
+                    e
+                )
+
+                if (canceledFlag || !ctxActiveNow) {
+                    Log.w("SudokuLLM", "$tag cancelled (InterruptedIOException) req_id=$reqId payload_sha12=$payloadSha12")
+                    return HttpAttemptResult(ok = false, code = -3, body = "cancelled")
+                }
+
+                Log.w("SudokuLLM", "$tag interrupted IO (treat as timeout) req_id=$reqId payload_sha12=$payloadSha12", e)
+                return HttpAttemptResult(ok = false, code = -1, body = "timeout")
+
+            } catch (e: IOException) {
+                val canceledFlag = (call?.isCanceled() == true)
+                val ctxActiveNow = currentCoroutineContext().isActive
+
+                Log.w(
+                    "SudokuLLM",
+                    "$tag IOException req_id=$reqId ctxActive=$ctxActiveNow canceledFlag=$canceledFlag " +
+                            "msg='${e.message}' cause='${e.cause?.message}' payload_sha12=$payloadSha12",
+                    e
+                )
+
+                if (canceledFlag || !ctxActiveNow) {
+                    Log.w("SudokuLLM", "$tag cancelled (IOException) req_id=$reqId payload_sha12=$payloadSha12")
+                    return HttpAttemptResult(ok = false, code = -3, body = "cancelled")
+                }
+
+                if (attemptIo < 1) {
+                    attemptIo++
+                    val delayMs = 250L + kotlin.random.Random.nextLong(0L, 200L)
+                    Log.w("SudokuLLM", "$tag IO exception retry=$attemptIo req_id=$reqId delayMs=$delayMs payload_sha12=$payloadSha12", e)
+                    delay(delayMs)
+                    continue
+                }
+
+                Log.e("SudokuLLM", "$tag IO exception giving up req_id=$reqId payload_sha12=$payloadSha12", e)
+                return HttpAttemptResult(ok = false, code = -2, body = "io_error:${e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun capPreview(text: String, maxChars: Int): String {
+        val normalized = text
+            .replace('\n', ' ')
+            .replace('\r', ' ')
+            .replace(Regex("\\s+"), " ")
+            .trim()
         if (normalized.length <= maxChars) return normalized
         return normalized.substring(0, maxChars).trimEnd() + "…"
     }
 
-    // -------------------------------------------------------------------------
-    // JSON helpers
-    // -------------------------------------------------------------------------
-
-    private fun org.json.JSONObject.toKotlinMap(): Map<String, Any?> {
-        val out = linkedMapOf<String, Any?>()
-        val it = keys()
-        while (it.hasNext()) {
-            val k = it.next()
-            val v = opt(k)
-            out[k] = when (v) {
-                is org.json.JSONObject -> v.toKotlinMap()
-                is org.json.JSONArray -> v.toKotlinList()
-                org.json.JSONObject.NULL -> null
-                else -> v
-            }
-        }
-        return out
+    private fun sha256HexUtf8(s: String): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(s.toByteArray(Charsets.UTF_8))
+        val hex = StringBuilder(digest.size * 2)
+        for (b in digest) hex.append(String.format("%02x", b))
+        return hex.toString()
     }
 
-    private fun org.json.JSONArray.toKotlinList(): List<Any?> {
-        val out = ArrayList<Any?>(length())
-        for (i in 0 until length()) {
-            val v = opt(i)
-            out += when (v) {
-                is org.json.JSONObject -> v.toKotlinMap()
-                is org.json.JSONArray -> v.toKotlinList()
-                org.json.JSONObject.NULL -> null
-                else -> v
-            }
+    // ---- Payload logging gate ----
+    // We now always emit full prompt/response text into telemetry (with a generous clip cap)
+    // so audit tools can reconstruct the exact System / Developer / User prompt surface.
+    private val FULL_TELEMETRY_TEXT_MAX_CHARS: Int = 250_000
+
+    private fun clipForTelemetry(s: String, max: Int = FULL_TELEMETRY_TEXT_MAX_CHARS): String {
+        if (s.length <= max) return s
+        return s.substring(0, max) + "…(truncated)"
+    }
+
+    private fun payloadKindForChannel(channel: String): String =
+        when (channel.uppercase()) {
+            "INTENT" -> "meaning_extract_v1"
+            "REPLY" -> "reply_generate_v1"
+            "FREE_TALK" -> "free_talk_v1"
+            else -> "model_call_v1"
         }
-        return out
+
+    private fun emitModelPayloadOut(
+        ctx: ModelCallTelemetryCtx?,
+        channel: String,                 // "INTENT" | "REPLY" | ...
+        payloadStr: String,
+        reqId: String? = null,
+        payloadSha12: String? = null,
+        systemPrompt: String? = null,
+        developerPrompt: String? = null,
+        userMessage: String? = null
+    ) {
+        if (ctx == null) return
+
+        val sha12 = payloadSha12 ?: runCatching { sha256HexUtf8(payloadStr).take(12) }.getOrNull()
+        val payloadKind = payloadKindForChannel(channel)
+
+        ConversationTelemetry.emit(
+            mapOf(
+                "type" to "MODEL_PAYLOAD_OUT",
+                "channel" to channel,
+                "payload_kind" to payloadKind,
+
+                "turn_id" to ctx.turnId,
+                "tick_id" to ctx.tickId,
+                "policy_req_seq" to ctx.policyReqSeq,
+                "correlation_id" to ctx.correlationId,
+                "model_call_id" to ctx.modelCallId,
+                "toolplan_id" to ctx.toolplanId,
+
+                "req_id" to reqId,
+
+                "payload_len" to payloadStr.length,
+                "payload_sha12" to sha12,
+
+                // Full request body for audit reconstruction
+                "payload_text" to clipForTelemetry(payloadStr),
+                "payload_preview" to capPreview(payloadStr, 900),
+
+                // First-class prompt surface fields for audit readability
+                "system_prompt_text" to systemPrompt?.let { clipForTelemetry(it) },
+                "developer_prompt_text" to developerPrompt?.let { clipForTelemetry(it) },
+                "user_message_text" to userMessage?.let { clipForTelemetry(it) },
+
+                "system_prompt_len" to systemPrompt?.length,
+                "developer_prompt_len" to developerPrompt?.length,
+                "user_message_len" to userMessage?.length,
+
+                "system_prompt_sha12" to systemPrompt?.let { sha256HexUtf8(it).take(12) },
+                "developer_prompt_sha12" to developerPrompt?.let { sha256HexUtf8(it).take(12) },
+                "user_message_sha12" to userMessage?.let { sha256HexUtf8(it).take(12) }
+            )
+        )
+    }
+
+    private fun emitModelPayloadIn(
+        ctx: ModelCallTelemetryCtx?,
+        channel: String,
+        responseStr: String,
+        reqId: String? = null,
+        httpCode: Int? = null,
+        dtMs: Long? = null,
+        payloadSha12: String? = null,
+        parseOk: Boolean? = null,
+        parseErrors: String? = null
+    ) {
+        if (ctx == null) return
+
+        val respSha12 = runCatching { sha256HexUtf8(responseStr).take(12) }.getOrNull()
+        val payloadKind = payloadKindForChannel(channel)
+
+        ConversationTelemetry.emit(
+            mapOf(
+                "type" to "MODEL_PAYLOAD_IN",
+                "channel" to channel,
+                "payload_kind" to payloadKind,
+
+                "turn_id" to ctx.turnId,
+                "tick_id" to ctx.tickId,
+                "policy_req_seq" to ctx.policyReqSeq,
+                "correlation_id" to ctx.correlationId,
+                "model_call_id" to ctx.modelCallId,
+                "toolplan_id" to ctx.toolplanId,
+
+                "req_id" to reqId,
+                "http_code" to httpCode,
+                "dt_ms" to dtMs,
+                "payload_sha12" to payloadSha12,
+
+                "response_len" to responseStr.length,
+                "response_sha12" to respSha12,
+
+                "response_text" to clipForTelemetry(responseStr),
+                "response_preview" to capPreview(responseStr, 1200),
+
+                "parse_ok" to parseOk,
+                "parse_errors" to parseErrors
+            )
+        )
     }
 
     // -------------------------------------------------------------------------
-    // GRID MODE (tool-calls-only)
+    // Generic helper for minimal JSON calls: IntentEnvelope + ReplyGenerate
     // -------------------------------------------------------------------------
 
-    override suspend fun sendGridUpdate(
+
+    private fun estimateTokensFromChars(chars: Int): Int =
+        if (chars <= 0) 0 else (chars + 3) / 4
+
+    private fun extractDemandCategoryFromDeveloperPrompt(developerPrompt: String): String {
+        val m = Regex("""demand_category\s*=\s*([A-Z_]+)""")
+            .find(developerPrompt)
+        return m?.groupValues?.getOrNull(1) ?: "LEGACY_OR_UNSPECIFIED"
+    }
+
+    private fun buildChatCompletionsPayload(
         systemPrompt: String,
         developerPrompt: String,
         userMessage: String,
-        history: List<Pair<String, String>>
-    ): PolicyRawResponse = withContext(Dispatchers.IO) {
+        temperature: Double,
+        forceJsonObject: Boolean = false
+    ): JSONObject {
+        val messages = JSONArray().apply {
+            put(JSONObject().apply { put("role", "system"); put("content", systemPrompt) })
+            put(JSONObject().apply { put("role", "developer"); put("content", developerPrompt) })
+            put(JSONObject().apply { put("role", "user"); put("content", userMessage) })
+        }
+
+        return JSONObject().apply {
+            put("model", model)
+            if (forceJsonObject) {
+                put("response_format", JSONObject().apply { put("type", "json_object") })
+            }
+            put("messages", messages)
+            put("temperature", temperature)
+        }
+    }
+
+    private fun extractAssistantContentOrEmpty(bodyString: String): String {
+        return try {
+            val root = JSONObject(bodyString)
+            val choices = root.optJSONArray("choices") ?: JSONArray()
+            if (choices.length() == 0) return ""
+            choices
+                .optJSONObject(0)
+                ?.optJSONObject("message")
+                ?.optString("content", "")
+                ?.trim()
+                ?: ""
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    private fun intentEnvelopeFallbackEmpty(rawUserText: String?): IntentEnvelopeV1 {
+        return IntentEnvelopeV1(
+            intents = emptyList(),
+            rawUserText = rawUserText,
+            language = null,
+            asrQuality = null,
+            freeTalkTopic = null,
+            freeTalkConfidence = 0.0
+        )
+    }
+
+    // -------------------------------------------------------------------------
+    // NEW (Frozen v1): Tick 1 Intent Envelope (NLU only) — no meaning_v1
+    // -------------------------------------------------------------------------
+
+    override suspend fun sendIntentEnvelope(
+        systemPrompt: String,
+        developerPrompt: String,
+        userMessage: String,
+        telemetryCtx: ModelCallTelemetryCtx?
+    ): IntentEnvelopeV1 = withContext(Dispatchers.IO) {
 
         val reqId = UUID.randomUUID().toString().substring(0, 8)
         val t0 = SystemClock.elapsedRealtime()
 
-        val enforceToolPlanOk = false
-        val DEBUG_DUMP_LLM_PROMPT = true
-
-        var toolplanFinalized = false
-
-        fun sha256HexUtf8(s: String): String {
-            val md = MessageDigest.getInstance("SHA-256")
-            val digest = md.digest(s.toByteArray(Charsets.UTF_8))
-            val hex = StringBuilder(digest.size * 2)
-            for (b in digest) hex.append(String.format("%02x", b))
-            return hex.toString()
-        }
-
-        fun capPreview(text: String, maxChars: Int): String {
-            val normalized = text
-                .replace('\n', ' ')
-                .replace('\r', ' ')
-                .replace(Regex("\\s+"), " ")
-                .trim()
-            if (normalized.length <= maxChars) return normalized
-            return normalized.substring(0, maxChars).trimEnd() + "…"
-        }
-
-        fun emitLargeText(eventType: String, label: String, text: String, chunkSize: Int = 1800) {
-            val normalized = text.replace("\r\n", "\n")
-            val total = normalized.length
-            val chunks = if (total == 0) 1 else ((total + chunkSize - 1) / chunkSize)
-
-            for (i in 0 until chunks) {
-                val start = i * chunkSize
-                val end = minOf(total, start + chunkSize)
-                val part = if (total == 0) "" else normalized.substring(start, end)
-
-                ConversationTelemetry.emitKv(
-                    eventType,
-                    "req_id" to reqId,
-                    "mode" to "GRID",
-                    "label" to label,
-                    "chunk_index" to i,
-                    "chunk_count" to chunks,
-                    "text_part" to part
-                )
-            }
-        }
-
-        fun emitPromptDump(
-            sysAfterAugment: String,
-            devTrim: String,
-            usrTrim: String,
-            messagesPretty: String,
-            payloadPretty: String,
-            payloadSha256: String
-        ) {
-            ConversationTelemetry.emitKv(
-                "LLM_PROMPT_DUMP_META",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "model" to model,
-                "sys_len" to sysAfterAugment.length,
-                "dev_len" to devTrim.length,
-                "usr_len" to usrTrim.length,
-                "messages_pretty_len" to messagesPretty.length,
-                "payload_pretty_len" to payloadPretty.length,
-                "payload_sha256" to payloadSha256
-            )
-            emitLargeText("LLM_PROMPT_DUMP", "sys_after_augment", sysAfterAugment)
-            emitLargeText("LLM_PROMPT_DUMP", "devTrim", devTrim)
-            emitLargeText("LLM_PROMPT_DUMP", "usrTrim", usrTrim)
-            emitLargeText("LLM_PROMPT_DUMP", "messages_pretty_json", messagesPretty)
-            emitLargeText("LLM_PROMPT_DUMP", "payload_pretty_json", payloadPretty)
-        }
-
-        fun emitToolPlanOkOnce(source: String, tools: List<ToolCallRaw>) {
-            if (toolplanFinalized) return
-            toolplanFinalized = true
-            val names = tools.map { it.name }.joinToString(",")
-            ConversationTelemetry.emitKv(
-                "LLM_TOOLPLAN_OK",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "source" to source,
-                "tool_count" to tools.size,
-                "tool_names" to names
-            )
-        }
-
-        fun emitToolPlanFallbackOnce(kind: String, extras: Map<String, Any?> = emptyMap()) {
-            if (toolplanFinalized) return
-            toolplanFinalized = true
-            val base = linkedMapOf<String, Any?>(
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "kind" to kind
-            )
-            for ((k, v) in extras) base[k] = v
-            ConversationTelemetry.emitKv(
-                "LLM_TOOLPLAN_FALLBACK",
-                *base.entries.map { it.key to it.value }.toTypedArray()
-            )
-        }
-
-        fun replyOnly(text: String): PolicyRawResponse =
-            PolicyRawResponse(
-                tool_calls = listOf(
-                    ToolCallRaw(name = "reply", args = mapOf("text" to text))
-                )
-            )
-
-        fun fallbackToolsFromUserText(userTextRaw: String): PolicyRawResponse {
-            emitToolPlanFallbackOnce("generic_repair")
-            return replyOnly(
-                "I didn’t catch that clearly. Please tell me ONE cell using: “row 2 column 1 is 5” or “r2 c1 is 5”."
-            )
-        }
-
-        fun parseToolCallsSafe(contentJson: JSONObject?, userText: String): PolicyRawResponse {
-            if (contentJson == null) return fallbackToolsFromUserText(userText)
-
-            val arr = contentJson.optJSONArray("tool_calls") ?: JSONArray()
-            val tools = mutableListOf<ToolCallRaw>()
-
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val name = obj.optString("name", "").trim()
-                if (name.isEmpty()) continue
-                val argsObj = obj.optJSONObject("args") ?: JSONObject()
-                tools += ToolCallRaw(name = name, args = argsObj.toKotlinMap())
-            }
-
-            if (tools.isEmpty()) {
-                emitToolPlanFallbackOnce("empty_tool_calls", mapOf("usr_len" to userText.length))
-                return fallbackToolsFromUserText(userText)
-            }
-
-            val hasReply = tools.any { it.name.trim().equals("reply", ignoreCase = true) }
-            if (!hasReply) {
-                emitToolPlanFallbackOnce(
-                    "missing_reply_tool",
-                    mapOf(
-                        "usr_len" to userText.length,
-                        "tool_names" to tools.joinToString(",") { it.name }
-                    )
-                )
-                return PolicyRawResponse(tool_calls = emptyList())
-            }
-
-            emitToolPlanOkOnce(source = "llm", tools = tools)
-            return PolicyRawResponse(tool_calls = tools)
-        }
-
-        fun classifyToolPlan(content: String): Pair<String, Int> {
-            if (content.isBlank()) return "blank_content" to 0
-            val obj = try { JSONObject(content) } catch (_: Exception) { return "not_json" to 0 }
-            val arr = obj.optJSONArray("tool_calls") ?: return "missing_tool_calls" to 0
-            if (arr.length() == 0) return "empty_tool_calls" to 0
-            return "ok" to arr.length()
-        }
-
-        // History budget (history is now passed explicitly)
-        data class HistMsg(val role: String, val content: String)
-
-        fun budgetHistory(
-            msgs: List<HistMsg>,
-            maxMessages: Int = 16,
-            maxCharsTotal: Int = 9000,
-            maxCharsPerMsg: Int = 1400
-        ): List<HistMsg> {
-            if (msgs.isEmpty()) return emptyList()
-            val tail = if (msgs.size > maxMessages) msgs.takeLast(maxMessages) else msgs
-            val clipped = tail.map { m ->
-                val c = m.content
-                    .replace("\r\n", "\n")
-                    .trim()
-                    .let { if (it.length <= maxCharsPerMsg) it else it.substring(0, maxCharsPerMsg).trimEnd() + "…" }
-                HistMsg(m.role, c)
-            }
-            val out = mutableListOf<HistMsg>()
-            var used = 0
-            for (m in clipped) {
-                val add = m.content.length
-                if (used + add > maxCharsTotal) break
-                used += add
-                out += m
-            }
-            return out
-        }
+        var payloadSha12: String? = null
+        var httpCode: Int? = null
+        var responseBodyForTelemetry: String = ""
 
         try {
-            val sys = augmentSystemPrompt(systemPrompt)
-            val devTrim = developerPrompt.trim()
-            val usrTrim = userMessage.trim()
-
-            // Defensive normalize + drop trailing dup of current user (if any)
-            fun norm(s: String) = s.trim().replace(Regex("\\s+"), " ")
-
-            val historyPairs = history
-                .mapNotNull { (role, content) ->
-                    val r = role.lowercase().trim()
-                    if (r != "user" && r != "assistant") null
-                    else {
-                        val c = content.replace("\r\n", "\n").trimEnd()
-                        if (c.isBlank()) null else (r to c)
-                    }
-                }
-                .let { h ->
-                    val last = h.lastOrNull()
-                    if (last != null && last.first == "user" && norm(last.second) == norm(usrTrim)) h.dropLast(1) else h
-                }
-
-            val histBudgeted = budgetHistory(historyPairs.map { (r, c) -> HistMsg(r, c) })
-
-            ConversationTelemetry.emitKv(
-                "SEND_GRID_UPDATE_CALLED",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "user_text" to capPreview(usrTrim, 220),
-                "history_msgs_in" to historyPairs.size,
-                "history_msgs_used" to histBudgeted.size
+            val payload = buildChatCompletionsPayload(
+                systemPrompt = systemPrompt,
+                developerPrompt = developerPrompt,
+                userMessage = userMessage,
+                temperature = 0.0,
+                forceJsonObject = true
             )
 
-            val messages = JSONArray().apply {
-                put(JSONObject().apply { put("role", "system"); put("content", sys) })
-                put(JSONObject().apply { put("role", "system"); put("content", devTrim) })
-
-                for (m in histBudgeted) {
-                    put(JSONObject().apply {
-                        put("role", m.role) // "user" or "assistant"
-                        put("content", m.content)
-                    })
-                }
-
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", if (usrTrim.isBlank()) "Continue." else usrTrim)
-                })
-            }
-
-            val payload = JSONObject().apply {
-                put("model", model)
-                put("response_format", SudoToolJsonSchema.responseFormat())
-                put("messages", messages)
-                put("temperature", 0.4)
-            }
-
             val payloadStr = payload.toString()
-            val payloadSha = sha256HexUtf8(payloadStr)
+            payloadSha12 = runCatching { sha256HexUtf8(payloadStr).take(12) }.getOrNull()
 
-            if (DEBUG_DUMP_LLM_PROMPT) {
-                val messagesPretty = try { messages.toString(2) } catch (_: Exception) { messages.toString() }
-                val payloadPretty = try { payload.toString(2) } catch (_: Exception) { payload.toString() }
-                emitPromptDump(
-                    sysAfterAugment = sys,
-                    devTrim = devTrim,
-                    usrTrim = usrTrim,
-                    messagesPretty = messagesPretty,
-                    payloadPretty = payloadPretty,
-                    payloadSha256 = payloadSha
+            emitModelPayloadOut(
+                ctx = telemetryCtx,
+                channel = "INTENT",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                payloadStr = payloadStr,
+                systemPrompt = systemPrompt,
+                developerPrompt = developerPrompt,
+                userMessage = userMessage
+            )
+
+            val demandCategory =
+                telemetryCtx?.demandCategory ?: extractDemandCategoryFromDeveloperPrompt(developerPrompt)
+
+            val systemChars = systemPrompt.length
+            val developerChars = developerPrompt.length
+            val userChars = userMessage.length
+            val staticChars = systemChars + developerChars
+            val dynamicChars = userChars
+            val outerChars = payloadStr.length
+
+            val systemTokens = estimateTokensFromChars(systemChars)
+            val developerTokens = estimateTokensFromChars(developerChars)
+            val userTokens = estimateTokensFromChars(userChars)
+            val staticTokens = estimateTokensFromChars(staticChars)
+            val dynamicTokens = estimateTokensFromChars(dynamicChars)
+            val outerTokens = estimateTokensFromChars(outerChars)
+
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "REPLY_PAYLOAD_METRICS",
+                    "turn_id" to telemetryCtx?.turnId,
+                    "tick_id" to telemetryCtx?.tickId,
+                    "policy_req_seq" to telemetryCtx?.policyReqSeq,
+                    "correlation_id" to telemetryCtx?.correlationId,
+                    "model_call_id" to telemetryCtx?.modelCallId,
+                    "toolplan_id" to telemetryCtx?.toolplanId,
+                    "req_id" to reqId,
+                    "demand_category" to demandCategory,
+                    "rollout_mode" to telemetryCtx?.rolloutMode,
+                    "system_chars" to systemChars,
+                    "developer_chars" to developerChars,
+                    "user_chars" to userChars,
+                    "static_chars" to staticChars,
+                    "dynamic_chars" to dynamicChars,
+                    "outer_payload_chars" to outerChars,
+                    "system_tokens_est" to systemTokens,
+                    "developer_tokens_est" to developerTokens,
+                    "user_tokens_est" to userTokens,
+                    "static_tokens_est" to staticTokens,
+                    "dynamic_tokens_est" to dynamicTokens,
+                    "outer_payload_tokens_est" to outerTokens
                 )
-            }
+            )
 
-            ConversationTelemetry.emitKv(
-                "LLM_HTTP_BEGIN",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "model" to model,
-                "sys_len" to sys.length,
-                "dev_len" to devTrim.length,
-                "usr_len" to usrTrim.length,
-                "payload_bytes" to payloadStr.toByteArray(Charsets.UTF_8).size,
-                "payload_sha256" to payloadSha,
-                "response_format" to "json_schema_strict",
-                "schema_name" to "sudo_policy",
-                "schema_sha256" to SudoToolJsonSchema.schemaSha256(),
-                "messages_count" to messages.length(),
-                "history_msgs_used" to histBudgeted.size
+            Log.i(
+                "SudokuLLM",
+                "REPLY payload_metrics req_id=$reqId demand=$demandCategory rollout=${telemetryCtx?.rolloutMode} " +
+                        "outer_chars=$outerChars outer_tok_est=$outerTokens static_chars=$staticChars dynamic_chars=$dynamicChars"
             )
 
             val request = Request.Builder()
@@ -727,176 +772,273 @@ In conversation:
                 .post(payloadStr.toRequestBody(jsonMediaType))
                 .build()
 
-            val response = httpClient.newCall(request).execute()
-            val bodyString = response.body?.string() ?: ""
+            val httpRes = executeWithRetryPolicy(
+                request = request,
+                reqId = reqId,
+                tag = "INTENT",
+                payloadSha12 = payloadSha12 ?: "sha12_missing"
+            )
+
             val dtMs = SystemClock.elapsedRealtime() - t0
+            httpCode = httpRes.code
+            responseBodyForTelemetry = httpRes.body
 
-            if (!response.isSuccessful) {
-                ConversationTelemetry.emitKv(
-                    "LLM_HTTP_END",
-                    "req_id" to reqId,
-                    "mode" to "GRID",
-                    "model" to model,
-                    "http_code" to response.code,
-                    "ok" to false,
-                    "latency_ms" to dtMs,
-                    "body_len" to bodyString.length,
-                    "body_preview" to capPreview(bodyString, 240)
+            if (!httpRes.ok) {
+                emitModelPayloadIn(
+                    ctx = telemetryCtx,
+                    channel = "INTENT",
+                    reqId = reqId,
+                    payloadSha12 = payloadSha12,
+                    httpCode = httpCode,
+                    dtMs = dtMs,
+                    responseStr = responseBodyForTelemetry,
+                    parseOk = false,
+                    parseErrors = "http_${httpRes.code}"
                 )
-                emitToolPlanFallbackOnce(
-                    "http_error",
-                    mapOf("http_code" to response.code, "body_preview" to capPreview(bodyString, 240))
-                )
-                return@withContext replyOnly(
-                    "I couldn’t get a valid tool plan right now (code ${response.code}). " +
-                            "Tell me ONE cell like “row 1 column 1 is 5”, or tap a cell and say the digit (1–9)."
-                )
+
+                Log.e("SudokuLLM", "INTENT HTTP ${httpRes.code} req_id=$reqId payload_sha12=$payloadSha12 dtMs=$dtMs body=${capPreview(httpRes.body, 260)}")
+                return@withContext intentEnvelopeFallbackEmpty(rawUserText = userMessage)
             }
 
-            val root = JSONObject(bodyString)
-            val usedModel = root.optString("model", "<missing>")
-            Log.i("SudokuLLM", "OpenAI GRID response model = $usedModel (requested=$model, req_id=$reqId)")
+            val content = extractAssistantContentOrEmpty(httpRes.body)
+            if (content.isBlank()) {
+                emitModelPayloadIn(
+                    ctx = telemetryCtx,
+                    channel = "INTENT",
+                    reqId = reqId,
+                    payloadSha12 = payloadSha12,
+                    httpCode = httpCode,
+                    dtMs = dtMs,
+                    responseStr = responseBodyForTelemetry,
+                    parseOk = false,
+                    parseErrors = "empty_assistant_content"
+                )
 
-            val choices = root.optJSONArray("choices") ?: JSONArray()
-            if (choices.length() == 0) {
-                ConversationTelemetry.emitKv(
-                    "LLM_HTTP_END",
-                    "req_id" to reqId,
-                    "mode" to "GRID",
-                    "model" to model,
-                    "http_code" to response.code,
-                    "ok" to false,
-                    "latency_ms" to dtMs,
-                    "error" to "no_choices"
-                )
-                emitToolPlanFallbackOnce("no_choices")
-                return@withContext replyOnly(
-                    "I didn’t get a valid action back. Tell me ONE cell like “row 1 column 1 is 5”, or tap a cell and say the digit (1–9)."
-                )
+                Log.e("SudokuLLM", "INTENT empty content req_id=$reqId dtMs=$dtMs")
+                return@withContext intentEnvelopeFallbackEmpty(rawUserText = userMessage)
             }
 
-            val content = choices
-                .optJSONObject(0)
-                ?.optJSONObject("message")
-                ?.optString("content", "")
-                ?.trim()
-                ?: ""
+            val parsed = IntentEnvelopeV1.parseJson(content)
 
-            val (verdict, toolCount) = classifyToolPlan(content)
-            ConversationTelemetry.emitKv(
-                "LLM_TOOLPLAN_VERDICT",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "verdict" to verdict,
-                "tool_count" to toolCount,
-                "content_len" to content.length,
-                "content_sha256" to sha256HexUtf8(content),
-                "content_preview" to capPreview(content, 220)
+            emitModelPayloadIn(
+                ctx = telemetryCtx,
+                channel = "INTENT",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                httpCode = httpCode,
+                dtMs = dtMs,
+                responseStr = responseBodyForTelemetry,
+                parseOk = parsed.errors.isEmpty(),
+                parseErrors = if (parsed.errors.isEmpty()) null else parsed.errors.joinToString("; ")
             )
 
-            if (enforceToolPlanOk && verdict != "ok") {
-                throw IllegalStateException("LLM tool plan invalid: $verdict :: ${capPreview(content, 260)}")
+            if (parsed.errors.isNotEmpty()) {
+                Log.w(
+                    "SudokuLLM",
+                    "INTENT parsed with errors req_id=$reqId dtMs=$dtMs errors=${parsed.errors.joinToString("; ")} preview=${capPreview(content, 240)}"
+                )
+            } else {
+                Log.i(
+                    "SudokuLLM",
+                    "INTENT ok req_id=$reqId dtMs=$dtMs intents=${parsed.value.intents.size} freeTalk=${parsed.value.freeTalkTopic ?: "none"}"
+                )
             }
 
-            val contentJson = try {
-                JSONObject(content)
-            } catch (_: Exception) {
-                ConversationTelemetry.emitKv(
-                    "LLM_HTTP_END",
-                    "req_id" to reqId,
-                    "mode" to "GRID",
-                    "model" to model,
-                    "http_code" to response.code,
-                    "ok" to true,
-                    "latency_ms" to dtMs,
-                    "parse_ok" to false,
-                    "content_len" to content.length
-                )
-                emitToolPlanFallbackOnce(
-                    "content_not_json",
-                    mapOf(
-                        "content_len" to content.length,
-                        "content_sha256" to sha256HexUtf8(content),
-                        "content_preview" to capPreview(content, 240)
-                    )
-                )
-                return@withContext fallbackToolsFromUserText(usrTrim)
-            }
-
-            ConversationTelemetry.emitKv(
-                "LLM_HTTP_END",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "model" to model,
-                "http_code" to response.code,
-                "ok" to true,
-                "latency_ms" to dtMs,
-                "parse_ok" to true
-            )
-
-            return@withContext parseToolCallsSafe(contentJson, usrTrim)
+            return@withContext parsed.value
 
         } catch (e: Exception) {
             val dtMs = SystemClock.elapsedRealtime() - t0
-            ConversationTelemetry.emitKv(
-                "LLM_HTTP_END",
-                "req_id" to reqId,
-                "mode" to "GRID",
-                "model" to model,
-                "ok" to false,
-                "latency_ms" to dtMs,
-                "exception" to (e.javaClass.simpleName ?: "Exception"),
-                "message" to (e.message ?: "")
+
+            emitModelPayloadIn(
+                ctx = telemetryCtx,
+                channel = "INTENT",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                httpCode = httpCode,
+                dtMs = dtMs,
+                responseStr = responseBodyForTelemetry,
+                parseOk = false,
+                parseErrors = "exception_${e.javaClass.simpleName ?: "Exception"}"
             )
 
-            emitToolPlanFallbackOnce(
-                "exception",
-                mapOf(
-                    "exception" to (e.javaClass.simpleName ?: "Exception"),
-                    "message" to (e.message ?: "")
-                )
-            )
-
-            return@withContext replyOnly(
-                "Something went wrong while preparing the tool plan. " +
-                        "Tell me ONE cell like “row 1 column 1 is 5”, or tap a cell and say the digit (1–9)."
-            )
+            Log.e("SudokuLLM", "INTENT exception req_id=$reqId dtMs=$dtMs", e)
+            return@withContext intentEnvelopeFallbackEmpty(rawUserText = userMessage)
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Tick 2 Reply Generate — unchanged behavior, strict {"text":"..."}
+    // -------------------------------------------------------------------------
+
+    override suspend fun sendReplyGenerate(
+        systemPrompt: String,
+        developerPrompt: String,
+        userMessage: String,
+        telemetryCtx: ModelCallTelemetryCtx?
+    ): String = withContext(Dispatchers.IO) {
+
+        val reqId = UUID.randomUUID().toString().substring(0, 8)
+        val t0 = SystemClock.elapsedRealtime()
+
+        var payloadSha12: String? = null
+        var httpCode: Int? = null
+        var responseBodyForTelemetry: String = ""
+
+        try {
+            val payload = buildChatCompletionsPayload(
+                systemPrompt = systemPrompt,
+                developerPrompt = developerPrompt,
+                userMessage = userMessage,
+                temperature = 0.2,
+                forceJsonObject = true
+            )
+
+            val payloadStr = payload.toString()
+            payloadSha12 = runCatching { sha256HexUtf8(payloadStr).take(12) }.getOrNull()
+
+            emitModelPayloadOut(
+                ctx = telemetryCtx,
+                channel = "REPLY",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                payloadStr = payloadStr,
+                systemPrompt = systemPrompt,
+                developerPrompt = developerPrompt,
+                userMessage = userMessage
+            )
+
+            val request = Request.Builder()
+                .url("https://api.openai.com/v1/chat/completions")
+                .addHeader("Authorization", "Bearer $apiKey")
+                .addHeader("Content-Type", "application/json")
+                .post(payloadStr.toRequestBody(jsonMediaType))
+                .build()
+
+            val httpRes = executeWithRetryPolicy(
+                request = request,
+                reqId = reqId,
+                tag = "REPLY",
+                payloadSha12 = payloadSha12 ?: "sha12_missing"
+            )
+
+            val dtMs = SystemClock.elapsedRealtime() - t0
+            httpCode = httpRes.code
+            responseBodyForTelemetry = httpRes.body
+
+            if (!httpRes.ok) {
+                emitModelPayloadIn(
+                    ctx = telemetryCtx,
+                    channel = "REPLY",
+                    reqId = reqId,
+                    payloadSha12 = payloadSha12,
+                    httpCode = httpCode,
+                    dtMs = dtMs,
+                    responseStr = responseBodyForTelemetry,
+                    parseOk = false,
+                    parseErrors = "http_${httpRes.code}"
+                )
+
+                Log.e("SudokuLLM", "REPLY HTTP ${httpRes.code} req_id=$reqId payload_sha12=$payloadSha12 dtMs=$dtMs body=${capPreview(httpRes.body, 260)}")
+                return@withContext "Sorry — I didn’t get that. Could you say it once more?"
+            }
+
+            val content = extractAssistantContentOrEmpty(httpRes.body)
+            if (content.isBlank()) {
+                emitModelPayloadIn(
+                    ctx = telemetryCtx,
+                    channel = "REPLY",
+                    reqId = reqId,
+                    payloadSha12 = payloadSha12,
+                    httpCode = httpCode,
+                    dtMs = dtMs,
+                    responseStr = responseBodyForTelemetry,
+                    parseOk = false,
+                    parseErrors = "empty_assistant_content"
+                )
+
+                Log.e("SudokuLLM", "REPLY empty content req_id=$reqId dtMs=$dtMs")
+                return@withContext "Sorry — I didn’t catch that. Could you repeat?"
+            }
+
+            val textOut = runCatching {
+                val o = JSONObject(content)
+                o.optString("text", "").trim()
+            }.getOrDefault("")
+
+            if (textOut.isBlank()) {
+                emitModelPayloadIn(
+                    ctx = telemetryCtx,
+                    channel = "REPLY",
+                    reqId = reqId,
+                    payloadSha12 = payloadSha12,
+                    httpCode = httpCode,
+                    dtMs = dtMs,
+                    responseStr = responseBodyForTelemetry,
+                    parseOk = false,
+                    parseErrors = "reply_text_blank_or_json_parse_failed"
+                )
+
+                Log.w("SudokuLLM", "REPLY invalid JSON(text) req_id=$reqId dtMs=$dtMs preview=${capPreview(content, 240)}")
+                return@withContext "Sorry — I couldn’t render that safely. Please repeat your last message."
+            }
+
+            emitModelPayloadIn(
+                ctx = telemetryCtx,
+                channel = "REPLY",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                httpCode = httpCode,
+                dtMs = dtMs,
+                responseStr = responseBodyForTelemetry,
+                parseOk = true,
+                parseErrors = null
+            )
+
+            Log.i("SudokuLLM", "REPLY ok req_id=$reqId dtMs=$dtMs len=${textOut.length}")
+            return@withContext textOut
+
+        } catch (e: Exception) {
+            val dtMs = SystemClock.elapsedRealtime() - t0
+
+            emitModelPayloadIn(
+                ctx = telemetryCtx,
+                channel = "REPLY",
+                reqId = reqId,
+                payloadSha12 = payloadSha12,
+                httpCode = httpCode,
+                dtMs = dtMs,
+                responseStr = responseBodyForTelemetry,
+                parseOk = false,
+                parseErrors = "exception_${e.javaClass.simpleName ?: "Exception"}"
+            )
+
+            Log.e("SudokuLLM", "REPLY exception req_id=$reqId dtMs=$dtMs", e)
+            return@withContext "Sorry — could you repeat that?"
+        }
+    }
 
     // -------------------------------------------------------------------------
-    // FREE-TALK MODE — unchanged
+    // FREE-TALK MODE — unchanged (telemetry/ID silent)
     // -------------------------------------------------------------------------
 
     override suspend fun chatFreeTalk(
         systemPrompt: String,
         developerPrompt: String,
         userMessage: String
+    ): FreeTalkRawResponse {
+        return chatFreeTalk(systemPrompt, developerPrompt, userMessage, telemetryCtx = null)
+    }
+
+    suspend fun chatFreeTalk(
+        systemPrompt: String,
+        developerPrompt: String,
+        userMessage: String,
+        telemetryCtx: ModelCallTelemetryCtx?
     ): FreeTalkRawResponse = withContext(Dispatchers.IO) {
-        // (unchanged from your version)
+        val reqId = UUID.randomUUID().toString().substring(0, 8)
+        val t0 = SystemClock.elapsedRealtime()
+
         try {
-            val reqId = UUID.randomUUID().toString().substring(0, 8)
-            val t0 = SystemClock.elapsedRealtime()
-
-            fun sha256HexUtf8(s: String): String {
-                val md = MessageDigest.getInstance("SHA-256")
-                val digest = md.digest(s.toByteArray(Charsets.UTF_8))
-                val hex = StringBuilder(digest.size * 2)
-                for (b in digest) hex.append(String.format("%02x", b))
-                return hex.toString()
-            }
-
-            fun capPreview(text: String, maxChars: Int): String {
-                val normalized = text
-                    .replace('\n', ' ')
-                    .replace('\r', ' ')
-                    .replace(Regex("\\s+"), " ")
-                    .trim()
-                if (normalized.length <= maxChars) return normalized
-                return normalized.substring(0, maxChars).trimEnd() + "…"
-            }
-
             fun capForHistory(role: String, text: String): String {
                 val maxChars = when (role) {
                     "user" -> 900
@@ -917,6 +1059,35 @@ In conversation:
                 val userCount: Int,
                 val assistantCount: Int
             )
+
+            fun extractBlockOrNull(text: String, begin: String, end: String): String? {
+                val bi = text.indexOf(begin)
+                val ei = text.indexOf(end)
+                if (bi < 0 || ei < 0 || ei <= bi) return null
+                return text.substring(bi + begin.length, ei).trim()
+            }
+
+            fun capChars(s: String, maxChars: Int): String {
+                val normalized = s.replace("\r\n", "\n").trimEnd()
+                if (normalized.length <= maxChars) return normalized
+                return normalized.substring(0, maxChars).trimEnd() + "…"
+            }
+
+            fun buildPinnedGridContextSystemMessage(developerPrompt: String): String {
+                val devTrim = developerPrompt.trim()
+                val marked = extractBlockOrNull(devTrim, "BEGIN_GRID_CONTEXT", "END_GRID_CONTEXT")
+                val payload = (marked ?: devTrim).trim()
+                val capped = capChars(payload, 8000)
+
+                return buildString {
+                    appendLine("GRID CONTEXT (AUTHORITATIVE):")
+                    appendLine("- The following block describes the CURRENT captured grid from the user's scan.")
+                    appendLine("- Treat it as ground truth and do not contradict it.")
+                    appendLine("- If you need a detail not present here, ask the user to confirm a specific cell.")
+                    appendLine()
+                    appendLine(capped)
+                }.trim()
+            }
 
             fun parseCanonicalHistory(dev: String): ParsedHistory {
                 val begin = "BEGIN_CANONICAL_HISTORY"
@@ -950,8 +1121,7 @@ In conversation:
 
                 for (raw in lines) {
                     val line = raw.trimEnd()
-                    val m = Regex("^(system|developer|user|assistant)\\s*:\\s?(.*)$", RegexOption.IGNORE_CASE)
-                        .find(line)
+                    val m = Regex("^(system|developer|user|assistant)\\s*:\\s?(.*)$", RegexOption.IGNORE_CASE).find(line)
 
                     if (m != null) {
                         flush()
@@ -971,7 +1141,6 @@ In conversation:
 
                 val u = items.count { it.first == "user" }
                 val a = items.count { it.first == "assistant" }
-
                 return ParsedHistory(true, pre, history, post, items, u, a)
             }
 
@@ -981,36 +1150,21 @@ In conversation:
                 return tail.map { (role, content) -> role to capForHistory(role, content) }
             }
 
-            fun pickSoftRefToken(lastUserText: String): String? {
-                val words = lastUserText
-                    .lowercase()
-                    .replace(Regex("[^a-z0-9\\s]"), " ")
-                    .split(Regex("\\s+"))
-                    .filter { it.length >= 5 }
-                return words.lastOrNull()
-            }
-
             val sysTrim = augmentSystemPrompt(systemPrompt)
             val devTrim = developerPrompt.trim()
             val usrTrim = userMessage.trim()
 
             val parsed = parseCanonicalHistory(devTrim)
             val budgeted = budgetHistory(parsed.items)
-
             val pinnedGrid = buildPinnedGridContextSystemMessage(devTrim)
-            //val pinnedOrigin = buildPinnedCaptureOriginSystemMessage(devTrim)
 
             val contextBlob = buildString {
                 val pre = parsed.pre.trim().takeIf { it.isNotEmpty() }?.let { capChars(it, 5000) }
                 val post = parsed.post.trim().takeIf { it.isNotEmpty() }?.let { capChars(it, 5000) }
 
                 appendLine("BEGIN_CONTEXT")
-                if (pre != null) {
-                    appendLine(pre); appendLine()
-                }
-                if (post != null) {
-                    appendLine(post); appendLine()
-                }
+                if (pre != null) { appendLine(pre); appendLine() }
+                if (post != null) { appendLine(post); appendLine() }
 
                 appendLine("TURN-TAKING / MEMORY CONTRACT (STRICT):")
                 appendLine("- The conversation history is provided as actual user/assistant messages below.")
@@ -1021,7 +1175,6 @@ In conversation:
 
             val messages = JSONArray().apply {
                 put(JSONObject().apply { put("role", "system"); put("content", sysTrim) })
-                //put(JSONObject().apply { put("role", "system"); put("content", pinnedOrigin) })
                 put(JSONObject().apply { put("role", "system"); put("content", pinnedGrid) })
                 if (contextBlob.isNotBlank()) put(JSONObject().apply { put("role", "system"); put("content", contextBlob) })
                 for ((role, content) in budgeted) put(JSONObject().apply { put("role", role); put("content", content) })
@@ -1035,32 +1188,7 @@ In conversation:
             }
 
             val payloadStr = payload.toString()
-            val payloadSha = sha256HexUtf8(payloadStr)
-
-            val lastUserFromHistory = budgeted.lastOrNull { it.first == "user" }?.second ?: ""
-            val softToken = pickSoftRefToken(lastUserFromHistory)
-
-            ConversationTelemetry.emitKv(
-                "LLM_HTTP_BEGIN",
-                "req_id" to reqId,
-                "mode" to "FREE_TALK",
-                "model" to model,
-                "sys_len" to sysTrim.length,
-                "dev_len" to devTrim.length,
-                "usr_len" to usrTrim.length,
-                "dev_has_history_markers" to (devTrim.contains("BEGIN_CANONICAL_HISTORY") && devTrim.contains("END_CANONICAL_HISTORY")),
-                "history_parse_ok" to parsed.ok,
-                "history_items_total" to parsed.items.size,
-                "history_items_budgeted" to budgeted.size,
-                "history_user_ct" to parsed.userCount,
-                "history_asst_ct" to parsed.assistantCount,
-                "payload_bytes" to payloadStr.toByteArray(Charsets.UTF_8).size,
-                "payload_sha256" to payloadSha,
-                "dev_preview" to capPreview(devTrim, 220),
-                "usr_preview" to capPreview(usrTrim, 140),
-                "history_last_user_preview" to capPreview(lastUserFromHistory, 140),
-                "soft_ref_token" to (softToken ?: JSONObject.NULL)
-            )
+            val payloadSha12 = sha256HexUtf8(payloadStr).take(12)
 
             val request = Request.Builder()
                 .url("https://api.openai.com/v1/chat/completions")
@@ -1074,27 +1202,13 @@ In conversation:
             val dtMs = SystemClock.elapsedRealtime() - t0
 
             if (!response.isSuccessful) {
-                Log.e("SudokuLLM", "OpenAI freeTalk error: HTTP ${response.code} - $bodyString")
-                ConversationTelemetry.emitKv(
-                    "LLM_HTTP_END",
-                    "req_id" to reqId,
-                    "mode" to "FREE_TALK",
-                    "model" to model,
-                    "http_code" to response.code,
-                    "ok" to false,
-                    "latency_ms" to dtMs,
-                    "body_len" to bodyString.length,
-                    "body_preview" to capPreview(bodyString, 260)
-                )
+                Log.e("SudokuLLM", "FREE_TALK HTTP ${response.code} req_id=$reqId payload_sha12=$payloadSha12 body=${capPreview(bodyString, 260)}")
                 return@withContext FreeTalkRawResponse("I’m having trouble reaching the server. Want to try again?")
             }
 
             val root = JSONObject(bodyString)
-
-            // ✅ Log the model actually used by the API
             val usedModel = root.optString("model", "<missing>")
-            Log.i("SudokuLLM", "OpenAI FREE_TALK response model = $usedModel (requested=$model, req_id=$reqId)")
-
+            Log.i("SudokuLLM", "OpenAI FREE_TALK response model=$usedModel (requested=$model) req_id=$reqId dtMs=$dtMs")
 
             val content = root.getJSONArray("choices")
                 .getJSONObject(0)
@@ -1102,32 +1216,17 @@ In conversation:
                 .getString("content")
                 .trim()
 
-            val softRefOk = if (!softToken.isNullOrBlank()) content.lowercase().contains(softToken) else JSONObject.NULL
+            return@withContext FreeTalkRawResponse(content)
 
-            ConversationTelemetry.emitKv(
-                "LLM_HTTP_END",
-                "req_id" to reqId,
-                "mode" to "FREE_TALK",
-                "model" to model,
-                "http_code" to response.code,
-                "ok" to true,
-                "latency_ms" to dtMs,
-                "body_len" to bodyString.length,
-                "content_len" to content.length,
-                "content_sha256" to sha256HexUtf8(content),
-                "content_preview" to capPreview(content, 260),
-                "soft_ref_ok" to softRefOk
-            )
-
-            FreeTalkRawResponse(content)
         } catch (e: Exception) {
-            Log.e("SudokuLLM", "Error in freeTalk()", e)
-            FreeTalkRawResponse("Something went wrong on my side. Can you repeat that?")
+            val dtMs = SystemClock.elapsedRealtime() - t0
+            Log.e("SudokuLLM", "FREE_TALK exception req_id=$reqId dtMs=$dtMs", e)
+            return@withContext FreeTalkRawResponse("Something went wrong on my side. Can you repeat that?")
         }
     }
 
     // -------------------------------------------------------------------------
-    // extractClues left as-is
+    // extractClues — unchanged behavior (still telemetry/ID silent)
     // -------------------------------------------------------------------------
 
     override suspend fun extractClues(
@@ -1168,7 +1267,7 @@ In conversation:
             val bodyString = response.body?.string() ?: ""
 
             if (!response.isSuccessful) {
-                Log.e("SudokuLLM", "OpenAI extractClues error: HTTP ${response.code} - $bodyString")
+                Log.e("SudokuLLM", "OpenAI extractClues error: HTTP ${response.code} - ${capPreview(bodyString, 260)}")
                 return@withContext ClueExtractionRawResponse(emptyList())
             }
 
@@ -1193,6 +1292,7 @@ In conversation:
             }.filter { it.key.isNotBlank() && it.value.isNotBlank() }
 
             ClueExtractionRawResponse(clues)
+
         } catch (e: Exception) {
             Log.e("SudokuLLM", "Error in extractClues()", e)
             ClueExtractionRawResponse(emptyList())

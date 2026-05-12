@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -11,20 +12,29 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Log
-import android.widget.Toast
 import androidx.core.content.ContextCompat
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.max
 
 import com.contextionary.sudoku.telemetry.ConversationTelemetry
 
 /**
- * SudoASR — SpeechRecognizer wrapper.
+ * SudoASR — Robust SpeechRecognizer wrapper for conversational apps.
  *
- * Key design (robust on flaky devices):
- * - Every start() creates a fresh SpeechRecognizer + fresh RecognitionListener capturing a serial.
- * - We do NOT block onResults based on "stopRequested" (many devices deliver results after stop()).
- * - Phase 0 invariant: never forward callbacks while suppressed/isSpeaking.
- * - TurnController owns when to call start(); SudoASR does not auto-restart.
+ * Goals:
+ * - Deterministic ownership: the conductor decides when to start/stop/cancel.
+ * - Strong session isolation: late callbacks from old sessions are ignored.
+ * - Main-thread correctness: SpeechRecognizer is created/used/destroyed on main thread.
+ * - Clear semantics: stop() vs cancel() are distinct.
+ * - Defensive OEM behavior handling: empty results, NO_MATCH storms, BUSY, ERROR_CLIENT races.
+ * - Telemetry-first: every ASR "row" begins and ends exactly once.
+ *
+ * Contract:
+ * - Call startListening() only when you truly want to listen (user turn).
+ * - Call cancelListening() for turn transitions (TTS start, camera, recovery).
+ * - Call stopListening() only when you want to request "finalization" (rare; usually the recognizer
+ *   finalizes itself after END).
  */
 class SudoASR(
     private val context: Context,
@@ -32,71 +42,674 @@ class SudoASR(
 ) {
 
     data class Config(
+        // Recognition
         val partialResults: Boolean = true,
-        val maxResults: Int = 1,
-        val completeSilenceMs: Long = 900L,
-        val possiblyCompleteSilenceMs: Long = 700L,
-        val minInputLengthMs: Long = 400L,
-
+        val maxResults: Int = 3,
+        val preferOffline: Boolean = true,
         val preferredLocaleTag: String = "",
-        val restartDelayMs: Long = 300L,
-        val minGapBetweenSessionsMs: Long = 250L
+        val defaultLocaleTag: String = "en-US",
+
+        // Silence tuning (OEM-dependent). We auto-disable after repeated suspicious failures.
+        val useSilenceTuningExtras: Boolean = true,
+        val completeSilenceMs: Long = 6000L,
+        val possiblyCompleteSilenceMs: Long = 3500L,
+        val minInputLengthMs: Long = 1500L,
+
+        // Start throttling & recovery
+        val minGapBetweenStartsMs: Long = 300L,
+        val busyBackoffMs: Long = 450L,
+        val clientErrorBackoffMs: Long = 450L,
+
+        // Empty final handling (some OEMs emit empty onResults)
+        val emptyFinalGraceMs: Long = 250L,
+
+        // Auto-disable silence extras after N consecutive suspicious failures
+        val silenceExtrasDisableThreshold: Int = 2,
+
+        // Audio focus (optional; helps some devices route mic correctly)
+        val requestAudioFocus: Boolean = true
     )
 
     interface Listener {
         fun onReady(localeTag: String) {}
         fun onBegin() {}
         fun onRmsChanged(rmsDb: Float) {}
+
         fun onPartial(text: String) {}
-        fun onHeard(text: String, confidence: Float?) {}
         fun onFinal(rowId: Int, text: String, confidence: Float?, reason: String) {}
+
         fun onEnd() {}
         fun onError(code: Int) {}
+        fun onDebugEvent(type: String, extras: Map<String, Any?> = emptyMap()) {}
     }
 
     var listener: Listener? = null
 
-    // Recognizer + intent rebuilt per start() to avoid stale callbacks breaking sessions.
+    // ---------- Public gates ----------
+    @Volatile private var suppressed: Boolean = false
+    @Volatile private var isSpeaking: Boolean = false
+
+    /**
+     * speaking=true: immediately cancel listening and suppress callbacks.
+     * speaking=false: lift suppression (does NOT auto-start).
+     */
+    fun setSpeaking(speaking: Boolean) {
+        isSpeaking = speaking
+        if (speaking) {
+            suppressed = true
+            cancelListening("tts_speaking")
+            emit("ASR_SUPPRESS_FOR_TTS", mapOf("speaking" to true))
+        } else {
+            suppressed = false
+            emit("ASR_SUPPRESS_LIFTED", mapOf("speaking" to false))
+        }
+    }
+
+    fun setSuppressed(s: Boolean, reason: String) {
+        suppressed = s
+        if (s) cancelListening("suppressed:$reason")
+        emit("ASR_SUPPRESSED_SET", mapOf("suppressed" to s, "reason" to reason))
+    }
+
+    fun setConversationLocaleTag(tag: String?) {
+        conversationLocaleTag = tag?.trim()?.ifEmpty { null }
+        emit("ASR_CONVERSATION_LOCALE_SET", mapOf("tag" to (conversationLocaleTag ?: "")))
+    }
+
+    // ---------- Lifecycle ----------
+    fun prewarm() {
+        // Only validates locale parsing. Does not create the recognizer.
+        val tag = effectiveLocale().toLanguageTag()
+        emit("ASR_PREWARM_OK", mapOf("locale" to tag))
+    }
+
+    fun release() {
+        runOnMain {
+            cancelListening("release")
+            destroyRecognizerLocked("release")
+            state = State.IDLE
+            currentRowId = -1
+            currentSessionToken = 0L
+            currentLocaleTag = ""
+            lastStartAtMs = 0L
+        }
+    }
+
+    // ---------- Control API ----------
+    fun isActive(): Boolean = (state == State.LISTENING || state == State.STARTING)
+
+    /**
+     * Start a listening session.
+     * The "row" is started here and will always be ended exactly once.
+     */
+    fun startListening() {
+        runOnMain {
+            if (!canStartNow()) return@runOnMain
+
+            val now = System.currentTimeMillis()
+            if (now - lastStartAtMs < config.minGapBetweenStartsMs) {
+                emit("ASR_START_SKIPPED", mapOf("reason" to "debounce", "delta_ms" to (now - lastStartAtMs)))
+                return@runOnMain
+            }
+
+            if (!hasMicPermission()) {
+                emit("ASR_START_DENIED", mapOf("reason" to "missing_record_audio_permission"))
+                safeToast("Enable microphone permission to talk to Sudo.")
+                return@runOnMain
+            }
+
+            if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+                emit("ASR_START_DENIED", mapOf("reason" to "recognition_not_available"))
+                safeToast("Speech recognition not available on this device.")
+                return@runOnMain
+            }
+
+            lastStartAtMs = now
+            state = State.STARTING
+
+            // New session token; all callbacks must match this token.
+            currentSessionToken = tokenGen.incrementAndGet()
+
+            // Choose locale and build intent
+            val chosenLocaleTag = chooseLocaleTag()
+            currentLocaleTag = chosenLocaleTag
+
+            // Determine silence extras mode (with auto-disable latch)
+            val silenceExtrasEnabled = config.useSilenceTuningExtras && !silenceExtrasDisabled
+            emit(
+                "ASR_SILENCE_EXTRAS_MODE",
+                mapOf(
+                    "enabled" to silenceExtrasEnabled,
+                    "disabled_latch" to silenceExtrasDisabled,
+                    "disabled_reason" to (silenceExtrasDisabledReason ?: ""),
+                    "complete_ms" to config.completeSilenceMs,
+                    "possibly_ms" to config.possiblyCompleteSilenceMs,
+                    "min_len_ms" to config.minInputLengthMs
+                )
+            )
+
+            // Start telemetry row
+            currentRowId = ConversationTelemetry.asrRowStart(
+                "locale" to chosenLocaleTag,
+                "session_token" to currentSessionToken
+            )
+            emitRow("ASR_ROW_START", mapOf("row_id" to currentRowId, "locale" to chosenLocaleTag))
+
+            // Always recreate recognizer per session (OEM robustness)
+            destroyRecognizerLocked("start_new_session")
+            recognizer = SpeechRecognizer.createSpeechRecognizer(context).also { r ->
+                r.setRecognitionListener(makeListener(currentSessionToken, chosenLocaleTag, silenceExtrasEnabled))
+            }
+            intent = buildIntent(chosenLocaleTag, silenceExtrasEnabled)
+
+            // Optional audio focus
+            acquireAudioFocusIfNeeded("startListening")
+
+            emitRow("ASR_LISTEN_START", mapOf("locale" to chosenLocaleTag, "token" to currentSessionToken))
+            listener?.onDebugEvent("ASR_LISTEN_START", mapOf("locale" to chosenLocaleTag, "token" to currentSessionToken))
+
+            try {
+                recognizer?.startListening(intent)
+                state = State.LISTENING
+            } catch (t: Throwable) {
+                emitRow("ASR_START_THROW", mapOf("message" to (t.message ?: t.toString())))
+                endRowOnceLocked("ASR_ERROR", mapOf("reason" to "start_throw", "message" to (t.message ?: t.toString())))
+                releaseAudioFocusIfNeeded("start_throw")
+                state = State.IDLE
+                destroyRecognizerLocked("start_throw")
+            }
+        }
+    }
+
+    /**
+     * stopListening():
+     * A polite request to end and deliver final results. Use sparingly.
+     * For turn transitions, prefer cancelListening().
+     */
+    fun stopListening(reason: String = "stop") {
+        runOnMain {
+            if (state == State.IDLE) return@runOnMain
+            if (state == State.DESTROYED) return@runOnMain
+
+            emitRow("ASR_STOP_REQUESTED", mapOf("reason" to reason))
+            try { recognizer?.stopListening() } catch (_: Throwable) {}
+
+            // Do NOT end row here. We end on onResults/onError or onTimeoutPath.
+            // But we do move to STOPPING so we don't accept "new starts" accidentally.
+            state = State.STOPPING
+        }
+    }
+
+    /**
+     * cancelListening():
+     * Hard cancel; drops results. Use for TTS start, camera, recovery, etc.
+     * Cancelling ends the row deterministically.
+     */
+    fun cancelListening(reason: String = "cancel") {
+        runOnMain {
+            if (state == State.IDLE) return@runOnMain
+            if (state == State.DESTROYED) return@runOnMain
+
+            emitRow("ASR_CANCEL_REQUESTED", mapOf("reason" to reason))
+            try { recognizer?.cancel() } catch (_: Throwable) {}
+
+            // End row immediately; ignore late callbacks (session token invalidation)
+            endRowOnceLocked("ASR_STOP", mapOf("reason" to "cancel:$reason"))
+            releaseAudioFocusIfNeeded("cancel:$reason")
+
+            // Invalidate token so late callbacks are rejected.
+            currentSessionToken = 0L
+            state = State.IDLE
+            destroyRecognizerLocked("cancel:$reason")
+        }
+    }
+
+    // ---------- Internals ----------
+    private enum class State { IDLE, STARTING, LISTENING, STOPPING, DESTROYED }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val logTag = "SudoASR"
+
     private var recognizer: SpeechRecognizer? = null
     private var intent: Intent? = null
 
-    // External gates/state
-    private var isSpeaking: Boolean = false
-    private var suppressed: Boolean = false
-    private var asrActive: Boolean = false
+    @Volatile private var state: State = State.IDLE
+    @Volatile private var currentSessionToken: Long = 0L
+    @Volatile private var currentLocaleTag: String = ""
+    @Volatile private var currentRowId: Int = -1
 
-    // Telemetry correlation: row_id allocated at startListening()
-    private var activeRowId: Int = -1
-
-    private var lastStartMs: Long = 0L
+    private var lastStartAtMs: Long = 0L
     private var lastPartial: String = ""
-
-    @Volatile private var intentLocaleTag: String = ""
-
-    // Session serial (mainly for logs/telemetry)
-    @Volatile private var startSerial: Int = 0
 
     @Volatile private var conversationLocaleTag: String? = null
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var pendingRestart: Runnable? = null
-
-    // ---- Robust locale fallback state ----
-    @Volatile private var lastLanguageUnavailable: Boolean = false   // code 13
-    @Volatile private var lastLanguageNotSupported: Boolean = false  // code 12
+    // Locale failure latches (reactive)
     @Volatile private var lastFailedLocaleTag: String? = null
+    @Volatile private var lastLanguageNotSupported: Boolean = false // 12
+    @Volatile private var lastLanguageUnavailable: Boolean = false  // 13
 
-    // TurnController should implement this (or you can just emit telemetry and let it decide)
-    var onLocaleFallbackSuggested: ((fallbackLocaleTag: String) -> Unit)? = null
+    // Silence extras auto-disable latch
+    @Volatile private var silenceExtrasDisabled: Boolean = false
+    @Volatile private var silenceExtrasDisabledReason: String? = null
+    private var consecutiveSuspiciousNoHypothesis: Int = 0
 
-    private var langUnavailableRetryArmed = false
+    // Token generator for session isolation
+    private val tokenGen = AtomicLong(1000L)
 
-    private val logTag = "SudoASR"
+    // Audio focus
+    private val audioManager: AudioManager? =
+        context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private var hasAudioFocus: Boolean = false
+
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post { block() }
+    }
+
+    private fun canStartNow(): Boolean {
+        if (suppressed) {
+            emit("ASR_START_BLOCKED", mapOf("reason" to "suppressed"))
+            return false
+        }
+        if (isSpeaking) {
+            emit("ASR_START_BLOCKED", mapOf("reason" to "is_speaking"))
+            return false
+        }
+        if (state == State.LISTENING || state == State.STARTING || state == State.STOPPING) {
+            emit("ASR_START_BLOCKED", mapOf("reason" to "already_active", "state" to state.name))
+            return false
+        }
+        return true
+    }
+
+    private fun hasMicPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun safeToast(msg: String) {
+        // Avoid bringing in Toast here if you prefer pure engine class; keep it silent.
+        // If you want to show toast, wire it from UI layer. We only log/telemetry here.
+        Log.w(logTag, msg)
+    }
+
+    private fun buildIntent(localeTag: String, silenceExtrasEnabled: Boolean): Intent {
+        return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeTag)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, config.partialResults)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, max(1, config.maxResults))
+
+            if (config.preferOffline) {
+                putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            }
+
+            if (silenceExtrasEnabled) {
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    config.completeSilenceMs
+                )
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                    config.possiblyCompleteSilenceMs
+                )
+                putExtra(
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
+                    config.minInputLengthMs
+                )
+            }
+
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+        }
+    }
+
+    private fun effectiveLocale(): Locale {
+        val conv = conversationLocaleTag?.trim().orEmpty()
+        if (conv.isNotEmpty()) {
+            runCatching { Locale.forLanguageTag(conv).takeIf { it.language.isNotBlank() } }
+                .getOrNull()?.let { return it }
+        }
+
+        val cfg = config.preferredLocaleTag.trim()
+        if (cfg.isNotEmpty()) {
+            runCatching { Locale.forLanguageTag(cfg).takeIf { it.language.isNotBlank() } }
+                .getOrNull()?.let { return it }
+        }
+
+        runCatching { Locale.forLanguageTag(config.defaultLocaleTag).takeIf { it.language.isNotBlank() } }
+            .getOrNull()?.let { return it }
+
+        return Locale.getDefault()
+    }
+
+    private fun chooseLocaleTag(): String {
+        val requested = effectiveLocale().toLanguageTag()
+        val deviceDefault = Locale.getDefault().toLanguageTag()
+
+        // Only run fallback ladder if we latched a locale failure last time
+        if (!lastLanguageUnavailable && !lastLanguageNotSupported) return requested
+
+        val candidates = LinkedHashSet<String>()
+        candidates.add(deviceDefault)
+
+        runCatching { Locale.forLanguageTag(deviceDefault).language }
+            .getOrNull()?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+
+        candidates.add("en-US")
+        candidates.add("en-GB")
+
+        runCatching { Locale.forLanguageTag(requested).language }
+            .getOrNull()?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
+
+        candidates.add(requested)
+
+        val chosen = candidates.firstOrNull { it.isNotBlank() && it != lastFailedLocaleTag } ?: requested
+
+        emit(
+            "ASR_LOCALE_CHOSEN",
+            mapOf(
+                "requested" to requested,
+                "chosen" to chosen,
+                "device_default" to deviceDefault,
+                "last_failed" to (lastFailedLocaleTag ?: ""),
+                "prev_lang_unavailable" to lastLanguageUnavailable,
+                "prev_lang_not_supported" to lastLanguageNotSupported
+            )
+        )
+        return chosen
+    }
+
+    private fun destroyRecognizerLocked(reason: String) {
+        try { recognizer?.setRecognitionListener(null) } catch (_: Throwable) {}
+        try { recognizer?.destroy() } catch (_: Throwable) {}
+        recognizer = null
+        intent = null
+        emit("ASR_RECOGNIZER_DESTROYED", mapOf("reason" to reason))
+    }
+
+    private fun callbacksAllowed(token: Long): Boolean {
+        if (suppressed || isSpeaking) return false
+        // Session isolation: reject late callbacks
+        if (token == 0L || token != currentSessionToken) return false
+        return true
+    }
+
+    private fun makeListener(
+        token: Long,
+        localeTag: String,
+        silenceExtrasEnabled: Boolean
+    ): RecognitionListener {
+
+        // row-end idempotency
+        var ended = false
+
+        // hypothesis tracking
+        var sawHypothesis = false
+
+        // empty final grace runnable
+        var pendingEmptyFinalize: Runnable? = null
+
+        fun cancelEmptyFinalize(reason: String) {
+            pendingEmptyFinalize?.let { mainHandler.removeCallbacks(it) }
+            pendingEmptyFinalize = null
+            if (reason.isNotBlank()) emitRow("ASR_EMPTY_FINAL_CANCELLED", mapOf("reason" to reason))
+        }
+
+        fun endRowOnce(kind: String, extras: Map<String, Any?> = emptyMap()) {
+            if (ended) return
+            ended = true
+            endRowOnceLocked(kind, extras)
+        }
+
+        fun clearLocaleFailureLatches() {
+            lastLanguageNotSupported = false
+            lastLanguageUnavailable = false
+            lastFailedLocaleTag = null
+        }
+
+        fun maybeAutoDisableSilenceExtrasOnSuspiciousEnd(errorCode: Int, errorName: String) {
+            val isNoMatchish =
+                (errorCode == SpeechRecognizer.ERROR_NO_MATCH || errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+
+            if (!silenceExtrasEnabled || !isNoMatchish || sawHypothesis) {
+                consecutiveSuspiciousNoHypothesis = 0
+                return
+            }
+
+            consecutiveSuspiciousNoHypothesis += 1
+            emit(
+                "ASR_SILENCE_EXTRAS_SUSPICIOUS_FAILURE",
+                mapOf(
+                    "count" to consecutiveSuspiciousNoHypothesis,
+                    "threshold" to config.silenceExtrasDisableThreshold,
+                    "code" to errorCode,
+                    "name" to errorName,
+                    "token" to token
+                )
+            )
+
+            if (consecutiveSuspiciousNoHypothesis >= config.silenceExtrasDisableThreshold) {
+                silenceExtrasDisabled = true
+                silenceExtrasDisabledReason = "auto_disabled_after_${consecutiveSuspiciousNoHypothesis}_no_hypothesis_failures"
+                emit(
+                    "ASR_SILENCE_EXTRAS_AUTO_DISABLED",
+                    mapOf("reason" to (silenceExtrasDisabledReason ?: ""), "token" to token)
+                )
+            }
+        }
+
+        return object : RecognitionListener {
+
+            override fun onReadyForSpeech(params: Bundle?) {
+                if (!callbacksAllowed(token) || ended) return
+                listener?.onReady(localeTag)
+                emitRow("ASR_READY", mapOf("locale" to localeTag, "token" to token))
+            }
+
+            override fun onBeginningOfSpeech() {
+                if (!callbacksAllowed(token) || ended) return
+                clearLocaleFailureLatches()
+                listener?.onBegin()
+                emitRow("ASR_BEGIN", mapOf("token" to token))
+            }
+
+            override fun onRmsChanged(rmsdB: Float) {
+                if (!callbacksAllowed(token) || ended) return
+                listener?.onRmsChanged(rmsdB)
+            }
+
+            override fun onBufferReceived(buffer: ByteArray?) {}
+
+            override fun onEndOfSpeech() {
+                if (!callbacksAllowed(token) || ended) return
+                listener?.onEnd()
+                emitRow("ASR_END", mapOf("token" to token))
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                if (!callbacksAllowed(token) || ended) return
+
+                val parts = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val text = parts?.firstOrNull()?.orEmpty() ?: return
+                if (text.isBlank()) return
+
+                if (text != lastPartial) {
+                    sawHypothesis = true
+                    lastPartial = text
+                    listener?.onPartial(text)
+                    emitRow("ASR_PARTIAL", mapOf("text" to text, "token" to token))
+                }
+            }
+
+            override fun onResults(results: Bundle?) {
+                if (!callbacksAllowed(token) || ended) return
+
+                clearLocaleFailureLatches()
+                cancelEmptyFinalize("onResults")
+
+                // Prefer final; salvage from partial if empty
+                val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val scores = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
+
+                val finalCandidate = list?.firstOrNull()?.trim().orEmpty()
+                val partialCandidate = lastPartial.trim()
+                val conf = scores?.firstOrNull()
+
+                val chosenText = when {
+                    finalCandidate.isNotBlank() -> finalCandidate
+                    partialCandidate.isNotBlank() -> partialCandidate
+                    else -> ""
+                }
+
+                // Some OEMs emit empty onResults then real onResults shortly after.
+                if (chosenText.isBlank()) {
+                    emitRow("ASR_FINAL_EMPTY", mapOf("token" to token))
+
+                    val runnable = Runnable {
+                        // Only finalize if still same session and not ended
+                        if (!callbacksAllowed(token) || ended) return@Runnable
+                        endRowOnce("ASR_STOP", mapOf("reason" to "final_empty_grace_expired", "token" to token))
+                        releaseAudioFocusIfNeeded("final_empty_grace_expired")
+                        // Invalidate session token (reject late callbacks)
+                        currentSessionToken = 0L
+                        state = State.IDLE
+                        destroyRecognizerLocked("final_empty_grace_expired")
+                    }
+
+                    pendingEmptyFinalize = runnable
+                    mainHandler.postDelayed(runnable, config.emptyFinalGraceMs)
+                    return
+                }
+
+                sawHypothesis = true
+                lastPartial = ""
+                state = State.IDLE
+
+                val reason = if (finalCandidate.isNotBlank()) "final_results" else "final_from_partial"
+                emitRow("ASR_FINAL", mapOf("text" to chosenText, "confidence" to conf, "reason" to reason, "token" to token))
+                listener?.onFinal(currentRowId, chosenText, conf, reason)
+
+                endRowOnce("ASR_STOP", mapOf("reason" to reason, "final_text" to chosenText, "token" to token))
+                releaseAudioFocusIfNeeded("final:$reason")
+
+                // Invalidate token so late callbacks are rejected.
+                currentSessionToken = 0L
+                destroyRecognizerLocked("final:$reason")
+            }
+
+            override fun onError(error: Int) {
+                val name = errorName(error)
+
+                if (ended) return
+                if (!callbacksAllowed(token)) return
+
+                cancelEmptyFinalize("onError:$name")
+
+                // OEM: salvage partial on NO_MATCHish error if we have a good partial
+                val salvageCandidate = lastPartial.trim()
+                val isNoMatchish =
+                    (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+
+                maybeAutoDisableSilenceExtrasOnSuspiciousEnd(error, name)
+
+                if (isNoMatchish && salvageCandidate.isNotBlank()) {
+                    sawHypothesis = true
+                    lastPartial = ""
+                    state = State.IDLE
+
+                    emitRow(
+                        "ASR_FINAL_SALVAGED_ON_ERROR",
+                        mapOf("text" to salvageCandidate, "code" to error, "name" to name, "token" to token)
+                    )
+                    listener?.onFinal(currentRowId, salvageCandidate, null, "error_${name}_salvaged_partial")
+
+                    endRowOnce("ASR_STOP", mapOf("reason" to "final_salvaged_on_error", "final_text" to salvageCandidate, "token" to token))
+                    releaseAudioFocusIfNeeded("salvage_on_error")
+
+                    currentSessionToken = 0L
+                    destroyRecognizerLocked("salvage_on_error")
+                    return
+                }
+
+                // Latch locale failures for next start
+                when (error) {
+                    12 -> {
+                        lastLanguageNotSupported = true
+                        lastFailedLocaleTag = localeTag
+                        emit("ASR_LANG_NOT_SUPPORTED_LATCHED", mapOf("locale" to localeTag, "token" to token))
+                    }
+                    13 -> {
+                        lastLanguageUnavailable = true
+                        lastFailedLocaleTag = localeTag
+                        emit("ASR_LANG_UNAVAILABLE_LATCHED", mapOf("locale" to localeTag, "fallback" to Locale.getDefault().toLanguageTag(), "token" to token))
+                    }
+                }
+
+                // Handle BUSY/CLIENT with optional backoff (caller might retry)
+                state = State.IDLE
+                lastPartial = ""
+
+                emitRow("ASR_ERROR", mapOf("code" to error, "name" to name, "token" to token))
+                listener?.onError(error)
+
+                endRowOnce("ASR_ERROR", mapOf("code" to error, "name" to name, "token" to token))
+                releaseAudioFocusIfNeeded("error:$name")
+
+                currentSessionToken = 0L
+                destroyRecognizerLocked("error:$name")
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+    }
+
+    private fun endRowOnceLocked(kind: String, extras: Map<String, Any?> = emptyMap()) {
+        // Always end exactly once for the current rowId if valid.
+        val rowId = currentRowId
+        if (rowId < 0) return
+
+        val payload = mutableMapOf<String, Any?>(
+            "kind" to kind,
+            "row_id" to rowId,
+            "locale" to currentLocaleTag,
+            "state" to state.name
+        )
+        for ((k, v) in extras) payload[k] = v
+
+        // Use your existing telemetry API shape:
+        ConversationTelemetry.asrRowEnd(kind, *payload.entries.map { it.key to it.value }.toTypedArray())
+
+        currentRowId = -1
+    }
+
+    private fun emit(type: String, extras: Map<String, Any?> = emptyMap()) {
+        val base = mutableMapOf<String, Any?>(
+            "type" to type,
+            "asr_state" to state.name,
+            "locale" to currentLocaleTag,
+            "session_token" to currentSessionToken
+        )
+        for ((k, v) in extras) base[k] = v
+        ConversationTelemetry.emit(base)
+        listener?.onDebugEvent(type, extras)
+        Log.i(logTag, "$type $extras")
+    }
+
+    private fun emitRow(type: String, extras: Map<String, Any?> = emptyMap()) {
+        val base = mutableMapOf<String, Any?>(
+            "type" to type,
+            "row_id" to currentRowId,
+            "asr_state" to state.name,
+            "locale" to currentLocaleTag,
+            "session_token" to currentSessionToken
+        )
+        for ((k, v) in extras) base[k] = v
+        ConversationTelemetry.asrRowEvent(type, *base.entries.map { it.key to it.value }.toTypedArray())
+        listener?.onDebugEvent(type, extras)
+        Log.i(logTag, "$type $extras")
+    }
 
     companion object {
-        private const val DEFAULT_LOCALE_TAG = "en-US"
-
-        // ✅ Make this callable from MainActivity: SudoASR.errorName(code)
         @JvmStatic
         fun errorName(code: Int): String = when (code) {
             SpeechRecognizer.ERROR_AUDIO -> "ERROR_AUDIO"
@@ -114,573 +727,32 @@ class SudoASR(
         }
     }
 
-    fun isActive(): Boolean = asrActive
+    // ---------- Audio focus helpers ----------
+    private fun acquireAudioFocusIfNeeded(reason: String) {
+        if (!config.requestAudioFocus) return
+        if (hasAudioFocus) return
+        val am = audioManager ?: return
 
-    fun prewarm() {
-        // Prewarm just validates availability + locale; does not create recognizer yet
-        val tag = effectiveLocale().toLanguageTag()
-        intentLocaleTag = tag
-        Log.i(logTag, "Prewarm OK (intentLocaleTag=$intentLocaleTag)")
-    }
-
-    fun release() = destroy()
-
-    fun setConversationLocaleTag(tag: String?) {
-        conversationLocaleTag = tag?.trim()?.ifEmpty { null }
-        // next start() will rebuild with new locale
-        intentLocaleTag = ""
-    }
-
-    fun setSpeaking(speaking: Boolean) {
-        // speaking=true  => hard suppress + cancel listening immediately
-        // speaking=false => lift suppress immediately; Conductor decides when to start()
-        isSpeaking = speaking
-
-        if (speaking) {
-            suppressed = true
-
-            pendingRestart?.let { mainHandler.removeCallbacks(it) }
-            pendingRestart = null
-
-            // While TTS speaks, we must not be listening.
-            cancel()
-
-            Log.i(logTag, "SUPPRESS_ON (tts speaking)")
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "ASR_SUPPRESS_FOR_TTS",
-                    "reason" to "tts_speaking"
-                )
-            )
-        } else {
-            // IMPORTANT: lift suppression here.
-            // We do NOT start ASR here — Turn Conductor will call start() when legal.
-            suppressed = false
-
-            pendingRestart?.let { mainHandler.removeCallbacks(it) }
-            pendingRestart = null
-
-            Log.i(logTag, "SUPPRESS_OFF (tts finished; Conductor may start ASR)")
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "ASR_SUPPRESS_LIFTED",
-                    "source" to "setSpeaking(false)"
-                )
-            )
-        }
-    }
-
-    @Deprecated(
-        message = "Contract violation: workers (TTS) must not control ASR. Do not use.",
-        level = DeprecationLevel.ERROR
-    )
-    fun asAsrController(): Any {
-        // Intentionally impossible to use. Remove all call sites (MainActivity, AzureCloudTtsEngine wiring).
-        error("Do not use asAsrController(): Turn Conductor is the only ASR authority.")
-    }
-
-    fun start() {
-        if (suppressed) {
-            Log.i(logTag, "LISTEN_SKIP reason=suppressed_for_tts")
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_SKIP", "reason" to "suppressed_for_tts"))
-            return
-        }
-        if (isSpeaking) {
-            Log.i(logTag, "LISTEN_SKIP reason=still_speaking")
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_SKIP", "reason" to "still_speaking"))
-            return
-        }
-        if (asrActive) {
-            Log.i(logTag, "LISTEN_SKIP reason=already_active")
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_SKIP", "reason" to "already_active"))
-            return
-        }
-
-        val now = System.currentTimeMillis()
-        if (now - lastStartMs < config.minGapBetweenSessionsMs) {
-            Log.i(logTag, "LISTEN_SKIP reason=debounce (${now - lastStartMs}ms since last)")
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_SKIP", "reason" to "debounce"))
-            return
-        }
-
-        val ok = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                PackageManager.PERMISSION_GRANTED
-        if (!ok) {
-            Log.w(logTag, "LISTEN_DENY reason=missing_record_audio_permission")
-            Toast.makeText(context, "Enable microphone permission to talk to Sudo.", Toast.LENGTH_SHORT).show()
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_DENY", "reason" to "missing_record_audio_permission"))
-            return
-        }
-
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            Log.w(logTag, "LISTEN_DENY reason=recognition_not_available")
-            Toast.makeText(context, "Speech recognition not available on this device.", Toast.LENGTH_SHORT).show()
-            ConversationTelemetry.emit(mapOf("type" to "ASR_LISTEN_DENY", "reason" to "recognition_not_available"))
-            return
-        }
-
-        // Fresh recognizer per start() (prevents stale callbacks / ERROR_CLIENT weirdness from poisoning next sessions)
-        destroyRecognizerOnly()
-
-        // ---- Locale selection with robust fallback ladder ----
-        val requestedLocale: Locale = effectiveLocale()
-        val deviceDefaultLocale: Locale = Locale.getDefault()
-
-        val requestedTag = requestedLocale.toLanguageTag()
-        val deviceDefaultTag = deviceDefaultLocale.toLanguageTag()
-
-        val prevUnavailable = lastLanguageUnavailable
-        val prevNotSupported = lastLanguageNotSupported
-
-        val chosenTag = pickSupportedLocaleTag(
-            requestedTag = requestedTag,
-            deviceDefaultTag = deviceDefaultTag,
-            lastFailed = lastFailedLocaleTag
+        // This is the legacy API; if you want AudioFocusRequest (API 26+),
+        // you can swap it in. Keeping this minimal and widely compatible.
+        @Suppress("DEPRECATION")
+        val result = am.requestAudioFocus(
+            { /* ignored */ },
+            AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
         )
-
-        intentLocaleTag = chosenTag
-
-        ConversationTelemetry.emit(
-            mapOf(
-                "type" to "ASR_LOCALE_CHOSEN",
-                "requested" to requestedTag,
-                "chosen" to chosenTag,
-                "device_default" to deviceDefaultTag,
-                "prev_lang_unavailable" to prevUnavailable,
-                "prev_lang_not_supported" to prevNotSupported,
-                "last_failed" to (lastFailedLocaleTag ?: "")
-            )
-        )
-
-        // Clear "retry suggestion" arm per new row
-        langUnavailableRetryArmed = false
-        // -----------------------------------------------------
-
-        val serial = ++startSerial
-        lastStartMs = now
-        lastPartial = ""
-        asrActive = true
-
-        recognizer = SpeechRecognizer.createSpeechRecognizer(context)
-        intent = buildIntent(chosenTag)
-
-        recognizer!!.setRecognitionListener(makeListener(serial, chosenTag))
-
-        Log.i(logTag, "LISTEN_START locale=$chosenTag serial=$serial")
-        activeRowId = ConversationTelemetry.asrRowStart("locale" to chosenTag, "serial" to serial)
-
-        try {
-            recognizer?.startListening(intent)
-        } catch (t: Throwable) {
-            asrActive = false
-            Log.e(logTag, "LISTEN_ERROR ${t.message}", t)
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "ASR_START_THROW",
-                    "message" to (t.message ?: t.toString()),
-                    "serial" to serial
-                )
-            )
-        }
+        hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+        emit("ASR_AUDIO_FOCUS", mapOf("acquired" to hasAudioFocus, "reason" to reason))
     }
 
-    fun stop() {
-        // Important: do NOT create a latch that blocks onResults (some devices still deliver results after stop()).
-        try { recognizer?.stopListening() } catch (_: Throwable) {}
-
-        if (asrActive) {
-            Log.i(logTag, "LISTEN_STOP_REQUESTED")
-            ConversationTelemetry.asrRowEvent("ASR_STOP_REQUESTED", "source" to "manual_stop")
-        }
-
-        asrActive = false
-        lastPartial = ""
-    }
-
-    fun cancel() {
-        // Cancel means: drop everything.
-        try { recognizer?.cancel() } catch (_: Throwable) {}
-
-        if (asrActive) {
-            Log.i(logTag, "LISTEN_CANCEL_REQUESTED")
-            ConversationTelemetry.asrRowEvent("ASR_CANCEL_REQUESTED", "source" to "manual_cancel")
-        }
-
-        asrActive = false
-        lastPartial = ""
-    }
-
-    fun destroy() {
-        cancel()
-        destroyRecognizerOnly()
-
-        intent = null
-        intentLocaleTag = ""
-        suppressed = false
-
-        pendingRestart?.let { mainHandler.removeCallbacks(it) }
-        pendingRestart = null
-    }
-
-    // ---------------- internals ----------------
-
-    private fun callbacksAllowed(): Boolean {
-        if (suppressed) return false
-        if (isSpeaking) return false
-        return true
-    }
-
-    private fun buildIntent(localeTag: String): Intent =
-        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeTag)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeTag)
-
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, config.partialResults)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, config.maxResults)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, config.completeSilenceMs)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, config.possiblyCompleteSilenceMs)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, config.minInputLengthMs)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
-        }
-
-    private fun makeListener(serial: Int, localeTag: String): RecognitionListener =
-        object : RecognitionListener {
-
-            // After an ASR row ends (onError or accepted onResults), ignore any late callbacks.
-            @Volatile private var ended: Boolean = false
-
-            // Some OEM recognizers can deliver an empty onResults() then a real one shortly after.
-            // We wait a short grace window before treating empty as NO_MATCH.
-            private var pendingEmptyFinalize: Runnable? = null
-            private var pendingEmptyAtMs: Long = 0L
-            private val emptyFinalGraceMs: Long = 250L
-
-            private fun allowed(): Boolean {
-                if (ended) return false
-                return callbacksAllowed()
-            }
-
-            private fun endRowOnce(kind: String) {
-                if (!ended) {
-                    ended = true
-                }
-            }
-
-            private fun cancelPendingEmptyFinalize(reason: String) {
-                pendingEmptyFinalize?.let { mainHandler.removeCallbacks(it) }
-                pendingEmptyFinalize = null
-                pendingEmptyAtMs = 0L
-
-                // Optional breadcrumb: only emit if we were actually waiting
-                if (reason.isNotBlank()) {
-                    ConversationTelemetry.asrRowEvent(
-                        "ASR_EMPTY_FINAL_CANCELLED",
-                        "serial" to serial,
-                        "reason" to reason
-                    )
-                }
-            }
-
-            private fun clearLocaleFailureLatches() {
-                lastLanguageUnavailable = false
-                lastLanguageNotSupported = false
-                lastFailedLocaleTag = null
-            }
-
-            override fun onReadyForSpeech(params: Bundle?) {
-                if (!allowed()) {
-                    Log.i(logTag, "READY_IGNORED serial=$serial ended=$ended suppressed=$suppressed isSpeaking=$isSpeaking")
-                    return
-                }
-                asrActive = true
-                listener?.onReady(localeTag)
-                Log.i(logTag, "READY locale=$localeTag serial=$serial")
-                ConversationTelemetry.asrRowEvent("ASR_READY", "locale" to localeTag, "serial" to serial)
-            }
-
-            override fun onBeginningOfSpeech() {
-                if (!allowed()) {
-                    Log.i(logTag, "BEGIN_IGNORED serial=$serial ended=$ended suppressed=$suppressed isSpeaking=$isSpeaking")
-                    return
-                }
-                // If we got to actual speech, recognizer is functioning — clear latches.
-                clearLocaleFailureLatches()
-
-                asrActive = true
-                listener?.onBegin()
-                Log.i(logTag, "BEGIN serial=$serial")
-                ConversationTelemetry.asrRowEvent("ASR_BEGIN", "serial" to serial)
-            }
-
-            override fun onRmsChanged(rmsdB: Float) {
-                if (!allowed()) return
-                listener?.onRmsChanged(rmsdB)
-                ConversationTelemetry.asrRowEvent("ASR_RMS", "rms_db" to rmsdB, "serial" to serial)
-            }
-
-            override fun onBufferReceived(buffer: ByteArray?) {}
-
-            override fun onEndOfSpeech() {
-                if (!allowed()) {
-                    Log.i(logTag, "END_IGNORED serial=$serial ended=$ended suppressed=$suppressed isSpeaking=$isSpeaking")
-                    return
-                }
-                listener?.onEnd()
-                Log.i(logTag, "END serial=$serial")
-                ConversationTelemetry.asrRowEvent("ASR_END", "serial" to serial)
-            }
-
-            override fun onError(error: Int) {
-                val name = SudoASR.errorName(error)
-
-                if (ended) {
-                    Log.i(logTag, "ERROR_IGNORED late code=$error ($name) serial=$serial")
-                    return
-                }
-                if (!callbacksAllowed()) {
-                    Log.i(
-                        logTag,
-                        "ERROR_IGNORED gate code=$error ($name) serial=$serial suppressed=$suppressed isSpeaking=$isSpeaking"
-                    )
-                    return
-                }
-
-                // If we were waiting on an empty final, cancel that path.
-                cancelPendingEmptyFinalize(reason = "onError:$name")
-
-                // Latch locale failures for *next* start()
-                when (error) {
-                    SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE, 13 -> {
-                        lastLanguageUnavailable = true
-                        lastFailedLocaleTag = localeTag
-
-                        val fallback = Locale.getDefault().toLanguageTag()
-                        ConversationTelemetry.emit(
-                            mapOf(
-                                "type" to "ASR_LANG_UNAVAILABLE_LATCHED",
-                                "serial" to serial,
-                                "locale" to localeTag,
-                                "fallback" to fallback
-                            )
-                        )
-
-                        if (!langUnavailableRetryArmed) {
-                            langUnavailableRetryArmed = true
-                            ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "ASR_LOCALE_FALLBACK_SUGGESTED",
-                                    "from" to localeTag,
-                                    "to" to fallback,
-                                    "serial" to serial
-                                )
-                            )
-                            onLocaleFallbackSuggested?.invoke(fallback)
-                        }
-                    }
-
-                    12 -> {
-                        lastLanguageNotSupported = true
-                        lastFailedLocaleTag = localeTag
-                        ConversationTelemetry.emit(
-                            mapOf(
-                                "type" to "ASR_LANG_NOT_SUPPORTED_LATCHED",
-                                "serial" to serial,
-                                "locale" to localeTag
-                            )
-                        )
-                    }
-                }
-
-                endRowOnce("error")
-
-                asrActive = false
-                lastPartial = ""
-
-                Log.w(logTag, "ERROR code=$error ($name) serial=$serial")
-                listener?.onError(error)
-
-                ConversationTelemetry.asrRowEnd(
-                    "ASR_ERROR",
-                    "code" to error,
-                    "name" to name,
-                    "serial" to serial
-                )
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-                if (!allowed()) return
-
-                val parts = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                if (!parts.isNullOrEmpty()) {
-                    val text = parts.first().orEmpty()
-                    if (text != lastPartial) {
-                        lastPartial = text
-                        logHeard("PARTIAL", text, null)
-                        listener?.onPartial(text)
-                        ConversationTelemetry.asrRowEvent("ASR_PARTIAL", "text" to text, "serial" to serial)
-                    }
-                }
-            }
-
-            override fun onResults(results: Bundle?) {
-                if (ended) {
-                    Log.i(logTag, "RESULTS_IGNORED late serial=$serial")
-                    return
-                }
-                if (!callbacksAllowed()) {
-                    Log.i(
-                        logTag,
-                        "RESULTS_IGNORED gate serial=$serial suppressed=$suppressed isSpeaking=$isSpeaking"
-                    )
-                    return
-                }
-
-                // If we got results, recognizer is functioning — clear latches.
-                lastLanguageUnavailable = false
-                lastLanguageNotSupported = false
-                lastFailedLocaleTag = null
-
-                // End the active ASR row (idempotent).
-                endRowOnce("results")
-
-                // Capture partial BEFORE clearing; we may need it if final is empty.
-                val partialCandidate = lastPartial.trim()
-
-                asrActive = false
-                lastPartial = ""
-
-                val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                val scores = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
-
-                val finalCandidate = list?.firstOrNull()?.trim().orEmpty()
-                val conf = scores?.firstOrNull()
-
-                // Prefer final, but salvage from partial if final is empty (common on some devices).
-                val text = when {
-                    finalCandidate.isNotBlank() -> finalCandidate
-                    partialCandidate.isNotBlank() -> partialCandidate
-                    else -> ""
-                }
-
-                if (text.isBlank()) {
-                    // ✅ Drop empty finals on the floor (no NO_MATCH escalation).
-                    Log.i(logTag, "HEARD: (final empty) serial=$serial → dropped")
-                    ConversationTelemetry.asrRowEvent("ASR_FINAL_EMPTY", "serial" to serial)
-
-                    ConversationTelemetry.asrRowEnd(
-                        "ASR_STOP",
-                        "reason" to "final_empty_dropped",
-                        "serial" to serial
-                    )
-                    return
-                }
-
-                // Normal final (or salvaged from partial)
-                val reason = if (finalCandidate.isNotBlank()) "final_results" else "final_from_partial"
-
-                logHeard("HEARD", text, conf)
-                listener?.onHeard(text, conf)
-                listener?.onFinal(activeRowId, text, conf, reason)
-
-                ConversationTelemetry.asrRowEvent(
-                    "ASR_FINAL",
-                    "text" to text,
-                    "confidence" to (conf ?: null),
-                    "serial" to serial,
-                    "final_reason" to reason
-                )
-
-                ConversationTelemetry.asrRowEnd(
-                    "ASR_STOP",
-                    "reason" to reason,
-                    "final_text" to text,
-                    "final_confidence" to (conf ?: null),
-                    "serial" to serial
-                )
-            }
-
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        }
-
-
-
-
-    private fun destroyRecognizerOnly() {
-        try { recognizer?.setRecognitionListener(null) } catch (_: Throwable) {}
-        try { recognizer?.destroy() } catch (_: Throwable) {}
-        recognizer = null
-    }
-
-    private fun effectiveLocale(): Locale {
-        val conv = conversationLocaleTag?.trim().orEmpty()
-        if (conv.isNotEmpty()) {
-            runCatching { Locale.forLanguageTag(conv).takeIf { it.language.isNotBlank() } }
-                .getOrNull()?.let { return it }
-        }
-
-        val cfg = config.preferredLocaleTag.trim()
-        if (cfg.isNotEmpty()) {
-            runCatching { Locale.forLanguageTag(cfg).takeIf { it.language.isNotBlank() } }
-                .getOrNull()?.let { return it }
-        }
-
-        runCatching { Locale.forLanguageTag(DEFAULT_LOCALE_TAG).takeIf { it.language.isNotBlank() } }
-            .getOrNull()?.let { return it }
-
-        return Locale.getDefault()
-    }
-
-    /**
-     * Pick a locale tag for the next start() with a robust fallback ladder.
-     *
-     * We cannot reliably query “supported locales” across OEM recognizers,
-     * so we:
-     * - react to real failures (12/13) by trying different tags next time,
-     * - avoid repeating the exact same failing tag,
-     * - provide a sane English fallback set.
-     */
-    private fun pickSupportedLocaleTag(
-        requestedTag: String,
-        deviceDefaultTag: String,
-        lastFailed: String?
-    ): String {
-        // If no previous locale failure, keep requested
-        if (!lastLanguageUnavailable && !lastLanguageNotSupported) return requestedTag
-
-        val candidates = LinkedHashSet<String>()
-
-        // 1) Device default (full)
-        candidates.add(deviceDefaultTag)
-
-        // 2) Device default language-only (e.g., "en")
-        runCatching { Locale.forLanguageTag(deviceDefaultTag).language }
-            .getOrNull()?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
-
-        // 3) Safe English fallbacks
-        candidates.add("en-US")
-        candidates.add("en-GB")
-
-        // 4) Requested language-only (if requested had region)
-        runCatching { Locale.forLanguageTag(requestedTag).language }
-            .getOrNull()?.takeIf { it.isNotBlank() }?.let { candidates.add(it) }
-
-        // 5) Finally, requestedTag itself (in case the failure was transient)
-        candidates.add(requestedTag)
-
-        val cleaned = candidates.filter { it.isNotBlank() }
-
-        // avoid repeating the last failing tag if possible
-        val chosen = cleaned.firstOrNull { it != lastFailed } ?: requestedTag
-        return chosen
-    }
-
-    private fun logHeard(kind: String, text: String, confidence: Float?) {
-        val base = "$kind: \"${text.replace("\n", " ")}\""
-        if (confidence != null) {
-            Log.i(logTag, "$base (conf=${"%.2f".format(confidence)})")
-        } else {
-            Log.i(logTag, base)
-        }
+    private fun releaseAudioFocusIfNeeded(reason: String) {
+        if (!config.requestAudioFocus) return
+        if (!hasAudioFocus) return
+        val am = audioManager ?: return
+
+        @Suppress("DEPRECATION")
+        am.abandonAudioFocus(null)
+        hasAudioFocus = false
+        emit("ASR_AUDIO_FOCUS", mapOf("released" to true, "reason" to reason))
     }
 }

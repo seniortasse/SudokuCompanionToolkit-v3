@@ -1,89 +1,108 @@
 package com.contextionary.sudoku.conductor
 
 /**
- * Clarification type requested by the policy.
+ * Phase 6 (clean): ToolCall is INTERNAL-ONLY.
  *
- * Note: the policy JSON may use aliases ("COLUMN" vs "COL").
- * Use [fromWire] in your JSON->ToolCall mapper.
+ * - No LLM “tool schema” surface here.
+ * - No wire names / JSON decoding helpers.
+ * - These are produced only by app-side planning/engine and executed locally.
  */
+
+// ----------------------------
+// Shared internal enums
+// ----------------------------
+
+/** Clarification types the app can ask for (internal). */
 enum class ClarifyKind {
     ROW,
     COL,
     DIGIT,
-    POSITION;
-
-    companion object {
-        /**
-         * Accepts common aliases coming from LLM/tool JSON.
-         * Returns null if unknown.
-         */
-        fun fromWire(raw: String?): ClarifyKind? {
-            val s = raw
-                ?.trim()
-                ?.uppercase()
-                ?.replace("-", "_")
-                ?.replace(" ", "_")
-                ?: return null
-
-            return when (s) {
-                "ROW", "R" -> ROW
-                "COL", "COLUMN", "C" -> COL
-                "DIGIT", "NUMBER", "VALUE" -> DIGIT
-                "POSITION", "POS", "CELL", "CELL_POSITION" -> POSITION
-                else -> null
-            }
-        }
-
-        /**
-         * Canonical wire name (if you want to serialize back to JSON).
-         */
-        fun toWire(kind: ClarifyKind): String = when (kind) {
-            ROW -> "ROW"
-            COL -> "COL"
-            DIGIT -> "DIGIT"
-            POSITION -> "POSITION"
-        }
-    }
+    POSITION,
+    YESNO,
+    // Generic non-grid clarifications (mode, verbosity, preferences, etc.)
+    WORKFLOW
 }
 
+/** Provenance/classification for a cell (internal). */
 enum class CellClass {
     GIVEN,
     SOLUTION,
-    EMPTY;
+    EMPTY
+}
+
+/**
+ * SOLVING: canonical North Star CTA families.
+ *
+ * These are the only normal stage-level CTA semantics the solving rail should expose:
+ * - SHOW_PROOF : setup -> walkthrough/proof
+ * - LOCK_IT_IN : confrontation -> commit/apply
+ * - NEXT_STEP  : resolution -> continue the solve loop
+ *
+ * Legacy multi-branch tutoring options are intentionally removed from the canonical enum.
+ */
+enum class SolvePreferenceOption {
+    SHOW_PROOF,
+    LOCK_IT_IN,
+    NEXT_STEP;
 
     companion object {
-        fun fromWire(raw: String?): CellClass? {
-            val s = raw?.trim()?.uppercase()?.replace("-", "_") ?: return null
-            return when (s) {
-                "GIVEN", "GIVENS" -> GIVEN
-                "SOLUTION", "SOLUTIONS", "USER_SOLUTION" -> SOLUTION
-                "EMPTY", "BLANK" -> EMPTY
+        fun parse(raw: String): SolvePreferenceOption? {
+            val key = raw.trim().uppercase().replace("-", "_").replace(" ", "_")
+            return when (key) {
+                "SHOW_PROOF",
+                "GUIDE_ME",
+                "MORE_HINT" -> SHOW_PROOF
+
+                "LOCK_IT_IN",
+                "READY_FOR_ANSWER",
+                "APPLY_NOW",
+                "REVEAL_ONLY",
+                "REVEAL_WITH_EXPLANATION" -> LOCK_IT_IN
+
+                "NEXT_STEP" -> NEXT_STEP
                 else -> null
             }
-        }
-
-        fun toWire(v: CellClass): String = when (v) {
-            GIVEN -> "GIVEN"
-            SOLUTION -> "SOLUTION"
-            EMPTY -> "EMPTY"
         }
     }
 }
 
 /**
- * Policy tool calls emitted by the LLM (grid mode).
+ * Post-resolution canonical CTA family.
  *
- * Keep this file aligned with:
- * - CompanionConversation.kt ToolNames (string tool names)
- * - JSON->ToolCall decoder/mapper
- * - SudoConductor.applyPolicyTools(...)
+ * North Star resolution should reopen the solve loop with NEXT_STEP.
+ * Deep-dive / technique-talk is no longer a default sibling CTA in the normal rail.
+ */
+enum class SolveCtaOption {
+    NEXT_STEP;
+
+    companion object {
+        fun parse(raw: String): SolveCtaOption? {
+            val key = raw.trim().uppercase().replace("-", "_").replace(" ", "_")
+            return when (key) {
+                "NEXT_STEP" -> NEXT_STEP
+                "DEEP_DIVE",
+                "ASK_TECHNIQUE" -> null
+                else -> null
+            }
+        }
+    }
+}
+
+/**
+ * INTERNAL app actions/commands (deterministic).
+ *
+ * Phase 6:
+ * - ToolCall is no longer an LLM “tool schema” surface.
+ * - Nothing here is decoded from model JSON.
+ * - These are produced only by app-side planning/engine and executed locally.
  */
 sealed class ToolCall {
 
     // ----------------------------
-    // Core tools
+    // Core tools (internal)
     // ----------------------------
 
+    /** User-facing assistant text to speak/show (produced by Tick2 renderer or app templates). */
     data class Reply(val text: String) : ToolCall()
 
     /**
@@ -100,7 +119,6 @@ sealed class ToolCall {
     ) : ToolCall()
 
     /**
-     * ✅ Patch 1:
      * Row/Col variant to eliminate cellIndex mismatch in confirmations.
      *
      * row/col are 1..9.
@@ -129,11 +147,8 @@ sealed class ToolCall {
     ) : ToolCall()
 
     /**
-     * ✅ Row/Col variant to reduce cellIndex mapping mistakes.
+     * Row/Col variant to reduce cellIndex mapping mistakes.
      * (row/col are 1..9, digit 0..9, where 0 = blank)
-     *
-     * Your adapter/mapper should convert this to cellIndex=(row-1)*9+(col-1)
-     * or map directly in your conductor.
      */
     data class ApplyUserEditRC(
         val row: Int,   // 1..9
@@ -142,17 +157,11 @@ sealed class ToolCall {
         val source: String = "user_request"
     ) : ToolCall()
 
-
-
     /**
-     * ✅ NEW (Option B): explicit confirmation (NOT an edit).
+     * Explicit confirmation (NOT an edit).
      *
-     * Index-based variant (0..80). Used when the policy already knows the concrete cellIndex
+     * Index-based variant (0..80). Used when the app already knows the concrete cellIndex
      * (e.g., from pending AskCellValue).
-     *
-     * digit allows 0..9 (0 = blank).
-     *
-     * NOTE: schema currently provides only (cell_index, digit). `source` is defaulted locally.
      */
     data class ConfirmCellValue(
         val cellIndex: Int,      // 0..80
@@ -161,13 +170,9 @@ sealed class ToolCall {
     ) : ToolCall()
 
     /**
-     * ✅ NEW (Option B): explicit confirmation (NOT an edit).
+     * Explicit confirmation (NOT an edit).
      *
      * Row/Col variant (preferred in GRID_SESSION).
-     *
-     * digit allows 0..9 (0 = blank).
-     *
-     * NOTE: schema currently provides only (row, col, digit). `source` is defaulted locally.
      */
     data class ConfirmCellValueRC(
         val row: Int,        // 1..9
@@ -176,40 +181,156 @@ sealed class ToolCall {
         val source: String = "user_confirm"
     ) : ToolCall()
 
+    // ----------------------------
+    // Wrap-up / solving transition
+    // ----------------------------
 
+    /**
+     * Operational:
+     * Seal the grid as fully validated and remove all WIP visual artifacts.
+     * This does NOT change digits; it changes presentation state.
+     */
+    data class FinalizeValidationPresentation(
+        val reason: String = "validated"
+    ) : ToolCall()
 
+    /** Control tool used in CONFIRMING/SEALING flows (kept for backward compat). */
+    object AskUserToConfirmValidation : ToolCall()
+
+    /**
+     * Control:
+     * Switch conversational intent to SOLVING (hints/techniques/next move).
+     * No args needed; the user-facing text is still in Reply.
+     */
+    object StartSolving : ToolCall()
+
+    // ----------------------------
+    // Grid validation clarification (NOT an edit)
+    // ----------------------------
+
+    enum class ValidationClarifyReason {
+        ASR_GARBLED,
+        MIXED_SIGNAL,
+        OFF_TOPIC,
+        PARTIAL_CONFIRM
+    }
+
+    enum class ValidationClarifyStyle {
+        YES_NO,
+        SPOT_CHECK_3,
+        ASK_WHICH_CELL_MISMATCHES
+    }
+
+    data class ClarifyValidation(
+        val reason: ValidationClarifyReason,
+        val style: ValidationClarifyStyle,
+        val prompt: String
+    ) : ToolCall()
+
+    // ----------------------------
+    // SOLVING: Evidence/engine + overlay controls (pure UI)
+    // ----------------------------
+
+    data class ShowSolveOverlay(
+        val stepId: String,
+        val frameId: String,
+        val style: String,      // "mini"|"full"
+        val gridHash12: String
+    ) : ToolCall()
+
+    data class HideSolveOverlay(
+        val stepId: String,
+        val frameId: String,
+        val gridHash12: String
+    ) : ToolCall()
+
+    data class RefreshSolveStep(
+        val gridHash12: String,
+        val reason: String
+    ) : ToolCall()
+
+    // ----------------------------
+    // SOLVING: End-of-turn CTA control tools (REQUIRED in SOLVING)
+    // ----------------------------
+
+    /**
+     * REQUIRED SOLVING CTA:
+     * Ask for the one normal next action for the CURRENT solve-step stage.
+     *
+     * North Star canonical families:
+     * - SHOW_PROOF : walkthrough the logic
+     * - LOCK_IT_IN : commit/apply the move
+     * - NEXT_STEP  : continue to the next step
+     *
+     * stepId should reference the cached engine step / CoachPlan id.
+     *
+     * options remain List<String> for transitional compatibility, but they are
+     * expected to normalize into SolvePreferenceOption via the parser below.
+     */
+    data class AskSolvePreference(
+        val stepId: String,
+        val options: List<String>,
+        val prompt: String,
+        val hintIndex: Int,
+        val isLastHint: Boolean,
+        val gridHash12: String
+    ) : ToolCall() {
+
+        /** Best-effort normalization into canonical North Star CTA families. */
+        val normalizedOptions: List<SolvePreferenceOption> =
+            options.mapNotNull { raw -> SolvePreferenceOption.parse(raw) }
+                .distinct()
+    }
+
+    /**
+     * REQUIRED SOLVING CTA after a completed step:
+     * North Star resolution should reopen the solve loop with NEXT_STEP.
+     *
+     * This tool name is kept temporarily for compatibility, but the normal
+     * resolution rail should no longer advertise deep-dive as a default sibling CTA.
+     *
+     * Note: options are expected to normalize into SolveCtaOption via the parser below.
+     */
+    data class AskNextStepOrDeepDive(
+        val stepId: String,
+        val prompt: String,
+        val options: List<String> = listOf(
+            SolveCtaOption.NEXT_STEP.name
+        ),
+        val gridHash12: String
+    ) : ToolCall() {
+
+        val normalizedOptions: List<SolveCtaOption> =
+            options.mapNotNull { raw -> SolveCtaOption.parse(raw) }
+                .distinct()
+    }
+
+    /** Optional explicit “try it now” CTA before giving more hints. */
+    data class AskUserToApplyHint(
+        val stepId: String,
+        val prompt: String,
+        val gridHash12: String
+    ) : ToolCall()
 
     // ----------------------------
     // Truth/provenance tools (givens vs user solutions)
     // ----------------------------
 
-    /**
-     * Reclassify a cell's provenance group.
-     * - kind="given"     => DNA / facts
-     * - kind="solution"  => user's placed digit (opinion)
-     * - kind="neither"   => neither group (digit may still exist; provenance cleared)
-     */
     data class ReclassifyCell(
         val cellIndex: Int,           // 0..80
-        val kind: String,             // "given" | "solution" | "neither"
+        val kind: String,             // internal canonical: "given" | "solution" | "neither"
         val source: String = "user_request"
     ) : ToolCall()
 
-    /**
-     * Batch reclassification (preferred when user reclassifies multiple cells).
-     */
     data class ReclassifyCells(
         val cells: List<ReclassifyCell>,
         val source: String = "user_request"
     ) : ToolCall()
 
-    /**
-     * Row/Col variant (optional but useful).
-     */
     data class ReclassifyCellRC(
         val row: Int,                 // 1..9
         val col: Int,                 // 1..9
-        val kind: String,             // "given" | "solution" | "neither"
+        val kind: String,             // internal canonical: "given" | "solution" | "neither"
         val source: String = "user_request"
     ) : ToolCall()
 
@@ -230,10 +351,6 @@ sealed class ToolCall {
     // Candidate tools (thought process layer)
     // ----------------------------
 
-    /**
-     * Set the full candidate bitmask for a cell.
-     * mask uses bit (d-1) for digit d (1..9). mask=0 clears all candidates.
-     */
     data class SetCandidates(
         val cellIndex: Int,           // 0..80
         val mask: Int,                // 0..(2^9-1)
@@ -245,24 +362,42 @@ sealed class ToolCall {
         val source: String = "user_request"
     ) : ToolCall()
 
-    /**
-     * Toggle a single candidate digit.
-     */
     data class ToggleCandidate(
         val cellIndex: Int,           // 0..80
         val digit: Int,               // 1..9
         val source: String = "user_request"
     ) : ToolCall()
 
+    // ----------------------------
+    // Existing control tools (kept)
+    // ----------------------------
+
     data class RecommendRetake(
         val strength: String, // "soft" | "strong"
         val reason: String
     ) : ToolCall()
 
+    /**
+     * META / NON-EXECUTING.
+     * Explanatory rationale for internal planning (logging/audit only).
+     *
+     * Must never be treated as operational or control.
+     * Must never affect sanitizer decisions.
+     */
+    data class ToolplanRationale(
+        val summary: String,
+        val factsUsed: List<String>,
+        val rulesUsed: List<String>,
+        val chosenControl: String?,
+        val chosenOps: List<String>,
+        val stateHeaderSha12: String? = null,
+        val gridHash12: String? = null
+    ) : ToolCall()
+
     object RecommendValidate : ToolCall()
 
     // ----------------------------
-    // Gate 4: conversational repair moves (NOT edits)
+    // Conversational repair moves (NOT edits)
     // ----------------------------
 
     data class ConfirmInterpretation(
@@ -283,45 +418,4 @@ sealed class ToolCall {
     ) : ToolCall()
 
     object Noop : ToolCall()
-
-    /**
-     * Centralize tool-name strings to keep JSON decoding consistent.
-     */
-    companion object WireNames {
-        const val REPLY = "reply"
-
-        // confirmations
-        const val ASK_CONFIRM_CELL = "ask_confirm_cell"           // legacy
-        const val ASK_CONFIRM_CELL_RC = "ask_confirm_cell_rc"     // ✅ Patch 1
-
-        // ✅ NEW: explicit confirmation tools (NOT an edit)
-        const val CONFIRM_CELL_VALUE = "confirm_cell_value"
-        const val CONFIRM_CELL_VALUE_RC = "confirm_cell_value_rc"
-
-        const val PROPOSE_EDIT = "propose_edit"
-
-        const val APPLY_USER_EDIT = "apply_user_edit"
-        const val APPLY_USER_EDIT_RC = "apply_user_edit_rc"
-
-        const val RECOMMEND_RETAKE = "recommend_retake"
-        const val RECOMMEND_VALIDATE = "recommend_validate"
-
-        // Gate 4
-        const val CONFIRM_INTERPRETATION = "confirm_interpretation"
-        const val ASK_CLARIFYING_QUESTION = "ask_clarifying_question"
-        const val SWITCH_TO_TAP = "switch_to_tap"
-
-        const val NOOP = "noop"
-
-        const val RECLASSIFY_CELL = "reclassify_cell"
-        const val RECLASSIFY_CELLS = "reclassify_cells"
-        const val RECLASSIFY_CELL_RC = "reclassify_cell_rc"
-
-        const val SET_CANDIDATES = "set_candidates"
-        const val CLEAR_CANDIDATES = "clear_candidates"
-        const val TOGGLE_CANDIDATE = "toggle_candidate"
-
-        const val APPLY_USER_CLASSIFY = "apply_user_classify"
-        const val APPLY_USER_CLASSIFY_RC = "apply_user_classify_rc"
-    }
 }

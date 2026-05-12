@@ -55,16 +55,25 @@ class ConversationTurnController {
     private var cmdStartAsr: (() -> Unit)? = null
     private var cmdStopAsr: (() -> Unit)? = null
 
+    // ✅ Option B: allow the controller to request a short system nudge speak
+    private var requestSystemSpeak: ((text: String, listenAfter: Boolean, reason: String) -> Unit)? = null
+
+    // ✅ Prevent nudge storms
+    private var lastNudgeAtMs: Long = 0L
+    private val nudgeCooldownMs: Long = 8000L
+
     /**
      * Attach worker commands ONCE (e.g. from MainActivity).
      * After this, only the Conductor calls these.
      */
     fun attachWorkers(
         startAsr: () -> Unit,
-        stopAsr: () -> Unit
+        stopAsr: () -> Unit,
+        requestSystemSpeak: (text: String, listenAfter: Boolean, reason: String) -> Unit
     ) {
         cmdStartAsr = startAsr
         cmdStopAsr = stopAsr
+        this.requestSystemSpeak = requestSystemSpeak
 
         val asrIsNull = (cmdStartAsr == null)
         val stopIsNull = (cmdStopAsr == null)
@@ -96,7 +105,7 @@ class ConversationTurnController {
         return when (error) {
             // Very common “soft failures”
             android.speech.SpeechRecognizer.ERROR_NO_MATCH,
-            android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 250L
+            android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 450L   // ✅ give mic/AGC time to recover
 
             // Network hiccup: backoff
             android.speech.SpeechRecognizer.ERROR_NETWORK,
@@ -202,9 +211,64 @@ class ConversationTurnController {
             return
         }
 
-        // Soft errors: retry with backoff
+        // Soft errors: bounded retry policy to prevent NO_MATCH storms.
+        val isNoMatchish =
+            (code == android.speech.SpeechRecognizer.ERROR_NO_MATCH) ||
+                    (code == android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+
+// Cap retries much lower for no-matchish errors.
+        val maxRetries = if (isNoMatchish) 2 else 3   // ✅ prevents “dead air” after 2 no-matches
+
+        if (asrRetryCount >= maxRetries) {
+            emit(
+                "ASR_RETRY_GIVE_UP",
+                mapOf(
+                    "code" to code,
+                    "max_retries" to maxRetries,
+                    "note" to "bounded_retry_policy_nudge"
+                )
+            )
+
+            // ✅ Emit explicit telemetry so this is never ambiguous
+            val now = System.currentTimeMillis()
+            emit(
+                "ASR_GIVE_UP_NUDGE_REQUESTED",
+                mapOf(
+                    "reason" to "asr_no_matchish_give_up",
+                    "listenAfter" to true,
+                    "text_len" to 0,
+                    "turn_state" to state.name,
+                    "cooldown_ms" to nudgeCooldownMs,
+                    "since_last_nudge_ms" to (now - lastNudgeAtMs)
+                )
+            )
+
+            // ✅ Prevent nudge storms in noisy environments
+            if ((now - lastNudgeAtMs) >= nudgeCooldownMs) {
+                lastNudgeAtMs = now
+
+                // Move to CAMERA baseline; TTS start will move us to SYSTEM_SPEAKING anyway.
+                // This avoids “silent limbo”.
+                transitionTo(TurnState.CAMERA, "asr_give_up_nudge")
+
+                // Ask a short nudge; listenAfter=true re-arms ASR after TTS
+                requestSystemSpeak?.invoke(
+                    "Are you there?",
+                    true,
+                    "asr_no_matchish_give_up"
+                )
+            } else {
+                // If we recently nudged, just keep trying to listen again later (no speech)
+                val delay = asrRetryDelayMsFor(code).coerceAtLeast(800L)
+                asrRetryCount = 0
+                scheduleAsrRetry("asr_give_up_nudge_cooldown", delay)
+            }
+
+            return
+        }
+
         val delay = asrRetryDelayMsFor(code)
-        asrRetryCount = (asrRetryCount + 1).coerceAtMost(6)
+        asrRetryCount = (asrRetryCount + 1).coerceAtMost(maxRetries)
 
         scheduleAsrRetry("asr_error:$code", delay)
     }
@@ -446,13 +510,14 @@ class ConversationTurnController {
      * FIX: If we're not currently SYSTEM_SPEAKING, ignore this event instead of
      * trying to transition (prevents CAMERA->COOLDOWN cascades).
      */
-    fun onTtsFinished() {
+    fun onTtsFinished(listenAfter: Boolean, finishReason: String? = null) {
         if (state != TurnState.SYSTEM_SPEAKING) {
             emit(
                 "TTS_FINISH_IGNORED",
                 mapOf(
                     "note" to "tts_finished_received_outside_system_speaking",
-                    "current_state" to state.name
+                    "current_state" to state.name,
+                    "finish_reason" to (finishReason ?: "")
                 )
             )
             return
@@ -460,14 +525,38 @@ class ConversationTurnController {
 
         transitionTo(TurnState.COOLDOWN, "tts_finished")
 
-        // Fixed contract pause.
-        val delayMs = 250L
+        if (!listenAfter) {
+            emit(
+                "ASR_REQUEST_DECLINED",
+                mapOf(
+                    "reason" to "listenAfter_false",
+                    "finish_reason" to (finishReason ?: "")
+                )
+            )
+            // No ASR resume; we simply end the cooldown and return to CAMERA baseline.
+            postMainDelayed(50L) {
+                if (state == TurnState.COOLDOWN) {
+                    transitionTo(TurnState.CAMERA, "tts_finished_no_listen")
+                }
+            }
+            return
+        }
+
+        // ✅ Fixed contract pause before listening resumes.
+        val delayMs = 650L   // ✅ gives device time to settle audio path after TTS
 
         val token = listenToken.get()
-        emit("ASR_REQUEST_ACCEPTED", mapOf("reason" to "post_tts_pause", "delay_ms" to delayMs))
+
+        emit(
+            "ASR_REQUEST_ACCEPTED",
+            mapOf(
+                "reason" to "post_tts_pause",
+                "delay_ms" to delayMs,
+                "finish_reason" to (finishReason ?: "")
+            )
+        )
 
         postMainDelayed(delayMs) {
-            // Abort if state changed since scheduling.
             if (token != listenToken.get() || state != TurnState.COOLDOWN) {
                 emit(
                     "ASR_START_ABORTED",
@@ -489,16 +578,13 @@ class ConversationTurnController {
      * Optional: if your ASR produces a final result, the worker should call this.
      * Conductor can stop ASR immediately; next steps (LLM/TTS) happen elsewhere.
      */
-    fun onAsrFinal(text: String, rowId: Int? = null, confidence: Float? = null) {
-        // Ensure conductor logic runs on main thread (avoids racey state reads/writes).
+    fun onAsrFinal(text: String, rowId: Int? = null, confidence: Float? = null, onAccepted: (() -> Unit)? = null) {
         postMain {
             val trimmed = text.trim()
             val preview = trimmed.replace("\n", " ").take(80)
 
-            // Always log what the Conductor received (this is the log line I suggested).
             logI("USER_HEARD state=${state.name} text='$preview'")
 
-            // Telemetry for correlation/debug
             emit(
                 "USER_HEARD",
                 mapOf(
@@ -509,37 +595,45 @@ class ConversationTurnController {
                 )
             )
 
-            // Drop empty finals on the floor.
             if (trimmed.isBlank()) {
                 emit("ASR_FINAL_EMPTY_DROPPED", emptyMap())
-                // Still stop ASR defensively.
                 dispatchStopAsr("asr_final_empty")
                 return@postMain
             }
 
-            // Late final protection: do NOT let a late final disturb the turn contract.
+            // Late final protection
             if (state != TurnState.USER_LISTENING) {
                 emit(
                     "ASR_FINAL_IGNORED_LATE",
                     mapOf("note" to "final_received_outside_user_listening")
                 )
-                // Stop ASR defensively; some devices keep it half-alive.
                 dispatchStopAsr("asr_final_late")
                 return@postMain
             }
 
-            // Reset retry counters on a successful final.
+            // ✅ NEW: dedupe by rowId if present (best signal)
+            // If rowId repeats quickly, treat as duplicate delivery.
+            val nowMs = System.currentTimeMillis()
+            if (rowId != null && lastAcceptedRowId == rowId) {
+                val lastMs = lastAcceptedFinalMs ?: 0L
+                if (nowMs - lastMs < 800L) {
+                    emit(
+                        "ASR_FINAL_DUPLICATE_DROPPED",
+                        mapOf("row_id" to rowId, "delta_ms" to (nowMs - lastMs))
+                    )
+                    dispatchStopAsr("asr_final_dup")
+                    return@postMain
+                }
+            }
+
             asrRetryCount = 0
             asrLastErrorCode = null
 
-            // Stop ASR immediately (end-of-utterance).
             dispatchStopAsr("asr_final")
 
-            // Persist last accepted user row for pairing with the next assistant speak
             lastAcceptedRowId = rowId
-            lastAcceptedFinalMs = System.currentTimeMillis()
+            lastAcceptedFinalMs = nowMs
 
-            // Emit a normalized USER_SAY for transcript reconstruction
             ConversationTelemetry.emitUserSay(
                 trimmed,
                 source = "turn_controller",
@@ -547,9 +641,13 @@ class ConversationTurnController {
                 confidence = confidence
             )
 
-            // IMPORTANT: We do NOT transition state here.
-            // We remain USER_LISTENING until TTS actually starts (onSystemSpeaking()).
-            emit("ASR_FINAL_ACCEPTED", mapOf("text_len" to trimmed.length, "row_id" to rowId, "confidence" to confidence))
+            emit(
+                "ASR_FINAL_ACCEPTED",
+                mapOf("text_len" to trimmed.length, "row_id" to rowId, "confidence" to confidence)
+            )
+
+            // ✅ NEW: callback to the app layer to dispatch into Store exactly once
+            onAccepted?.invoke()
         }
     }
 

@@ -1,0 +1,63 @@
+{
+  "puzzle_uid": "PZ-CL9-DW-B01-L1-001",
+  "library_id": "LIB-CL9",
+  "aisle_id": "AIS-DWEIGHT",
+  "book_id": "BK-CL9-DW-B01",
+  "section_id": "SEC-L1",
+  "section_code": "L1",
+  "local_puzzle_code": "L1-001",
+  "friendly_puzzle_id": "CL9-DW-B01-L1-001",
+  "title": "Puzzle L1-001",
+  "subtitle": "Classic 9x9",
+  "layout_type": "classic9x9",
+  "grid_size": 9,
+  "charset": "123456789",
+  "givens81": "075900308000008020108000000600800700050709060007001004080000601036180000012007580",
+  "solution81": "275916348943758126168234957691842735854379261327561894489523671536187492712694583",
+  "pattern_id": "PAT-CL9-0001",
+  "pattern_name": "Classic Diamond 33",
+  "clue_count": 31,
+  "symmetry_type": "vertical",
+  "is_unique": true,
+  "is_human_solvable": true,
+  "generation_method": "pattern_fill",
+  "generation_seed": 183746251,
+  "generator_version": "bookgen-v1",
+  "weight": 184,
+  "difficulty_label": "medium",
+  "difficulty_band_code": "D2",
+  "technique_count": 4,
+  "techniques_used": [
+    "singles",
+    "naked_double",
+    "pointing_single",
+    "x_wing"
+  ],
+  "technique_histogram": {
+    "singles": 22,
+    "naked_double": 3,
+    "pointing_single": 2,
+    "x_wing": 1
+  },
+  "featured_technique": "x_wing",
+  "technique_prominence_score": 0.71,
+  "app_search_tags": [
+    "medium",
+    "x_wing",
+    "4_techniques",
+    "classic9x9",
+    "diamond_pattern"
+  ],
+  "book_page_number": 12,
+  "position_in_section": 1,
+  "position_in_book": 1,
+  "print_header": {
+    "display_code": "L1-001",
+    "difficulty_label": "Medium",
+    "effort_label": "Effort 184"
+  },
+  "publication_status": "draft",
+  "reuse_policy": "book_exclusive",
+  "created_at": "2026-04-11T00:00:00Z",
+  "updated_at": "2026-04-11T00:00:00Z"
+}

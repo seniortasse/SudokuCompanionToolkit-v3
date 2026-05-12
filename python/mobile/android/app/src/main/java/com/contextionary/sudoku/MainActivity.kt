@@ -85,6 +85,9 @@ import android.os.Handler
 import android.os.Looper
 
 
+import org.json.JSONObject
+
+
 import com.contextionary.sudoku.telemetry.ConversationTelemetry
 
 
@@ -111,8 +114,9 @@ import android.graphics.Color
 
 
 
+
+
 import com.contextionary.sudoku.profile.UserProfileStore
-import com.contextionary.sudoku.profile.toSnapshot
 
 
 
@@ -159,14 +163,19 @@ import com.contextionary.sudoku.conductor.policy.CoordinatorPolicyAdapter
 
 import java.security.MessageDigest
 
-import com.contextionary.sudoku.logic.LlmToolCall
 
 import com.contextionary.sudoku.logic.GridSeverity
 import com.contextionary.sudoku.logic.computeSeverity
 
+import com.contextionary.sudoku.telemetry.Checkpoint
+
+
 
 private val manualEditLog = mutableListOf<LLMCellEditEvent>()
 private var manualEditSeq = 0
+
+
+private val androidUttSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
 
 
@@ -273,10 +282,15 @@ class MainActivity : ComponentActivity() {
     private val skipEvery = 0
 
 
+    private var lastSolveOverlayFrameSha12: String? = null
+
+
 
     private val speakLock = Any()
     @Volatile private var speakInFlight: Boolean = false
-    @Volatile private var queuedSpeak: Pair<String, Boolean>? = null
+    //@Volatile private var queuedSpeak: Pair<String, Boolean>? = null
+
+    @Volatile private var queuedSpeak: QueuedSpeak? = null
 
     private var nextSpeakReqId: Int = 1
 
@@ -453,6 +467,61 @@ B) A clear, evidence-backed explanation of the situation (or explicit uncertaint
 C) Exactly ONE concrete next step (non-vague):
    - ask_confirm_cell_rc(...) OR recommend_validate OR recommend_retake OR (if needed) ask_clarifying_question / confirm_interpretation / switch_to_tap.
 D) Never end with vague closings like “Let’s start…” without a specific next action.
+
+
+SOLVING MODE (phase=SOLVING) — CONTRACT:
+
+In SOLVING, your job is to coach the next step using technique + guided hints.
+Do NOT default to “here’s the digit” unless the user explicitly chooses a REVEAL option.
+
+HARD FORBIDDEN IN SOLVING:
+- recommend_validate (never output this tool, never talk about validating)
+
+EVIDENCE LOCK (MUST):
+- If you name a concrete technique/target/placement, it MUST be grounded in the cached solve step / CoachPlan in STATE_HEADER.
+- You MUST NOT invent placements or coordinates.
+
+TURN SHAPE (MUST):
+- Exactly ONE reply(...) tool per assistant turn.
+- Exactly ONE SOLVING CTA tool per assistant turn.
+- The CTA tool MUST be the LAST tool in the toolplan.
+- Do not leave the user with an open-ended question outside the CTA tool.
+
+ALLOWED SOLVING TOOLS (schema-legal):
+A) Evidence / step refresh
+- refresh_solve_step(reason, grid_hash12)
+
+B) Overlay controls (non-mutating)
+- show_solve_overlay(style, grid_hash12)
+- hide_solve_overlay(grid_hash12)
+
+C) SOLVING CTA tools (control tools; exactly one, and last)
+- ask_solve_preference(step_id, hint_index, hint_count, is_last_hint, options[], prompt, grid_hash12)
+  Normal North Star stage families are:
+  - SHOW_PROOF   (setup -> walkthrough / proof)
+  - LOCK_IT_IN   (confrontation -> commit / apply)
+  - NEXT_STEP    (resolution -> continue solving)
+- ask_next_step_or_deep_dive(step_id, prompt, options=[NEXT_STEP], grid_hash12)
+- ask_user_to_apply_hint(step_id, prompt, grid_hash12)  (optional coaching CTA)
+
+D) Operational (mutating grid truth)
+- apply_user_edit_rc(...) is allowed ONLY when the user chose the commit/apply path for the current step,
+  and ONLY using placements present in the cached CoachPlan (do not invent).
+
+HINT LADDER (MUST):
+- During normal solving, do NOT expose a broad multi-option tutoring menu.
+- Use the stage-locked North Star rail:
+  - setup         -> guided proof CTA
+  - confrontation -> lock-it-in CTA
+  - resolution    -> next-step CTA
+
+COMMIT / APPLY:
+- If user chose the commit/apply path for the current step:
+  - You MAY emit apply_user_edit_rc using placements from CoachPlan.reveal ONLY.
+  - After apply, you MUST end with a CTA: ask_next_step_or_deep_dive(...).
+
+
+
 
 FIRST TURN AFTER CAPTURE:
 If userMessage contains “[EVENT] grid_captured”, treat it as: grid is available now.
@@ -699,26 +768,7 @@ STYLE:
         }
     }
 
-    private data class Step2State(
-        var phase: Step2Phase = Step2Phase.IDLE,
 
-        // Your existing "mediation" switch is fine.
-        var mediationMode: Boolean = true,
-
-        // ✅ Pending confirmation (Row 1 relies on these)
-        var pendingKind: PendingKind? = null,
-        var pendingCellIdx: Int? = null,
-        var pendingDigit: Int? = null,
-
-        // Default to "unknown": we haven’t computed solvability yet.
-        var lastSolvability: Solvability = Solvability(
-            hasNoSolution = false,
-            solutionCountCapped = 0
-        ),
-
-        // Retake recommendation default
-        var lastRetakeRec: String = "none"
-    )
 
 
 
@@ -1519,7 +1569,7 @@ STYLE:
                 if (ttsPending.isNotEmpty()) {
                     val copy = ttsPending.toList()
                     ttsPending.clear()
-                    copy.forEach { speakAssistant(it) }
+                    copy.forEach { speakAssistant(message = it, listenAfter = true, turnId = null, tickId = null, source = "system_tts_pending") }
                 }
             } else {
                 Log.e("SudokuTTS", "TTS init failed")
@@ -1531,7 +1581,17 @@ STYLE:
                 PackageManager.PERMISSION_GRANTED
 
         if (hasMic) {
-            asr = SudoASR(this).apply {
+            asr = SudoASR(
+                this,
+                config = SudoASR.Config(
+                    preferOffline = false, // keep your fix for ERROR_LANGUAGE_UNAVAILABLE(13)
+
+                    // ✅ Conversational defaults: allow human “thinking time” after TTS
+                    completeSilenceMs = 8000L,
+                    possiblyCompleteSilenceMs = 6000L,
+                    minInputLengthMs = 1200L
+                )
+            ).apply {
                 prewarm()
 
                 listener = object : SudoASR.Listener {
@@ -1555,12 +1615,8 @@ STYLE:
                         Log.i("SudoASR", "END (waiting final)")
                     }
 
-                    override fun onHeard(text: String, confidence: Float?) {
-                        // Keep for backwards compatibility / optional debug.
-                        val t = text.trim()
-                        if (t.isBlank()) return
-                        logAsrHeard("HEARD", t, confidence)
-                    }
+                    // NOTE: SudoASR.Listener no longer has onHeard(...).
+// Use onPartial(...) for debug, and onFinal(...) for the real accepted utterance.
 
                     override fun onFinal(rowId: Int, text: String, confidence: Float?, reason: String) {
                         val t = text.trim()
@@ -1570,16 +1626,25 @@ STYLE:
                         }
 
                         logAsrHeard("FINAL", t, confidence)
-                        turnController.onAsrFinal(t, rowId = rowId, confidence = confidence)
 
-                        if (!USE_CONDUCTOR_ONLY) {
-                            handleUserUtterance(t) // legacy
-                        } else {
-                            // migrated path
-                            //sudoStore.dispatch(Evt.AsrFinal(rowId, t, confidence))
-                            //sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AsrFinal(text = t, confidence = confidence))
-                            sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AsrFinal(rowId = rowId, text = t, confidence = confidence))
-                        }
+                        turnController.onAsrFinal(
+                            t,
+                            rowId = rowId,
+                            confidence = confidence,
+                            onAccepted = {
+                                if (!USE_CONDUCTOR_ONLY) {
+                                    handleUserUtterance(t) // legacy
+                                } else {
+                                    sudoStore.dispatch(
+                                        com.contextionary.sudoku.conductor.Evt.AsrFinal(
+                                            rowId = rowId,
+                                            text = t,
+                                            confidence = confidence
+                                        )
+                                    )
+                                }
+                            }
+                        )
                     }
 
                     override fun onError(code: Int) {
@@ -1612,6 +1677,29 @@ STYLE:
     }
 
 
+
+    // ---- joinable parse of toolCallId ----
+// expected: tc:<turnId>:<tickId>:<policyReqSeq>:<toolplanId>:<idxOrTag>
+    private data class ToolCallMeta(
+        val turnId: Long,
+        val tickId: Int,
+        val policyReqSeq: Long,
+        val toolplanId: String
+    )
+
+    private fun parseToolCallId(toolCallId: String): ToolCallMeta? {
+        val parts = toolCallId.split(":")
+        if (parts.size < 6) return null
+        if (parts[0] != "tc") return null
+
+        val turnId = parts[1].toLongOrNull() ?: return null
+        val tickId = parts[2].toIntOrNull() ?: return null
+        val policyReqSeq = parts[3].toLongOrNull() ?: return null
+        val toolplanId = parts[4]
+        return ToolCallMeta(turnId, tickId, policyReqSeq, toolplanId)
+    }
+
+
     private fun ensureSudoStore() {
         if (::sudoStore.isInitialized) return
 
@@ -1620,95 +1708,12 @@ STYLE:
             ?.takeIf { it.isNotBlank() }
             ?: java.util.UUID.randomUUID().toString()
 
+        // Coordinator policy adapter is kept; EffectRunner calls policy.decide/continueTick2 directly.
         val policy: com.contextionary.sudoku.conductor.LlmPolicy =
             com.contextionary.sudoku.conductor.policy.CoordinatorPolicyAdapter(
                 coord = llmCoordinator,
                 systemPrompt = systemPromptText
             )
-
-        var applyEditSeq = 0L
-
-        var lastAssistantSpoken: String = ""
-
-        fun invokeNoArgIfExists(target: Any?, methodName: String): Boolean {
-            if (target == null) return false
-            return runCatching {
-                val m = target::class.java.methods.firstOrNull { it.name == methodName && it.parameterTypes.isEmpty() }
-                if (m != null) {
-                    m.isAccessible = true
-                    m.invoke(target)
-                    true
-                } else false
-            }.getOrDefault(false)
-        }
-
-        fun invokeStringArgIfExists(target: Any?, methodName: String, arg: String): Boolean {
-            if (target == null) return false
-            return runCatching {
-                val m = target::class.java.methods.firstOrNull {
-                    it.name == methodName &&
-                            it.parameterTypes.size == 1 &&
-                            it.parameterTypes[0] == String::class.java
-                }
-                if (m != null) {
-                    m.isAccessible = true
-                    m.invoke(target, arg)
-                    true
-                } else false
-            }.getOrDefault(false)
-        }
-
-        fun requestListenCompat(reason: String) {
-            runOnUiThread {
-                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                    mapOf("type" to "REQUEST_LISTEN", "reason" to reason)
-                )
-
-                if (isSpeaking || asrSuppressedByTts) {
-                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                        mapOf(
-                            "type" to "REQUEST_LISTEN_SUPPRESSED",
-                            "reason" to reason,
-                            "isSpeaking" to isSpeaking,
-                            "asrSuppressedByTts" to asrSuppressedByTts
-                        )
-                    )
-                    return@runOnUiThread
-                }
-
-                val usedTurnController =
-                    invokeStringArgIfExists(turnController, "requestListen", reason) ||
-                            invokeStringArgIfExists(turnController, "onRequestListen", reason) ||
-                            invokeStringArgIfExists(turnController, "startListening", reason)
-
-                if (usedTurnController) {
-                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                        mapOf("type" to "REQUEST_LISTEN_OK", "via" to "turnController", "reason" to reason)
-                    )
-                    return@runOnUiThread
-                }
-
-                val usedAsr =
-                    invokeNoArgIfExists(asr, "start") ||
-                            invokeNoArgIfExists(asr, "startListening") ||
-                            invokeStringArgIfExists(asr, "start", reason) ||
-                            invokeStringArgIfExists(asr, "startListening", reason)
-
-                if (usedAsr) {
-                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                        mapOf("type" to "REQUEST_LISTEN_OK", "via" to "asr", "reason" to reason)
-                    )
-                } else {
-                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                        mapOf("type" to "REQUEST_LISTEN_FAILED", "reason" to reason)
-                    )
-                    android.util.Log.w(
-                        "MainActivity",
-                        "Eff.RequestListen: could not find a start/listen method on turnController or asr"
-                    )
-                }
-            }
-        }
 
         /**
          * Single place that:
@@ -1747,6 +1752,8 @@ STYLE:
         }
 
         fun rerenderFromCanonical() {
+            // IMPORTANT: shownIsAutoCorrected drives cyan + PRINTED+BOLD via tfPrintedBold.
+            // It must be entirely cleared by the seal => achieved by clearing uiAuto/uiManual.
             val boldCorrected = BooleanArray(81) { i -> uiAuto[i] || uiManual[i] }
 
             resultsSudokuView?.setUiData(
@@ -1759,597 +1766,120 @@ STYLE:
             )
         }
 
-        val runner = object : com.contextionary.sudoku.conductor.EffectRunner {
+        // -------------------------
+        // Phase 1/1.5 extraction: AndroidEffectRunner
+        // -------------------------
+        val runner = com.contextionary.sudoku.conversation.runtime.AndroidEffectRunner(
+            sid = sid,
+            scope = lifecycleScope,
+            policy = policy,
+            host = object : com.contextionary.sudoku.conversation.runtime.AndroidEffectRunner.Host {
 
-            override fun run(
-                effect: com.contextionary.sudoku.conductor.Eff,
-                emit: (com.contextionary.sudoku.conductor.Evt) -> Unit
-            ) {
-                try {
-                    when (effect) {
+                // --- UI thread + message + speech ---
+                override fun runOnUiThread(block: () -> Unit) {
+                    this@MainActivity.runOnUiThread(block)
+                }
 
-                        is com.contextionary.sudoku.conductor.Eff.UpdateUiMessage -> {
-                            runOnUiThread {
-                                runCatching { updateSudoMessage(effect.text) }
-                                    .onFailure { android.util.Log.w("MainActivity", "UpdateUiMessage failed", it) }
-                            }
-                        }
+                override fun updateSudoMessage(text: String) {
+                    this@MainActivity.updateSudoMessage(text)
+                }
 
-                        is com.contextionary.sudoku.conductor.Eff.Speak -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "Speak",
-                                    "text_len" to effect.text.length,
-                                    "listen_after" to effect.listenAfter
-                                )
-                            )
+                override fun speakAssistant(
+                    message: String,
+                    listenAfter: Boolean,
+                    turnId: Long?,
+                    tickId: Int?,
+                    source: String
+                ) {
+                    this@MainActivity.speakAssistant(
+                        message = message,
+                        listenAfter = listenAfter,
+                        turnId = turnId,
+                        tickId = tickId,
+                        source = source
+                    )
+                }
 
-                            lastAssistantSpoken = effect.text
+                // --- ASR / TurnController compat ---
+                override fun requestListenCompat(reason: String) {
+                    this@MainActivity.requestListenCompat(reason)
+                }
 
-                            runOnUiThread {
-                                runCatching { speakAssistant(effect.text, listenAfter = effect.listenAfter) }
-                                    .onFailure { android.util.Log.w("MainActivity", "Speak failed", it) }
-                            }
-                        }
-
-                        // ✅ NEW: Focus highlight (pulsing yellow border)
-                        is com.contextionary.sudoku.conductor.Eff.SetFocusCell -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "SetFocusCell",
-                                    "cellIndex" to (effect.cellIndex ?: -1),
-                                    "reason" to (effect.reason ?: "")
-                                )
-                            )
-                            runOnUiThread {
-                                runCatching {
-                                    val v = resultsSudokuView ?: return@runCatching
-                                    val idx = effect.cellIndex
-                                    if (idx != null && idx in 0..80) {
-                                        v.startConfirmationPulse(idx)
-                                    } else {
-                                        v.stopConfirmationPulse()
-                                    }
-                                }.onFailure { t ->
-                                    android.util.Log.w("MainActivity", "SetFocusCell failed", t)
-                                }
-                            }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.RequestListen -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "RequestListen",
-                                    "reason" to effect.reason
-                                )
-                            )
-                            android.util.Log.i("MainActivity", "Eff.RequestListen(reason=${effect.reason})")
-                            requestListenCompat(reason = "eff:${effect.reason}")
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.StopAsr -> {
-                            android.util.Log.i("MainActivity", "Eff.StopAsr(reason=${effect.reason})")
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf("type" to "EFF_STOP_ASR", "reason" to effect.reason)
-                            )
-
-                            runCatching { asr?.stop() }
-                                .recoverCatching {
-                                    invokeNoArgIfExists(asr, "stop")
-                                    invokeNoArgIfExists(asr, "cancel")
-                                }
-                                .onFailure { android.util.Log.w("MainActivity", "StopAsr failed", it) }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.ApplyCellEdit -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "ApplyCellEdit",
-                                    "cellIndex" to effect.cellIndex,
-                                    "digit" to effect.digit,
-                                    "source" to effect.source
-                                )
-                            )
-
-                            val seq = ++applyEditSeq
-                            val idx = effect.cellIndex
-                            val d = effect.digit
-
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "APPLY_CELL_EDIT_BEGIN",
-                                    "edit_seq" to seq,
-                                    "cellIndex" to idx,
-                                    "digit" to d,
-                                    "source" to effect.source
-                                )
-                            )
-
-                            runOnUiThread {
-                                runCatching {
-                                    if (idx !in 0..80 || d !in 0..9) return@runCatching
-                                    if (resultsSudokuView == null || resultsDigits == null || resultsConfidences == null) {
-                                        android.util.Log.w("MainActivity", "ApplyCellEdit ignored: results UI not ready")
-                                        return@runCatching
-                                    }
-
-                                    val old = uiDigits[idx]
-                                    uiDigits[idx] = d
-                                    uiConfs[idx] = 1.0f
-
-                                    if (d == 0) {
-                                        uiGiven[idx] = false
-                                        uiSol[idx] = false
-                                    }
-
-                                    uiCand[idx] = 0
-
-                                    uiAuto[idx] = false
-                                    uiManual[idx] = true
-
-                                    System.arraycopy(uiDigits, 0, resultsDigits!!, 0, 81)
-                                    System.arraycopy(uiConfs, 0, resultsConfidences!!, 0, 81)
-
-                                    rerenderFromCanonical()
-                                    emitSnapshotOnce(emit, reason = "apply_cell_edit idx=$idx", seq = seq)
-
-                                    if (old != d) {
-                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                            mapOf(
-                                                "type" to "APPLY_CELL_EDIT_APPLIED",
-                                                "edit_seq" to seq,
-                                                "cellIndex" to idx,
-                                                "from" to old,
-                                                "to" to d,
-                                                "source" to effect.source
-                                            )
-                                        )
-                                    }
-                                }.onFailure { t ->
-                                    android.util.Log.w("MainActivity", "ApplyCellEdit failed", t)
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "APPLY_CELL_EDIT_CRASH",
-                                            "edit_seq" to seq,
-                                            "err" to (t.message ?: t.toString())
-                                        )
-                                    )
-                                }
-                            }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.ConfirmCellValue -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "ConfirmCellValue",
-                                    "cellIndex" to effect.cellIndex,
-                                    "digit" to effect.digit,
-                                    "source" to effect.source,
-                                    "changed" to effect.changed
-                                )
-                            )
-
-                            val seq = ++applyEditSeq
-                            val idx = effect.cellIndex
-                            val d = effect.digit
-
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "CONFIRM_CELL_VALUE_BEGIN",
-                                    "edit_seq" to seq,
-                                    "cellIndex" to idx,
-                                    "digit" to d,
-                                    "source" to effect.source,
-                                    "changed" to effect.changed
-                                )
-                            )
-
-                            runOnUiThread {
-                                runCatching {
-                                    if (idx !in 0..80 || d !in 0..9) return@runCatching
-                                    if (resultsSudokuView == null) return@runCatching
-
-                                    uiConfirmed[idx] = true
-
-                                    emitSnapshotOnce(
-                                        emit,
-                                        reason = "confirm_cell_value idx=$idx changed=${effect.changed}",
-                                        seq = seq
-                                    )
-
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "CONFIRM_CELL_VALUE_APPLIED",
-                                            "edit_seq" to seq,
-                                            "cellIndex" to idx,
-                                            "digit" to d,
-                                            "changed" to effect.changed
-                                        )
-                                    )
-                                }.onFailure { t ->
-                                    android.util.Log.w("MainActivity", "ConfirmCellValue failed", t)
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "CONFIRM_CELL_VALUE_CRASH",
-                                            "edit_seq" to seq,
-                                            "err" to (t.message ?: t.toString())
-                                        )
-                                    )
-                                }
-                            }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.ApplyCellClassify -> {
-                            val seq = ++applyEditSeq
-                            val idx = effect.cellIndex
-
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "APPLY_CELL_CLASSIFY_BEGIN",
-                                    "edit_seq" to seq,
-                                    "cellIndex" to idx,
-                                    "cellClass" to effect.cellClass.name,
-                                    "source" to effect.source
-                                )
-                            )
-
-                            runOnUiThread {
-                                runCatching {
-                                    if (idx !in 0..80) return@runCatching
-                                    if (resultsSudokuView == null) return@runCatching
-
-                                    when (effect.cellClass) {
-                                        com.contextionary.sudoku.conductor.CellClass.GIVEN -> {
-                                            uiGiven[idx] = true
-                                            uiSol[idx] = false
-                                        }
-                                        com.contextionary.sudoku.conductor.CellClass.SOLUTION -> {
-                                            uiGiven[idx] = false
-                                            uiSol[idx] = true
-                                        }
-                                        com.contextionary.sudoku.conductor.CellClass.EMPTY -> {
-                                            uiGiven[idx] = false
-                                            uiSol[idx] = false
-                                            uiDigits[idx] = 0
-                                            uiConfs[idx] = 1.0f
-                                            uiCand[idx] = 0
-                                            uiAuto[idx] = false
-                                            uiManual[idx] = true
-                                        }
-                                    }
-
-                                    rerenderFromCanonical()
-                                    emitSnapshotOnce(emit, reason = "apply_cell_classify idx=$idx", seq = seq)
-                                }.onFailure { t ->
-                                    android.util.Log.w("MainActivity", "ApplyCellClassify failed", t)
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "APPLY_CELL_CLASSIFY_CRASH",
-                                            "edit_seq" to seq,
-                                            "err" to (t.message ?: t.toString())
-                                        )
-                                    )
-                                }
-                            }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.ApplyCellCandidatesMask -> {
-                            val seq = ++applyEditSeq
-                            val idx = effect.cellIndex
-                            val mask = effect.candidateMask
-
-                            runOnUiThread {
-                                runCatching {
-                                    if (idx !in 0..80) return@runCatching
-                                    uiCand[idx] = mask.coerceIn(0, (1 shl 9) - 1)
-                                    rerenderFromCanonical()
-                                    emitSnapshotOnce(emit, reason = "apply_candidates idx=$idx", seq = seq)
-                                }.onFailure { t ->
-                                    android.util.Log.w("MainActivity", "ApplyCellCandidatesMask failed", t)
-                                }
-                            }
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.CallPolicy -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "CallPolicy",
-                                    "reason" to effect.reason,
-                                    "turnId" to effect.turnId,
-                                    "mode" to (effect.mode?.name ?: "null"),
-                                    "userText_preview" to effect.userText.take(120)
-                                )
-                            )
-                            android.util.Log.w("MainActivity", "Eff.CallPolicy should be handled by SudoStore; ignoring.")
-                        }
-
-                        is com.contextionary.sudoku.conductor.Eff.CallPolicyContinuationTick2 -> {
-                            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                mapOf(
-                                    "type" to "EFFECT_RUN",
-                                    "effect" to "CallPolicyContinuationTick2",
-                                    "tool_results_n" to effect.toolResults.size,
-                                    "mode" to effect.mode.name,
-                                    "reason" to effect.reason,
-                                    "turnId" to effect.turnId
-                                )
-                            )
-
-                            lifecycleScope.launch {
-                                val t0 = android.os.SystemClock.elapsedRealtime()
-
-                                // ----------------------------
-                                // Minimal helpers (local-safe)
-                                // ----------------------------
-                                fun anyToString(x: Any?): String? = (x as? String)?.trim()
-
-                                fun argsToJsonObject(args: Map<String, Any?>): org.json.JSONObject {
-                                    val o = org.json.JSONObject()
-                                    for ((k, v) in args) {
-                                        when (v) {
-                                            null -> o.put(k, org.json.JSONObject.NULL)
-                                            is Boolean, is Int, is Long, is Double, is Float, is String -> o.put(k, v)
-                                            is Number -> o.put(k, v.toDouble())
-                                            is Map<*, *> -> {
-                                                @Suppress("UNCHECKED_CAST")
-                                                o.put(k, argsToJsonObject(v as Map<String, Any?>))
-                                            }
-                                            is List<*> -> {
-                                                val arr = org.json.JSONArray()
-                                                for (item in v) {
-                                                    when (item) {
-                                                        null -> arr.put(org.json.JSONObject.NULL)
-                                                        is Boolean, is Int, is Long, is Double, is Float, is String -> arr.put(item)
-                                                        is Number -> arr.put(item.toDouble())
-                                                        is Map<*, *> -> {
-                                                            @Suppress("UNCHECKED_CAST")
-                                                            arr.put(argsToJsonObject(item as Map<String, Any?>))
-                                                        }
-                                                        else -> arr.put(item.toString())
-                                                    }
-                                                }
-                                                o.put(k, arr)
-                                            }
-                                            else -> o.put(k, v.toString())
-                                        }
-                                    }
-                                    return o
-                                }
-
-                                // -----------------------------------------
-                                // ✅ Robust ToolCall factory via reflection
-                                // -----------------------------------------
-                                fun toConductorToolCall(wireName: String, args: Map<String, Any?>): com.contextionary.sudoku.conductor.ToolCall? {
-                                    val tcClass = com.contextionary.sudoku.conductor.ToolCall::class.java
-                                    val argsJson = argsToJsonObject(args)
-
-                                    // Candidate factory method names you likely have somewhere (ToolCall or ToolCall.Companion)
-                                    val methodNames = listOf(
-                                        "fromWire", "fromNameArgs", "from", "decode", "parse", "fromJson", "fromJSONObject", "fromMap"
-                                    )
-
-                                    // 1) Try Companion.INSTANCE methods first (most Kotlin patterns)
-                                    try {
-                                        val companion = tcClass.declaredClasses.firstOrNull { it.simpleName == "Companion" }
-                                        if (companion != null) {
-                                            val instField = companion.getDeclaredField("INSTANCE")
-                                            instField.isAccessible = true
-                                            val inst = instField.get(null)
-
-                                            // Try (String, JSONObject)
-                                            for (mn in methodNames) {
-                                                val m = companion.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 2 }
-                                                if (m != null) {
-                                                    val p0 = m.parameterTypes[0]
-                                                    val p1 = m.parameterTypes[1]
-                                                    val out = when {
-                                                        p0 == String::class.java && p1 == org.json.JSONObject::class.java ->
-                                                            m.invoke(inst, wireName, argsJson)
-                                                        p0 == String::class.java && Map::class.java.isAssignableFrom(p1) ->
-                                                            m.invoke(inst, wireName, args)
-                                                        else -> null
-                                                    }
-                                                    if (out is com.contextionary.sudoku.conductor.ToolCall) return out
-                                                }
-                                            }
-
-                                            // Try (JSONObject) where JSON contains name+args
-                                            val packed = org.json.JSONObject()
-                                                .put("name", wireName)
-                                                .put("args", argsJson)
-
-                                            for (mn in methodNames) {
-                                                val m = companion.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && it.parameterTypes[0] == org.json.JSONObject::class.java }
-                                                if (m != null) {
-                                                    val out = m.invoke(inst, packed)
-                                                    if (out is com.contextionary.sudoku.conductor.ToolCall) return out
-                                                }
-                                            }
-                                        }
-                                    } catch (_: Throwable) {
-                                        // ignore; we’ll try static methods next
-                                    }
-
-                                    // 2) Try static methods on ToolCall itself
-                                    try {
-                                        for (mn in methodNames) {
-                                            val m2 = tcClass.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 2 }
-                                            if (m2 != null) {
-                                                val p0 = m2.parameterTypes[0]
-                                                val p1 = m2.parameterTypes[1]
-                                                val out = when {
-                                                    p0 == String::class.java && p1 == org.json.JSONObject::class.java ->
-                                                        m2.invoke(null, wireName, argsJson)
-                                                    p0 == String::class.java && Map::class.java.isAssignableFrom(p1) ->
-                                                        m2.invoke(null, wireName, args)
-                                                    else -> null
-                                                }
-                                                if (out is com.contextionary.sudoku.conductor.ToolCall) return out
-                                            }
-                                        }
-
-                                        // Try static (JSONObject) packed
-                                        val packed = org.json.JSONObject()
-                                            .put("name", wireName)
-                                            .put("args", argsJson)
-
-                                        for (mn in methodNames) {
-                                            val m1 = tcClass.methods.firstOrNull { it.name == mn && it.parameterTypes.size == 1 && it.parameterTypes[0] == org.json.JSONObject::class.java }
-                                            if (m1 != null) {
-                                                val out = m1.invoke(null, packed)
-                                                if (out is com.contextionary.sudoku.conductor.ToolCall) return out
-                                            }
-                                        }
-                                    } catch (_: Throwable) {
-                                        // ignore
-                                    }
-
-                                    // Nothing matched
-                                    return null
-                                }
-
-                                try {
-                                    // Build fresh grid snapshot AFTER tools (overlay is canonical now)
-                                    val gs = buildGridStateFromOverlay()
-                                    if (gs == null) {
-                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                            mapOf(
-                                                "type" to "POLICY_CONTINUATION_ERR",
-                                                "err" to "grid_state_null",
-                                                "turnId" to effect.turnId
-                                            )
-                                        )
-                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
-                                        return@launch
-                                    }
-                                    val llmGridAfter = buildLLMGridStateFromOverlay(gs)
-
-                                    val ack = lastAssistantSpoken.trim()
-
-                                    // ✅ Coordinator returns logic.LlmToolCall
-                                    val llmTools: List<com.contextionary.sudoku.logic.LlmToolCall> = runCatching {
-                                        llmCoordinator.sendToLLMToolsContinuationTick2(
-                                            sessionId = sid,
-                                            systemPrompt = systemPromptText,
-                                            gridStateAfterTools = llmGridAfter,
-                                            llm1ReplyText = ack,
-                                            toolResults = effect.toolResults,
-                                            stateHeader = effect.stateHeader,
-                                            continuationUserMessage = "Continue.",
-                                            turnId = effect.turnId
-                                        )
-                                    }.getOrElse { callErr ->
-                                        val dt = android.os.SystemClock.elapsedRealtime() - t0
-                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                            mapOf(
-                                                "type" to "POLICY_CONTINUATION_CRASH",
-                                                "ms" to dt,
-                                                "turnId" to effect.turnId,
-                                                "err" to (callErr.message ?: callErr.toString())
-                                            )
-                                        )
-                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
-                                        return@launch
-                                    }
-
-                                    val dt = android.os.SystemClock.elapsedRealtime() - t0
-
-                                    // Extract reply text (wire-name is almost certainly "reply")
-                                    val replyText = llmTools
-                                        .firstOrNull { it.name.equals("reply", ignoreCase = true) }
-                                        ?.args
-                                        ?.get("text")
-                                        ?.toString()
-                                        ?.trim()
-                                        .orEmpty()
-
-                                    if (replyText.isBlank()) {
-                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                            mapOf(
-                                                "type" to "POLICY_CONTINUATION_EMPTY",
-                                                "ms" to dt,
-                                                "turnId" to effect.turnId
-                                            )
-                                        )
-                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
-                                        return@launch
-                                    }
-
-                                    // Convert to conductor ToolCall using existing factory (via reflection)
-                                    val conductorTools = llmTools.mapNotNull { tc ->
-                                        toConductorToolCall(tc.name, tc.args)
-                                    }
-
-                                    if (conductorTools.isEmpty()) {
-                                        com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                            mapOf(
-                                                "type" to "POLICY_CONTINUATION_NO_TOOLCALL_FACTORY_MATCH",
-                                                "ms" to dt,
-                                                "turnId" to effect.turnId,
-                                                "llm_tool_names" to llmTools.map { it.name }
-                                            )
-                                        )
-                                        emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
-                                        return@launch
-                                    }
-
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "POLICY_CONTINUATION_OK",
-                                            "ms" to dt,
-                                            "turnId" to effect.turnId,
-                                            "reply_len" to replyText.length,
-                                            "tool_n" to conductorTools.size,
-                                            // ToolCall may not expose .name; log the LLM wire names instead:
-                                            "tool_names" to llmTools.map { it.name }
-                                        )
-                                    )
-
-                                    // ✅ Most important: emit tools so Store/Conductor continues normally
-                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyTools(conductorTools))
-
-                                    // ✅ Optional compatibility event (keep if your store expects it)
-                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationReply(replyText))
-
-                                } catch (t: Throwable) {
-                                    val dt = android.os.SystemClock.elapsedRealtime() - t0
-                                    android.util.Log.e("MainActivity", "Tick2 crashed (dt=${dt}ms)", t)
-                                    com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
-                                        mapOf(
-                                            "type" to "POLICY_CONTINUATION_CRASH",
-                                            "ms" to dt,
-                                            "turnId" to effect.turnId,
-                                            "err" to (t.message ?: t.toString())
-                                        )
-                                    )
-                                    emit(com.contextionary.sudoku.conductor.Evt.PolicyContinuationFailed)
-                                }
-                            }
-                        }
-
-                        else -> {
-                            android.util.Log.w("MainActivity", "Unhandled effect: ${effect::class.java.simpleName}")
-                        }
+                override fun stopAsrCompat(reason: String) {
+                    runCatching { this@MainActivity.asr?.cancelListening("stopAsrCompat:$reason") }.onFailure {
+                        android.util.Log.w("MainActivity", "stopAsrCompat failed ($reason)", it)
                     }
-                } catch (t: Throwable) {
-                    android.util.Log.e("MainActivity", "EffectRunner.run crashed", t)
+                }
+
+                // --- Focus + overlay ---
+                override fun onSetFocusCellPulse(cellIndex: Int?) {
+                    val v = this@MainActivity.resultsSudokuView ?: return
+                    if (cellIndex != null && cellIndex in 0..80) v.startConfirmationPulse(cellIndex)
+                    else v.stopConfirmationPulse()
+                }
+
+                override fun renderSolveOverlayV0(frameJson: String) {
+                    this@MainActivity.renderSolveOverlayV0(frameJson)
+                }
+
+                // ✅ NEW Host API (Phase 1.5)
+                override fun getResultsSudokuViewOrNull(): Any? {
+                    return this@MainActivity.resultsSudokuView
+                }
+
+                override fun stopConfirmationPulseIfAny() {
+                    runCatching { this@MainActivity.resultsSudokuView?.stopConfirmationPulse() }
+                }
+
+                override fun rerenderFromCanonical() {
+                    rerenderFromCanonical()
+                }
+
+                // --- Snapshot builder hooks ---
+                override fun buildGridStateFromOverlayOrNull(): Any? {
+                    return this@MainActivity.buildGridStateFromOverlay()
+                }
+
+                override fun buildLLMGridStateFromOverlayOrNull(gridState: Any): Any? {
+                    @Suppress("UNCHECKED_CAST")
+                    return this@MainActivity.buildLLMGridStateFromOverlay(
+                        gridState as com.contextionary.sudoku.logic.GridState
+                    )
+                }
+
+                override fun emitGridSnapshotUpdated(llmGridState: Any, reason: String, editSeq: Long) {
+                    @Suppress("UNCHECKED_CAST")
+                    val llm = llmGridState as com.contextionary.sudoku.logic.LLMGridState
+                    val snap = com.contextionary.sudoku.conductor.GridSnapshot(llm = llm)
+                    this@MainActivity.sudoStore.dispatch(
+                        com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(snap)
+                    )
+                }
+
+                // --- Canonical UI arrays ---
+                override val uiDigits: IntArray get() = this@MainActivity.uiDigits
+                override val uiConfs: FloatArray get() = this@MainActivity.uiConfs
+                override val uiGiven: BooleanArray get() = this@MainActivity.uiGiven
+                override val uiSol: BooleanArray get() = this@MainActivity.uiSol
+                override val uiCand: IntArray get() = this@MainActivity.uiCand
+                override val uiAuto: BooleanArray get() = this@MainActivity.uiAuto
+                override val uiManual: BooleanArray get() = this@MainActivity.uiManual
+
+                // ✅ NEW arrays / backing buffers (Phase 1.5)
+                override val uiConfirmed: BooleanArray? get() = this@MainActivity.uiConfirmed
+                override val resultsDigitsOrNull: IntArray? get() = this@MainActivity.resultsDigits
+                override val resultsConfidencesOrNull: FloatArray? get() = this@MainActivity.resultsConfidences
+
+                // ✅ NEW: persistence hook for confirmations (Phase 1.5)
+                override fun persistConfirmedIfPossible(cellIndex: Int, confirmed: Boolean) {
+                    runCatching {
+                        // Patch 3.2 behavior: persist confirmation to SessionStore truth
+                        SessionStore.ensureTruthInitializedFromCanonicalIfPossible()
+                        SessionStore.setConfirmed(cellIndex, confirmed)
+                    }
                 }
             }
-
-            override fun applyTools(
-                tools: List<com.contextionary.sudoku.conductor.ToolCall>,
-                emit: (com.contextionary.sudoku.conductor.Evt) -> Unit
-            ) {
-                runCatching { emit(com.contextionary.sudoku.conductor.Evt.PolicyTools(tools)) }
-                    .onFailure { android.util.Log.e("MainActivity", "applyTools crashed", it) }
-            }
-        }
+        )
 
         val conductor = com.contextionary.sudoku.conductor.SudoConductor()
         val initial = com.contextionary.sudoku.conductor.SudoState(
@@ -2360,7 +1890,6 @@ STYLE:
         sudoStore = com.contextionary.sudoku.conductor.SudoStore(
             initial = initial,
             conductor = conductor,
-            policy = policy,
             effects = runner,
             scope = lifecycleScope
         )
@@ -2370,6 +1899,133 @@ STYLE:
         sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.AppStarted())
         sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.CameraActive)
     }
+
+
+
+    private fun requestListenCompat(reason: String) {
+        runOnUiThread {
+            com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                mapOf("type" to "REQUEST_LISTEN", "reason" to reason)
+            )
+
+            if (isSpeaking || asrSuppressedByTts) {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "REQUEST_LISTEN_SUPPRESSED",
+                        "reason" to reason,
+                        "isSpeaking" to isSpeaking,
+                        "asrSuppressedByTts" to asrSuppressedByTts
+                    )
+                )
+                return@runOnUiThread
+            }
+
+            val usedTurnController =
+                invokeStringArgIfExists(turnController, "requestListen", reason) ||
+                        invokeStringArgIfExists(turnController, "onRequestListen", reason) ||
+                        invokeStringArgIfExists(turnController, "startListening", reason)
+
+            if (usedTurnController) {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf("type" to "REQUEST_LISTEN_OK", "via" to "turnController", "reason" to reason)
+                )
+                return@runOnUiThread
+            }
+
+
+
+            // ✅ In conductor-only mode, ASR should be started ONLY via TurnController.
+// Direct ASR starts can create racey duplicate sessions/finals.
+            if (USE_CONDUCTOR_ONLY) {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "REQUEST_LISTEN_FAILED",
+                        "reason" to reason,
+                        "note" to "blocked_direct_asr_start_in_conductor_only_mode"
+                    )
+                )
+                Log.w("MainActivity", "REQUEST_LISTEN blocked: conductor-only requires TurnController")
+                return@runOnUiThread
+            }
+
+// Legacy fallback allowed only when not conductor-only
+            val usedAsr =
+                invokeNoArgIfExists(asr, "start") ||
+                        invokeNoArgIfExists(asr, "startListening") ||
+                        invokeStringArgIfExists(asr, "start", reason) ||
+                        invokeStringArgIfExists(asr, "startListening", reason)
+
+
+
+
+            if (usedAsr) {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf("type" to "REQUEST_LISTEN_OK", "via" to "asr", "reason" to reason)
+                )
+            } else {
+                com.contextionary.sudoku.telemetry.ConversationTelemetry.emit(
+                    mapOf("type" to "REQUEST_LISTEN_FAILED", "reason" to reason)
+                )
+                android.util.Log.w(
+                    "MainActivity",
+                    "Eff.RequestListen: could not find a start/listen method on turnController or asr"
+                )
+            }
+        }
+    }
+
+
+    private fun invokeNoArgIfExists(target: Any?, methodName: String): Boolean {
+        if (target == null) return false
+        return runCatching {
+            val m = target::class.java.methods.firstOrNull { it.name == methodName && it.parameterTypes.isEmpty() }
+            if (m != null) {
+                m.isAccessible = true
+                m.invoke(target)
+                true
+            } else false
+        }.getOrDefault(false)
+    }
+
+    private fun invokeStringArgIfExists(target: Any?, methodName: String, arg: String): Boolean {
+        if (target == null) return false
+        return runCatching {
+            val m = target::class.java.methods.firstOrNull {
+                it.name == methodName &&
+                        it.parameterTypes.size == 1 &&
+                        it.parameterTypes[0] == String::class.java
+            }
+            if (m != null) {
+                m.isAccessible = true
+                m.invoke(target, arg)
+                true
+            } else false
+        }.getOrDefault(false)
+    }
+
+
+    private fun renderSolveOverlayV0(frameJson: String) {
+        val view = resultsSudokuView ?: return
+
+        // Phase 6: authoritative solving overlay rendering.
+        // Do NOT collapse the conductor-authored overlay JSON into a pulse-only affordance.
+        // SudokuResultView already knows how to render highlights/focus/reveal from the full frame JSON.
+        view.setSolveOverlayFromJson(frameJson)
+    }
+
+
+    private fun sha12(s: String): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(s.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) sb.append(String.format("%02x", b))
+        return sb.toString().take(12)
+    }
+
+
+
+
+
 
 
     private fun runConversationRecoveryBeforeVoiceLoop() {
@@ -2491,7 +2147,7 @@ STYLE:
         runCatching { mainHandler.removeCallbacksAndMessages(null) }
 
         // 1) ASR lifecycle (owned by SudoASR, but nullable)
-        runCatching { withAsr { it.stop() } }
+        runCatching { withAsr { it.cancelListening("activity_destroy") } }
         runCatching { voiceBars?.stopSpeaking(source = "asr_rms") }
         runCatching { withAsr { it.release() } }
         asr = null
@@ -2612,7 +2268,10 @@ STYLE:
                         runCatching { asr?.setSpeaking(false) }
 
                         // Conductor completion signal
-                        turnController.onTtsFinished()
+                        turnController.onTtsFinished(
+                            listenAfter = false,
+                            finishReason = "azure_onStopped:$source"
+                        )
 
                         ConversationTelemetry.emit(
                             mapOf(
@@ -2657,9 +2316,25 @@ STYLE:
     }
 
 
+    // Holds one pending speak request when we’re already speaking.
+    private data class QueuedSpeak(
+        val text: String,
+        val listenAfter: Boolean,
+        val turnId: Long? = null,
+        val tickId: Int? = null,
+        val source: String = "policy_reply"
+    )
+
+
     // Speak Sudo's message (queued). Milestone 7 will set Locale per utterance.
     // Speak, and optionally auto-listen as soon as speech ends (Azure preferred).
-    private fun speakAssistant(message: String, listenAfter: Boolean = true) {
+    private fun speakAssistant(
+        message: String,
+        listenAfter: Boolean = true,
+        turnId: Long? = null,
+        tickId: Int? = null,
+        source: String = "policy_reply"
+    ) {
 
         fun shortPreview(s: String, n: Int = 90): String {
             val oneLine = s.replace("\n", " ").trim()
@@ -2671,6 +2346,54 @@ STYLE:
             val hit = st.firstOrNull { it.className.contains("MainActivity") && it.methodName != "speakAssistant" }
             return if (hit != null) "${hit.methodName}:${hit.lineNumber}" else "unknown"
         }
+
+        // --- Reflection helpers (same style as your compat helpers) ---
+        fun resolveLongNoArg(target: Any?, methodNames: List<String>): Long? {
+            if (target == null) return null
+            return runCatching {
+                for (name in methodNames) {
+                    val m = target::class.java.methods.firstOrNull {
+                        it.name == name && it.parameterTypes.isEmpty()
+                    } ?: continue
+                    m.isAccessible = true
+                    val v = m.invoke(target)
+                    when (v) {
+                        is Long -> return v
+                        is Int -> return v.toLong()
+                    }
+                }
+                null
+            }.getOrNull()
+        }
+
+        fun resolveIntNoArg(target: Any?, methodNames: List<String>): Int? {
+            if (target == null) return null
+            return runCatching {
+                for (name in methodNames) {
+                    val m = target::class.java.methods.firstOrNull {
+                        it.name == name && it.parameterTypes.isEmpty()
+                    } ?: continue
+                    m.isAccessible = true
+                    val v = m.invoke(target)
+                    when (v) {
+                        is Int -> return v
+                        is Long -> return v.toInt()
+                    }
+                }
+                null
+            }.getOrNull()
+        }
+
+        // ✅ Resolve turn/tick if caller didn’t pass them (prevents null COMPOSED + turn--1 replyIds)
+        val resolvedTurnId: Long? = turnId ?: resolveLongNoArg(
+            turnController,
+            listOf("currentTurnId", "getCurrentTurnId", "peekTurnId", "getTurnId")
+        )
+
+        val resolvedTickId: Int? = tickId ?: resolveIntNoArg(
+            turnController,
+            listOf("currentTickId", "getCurrentTickId", "peekTickId", "getTickId")
+        )
 
         // Reflection helper: request listen via TurnController/ASR if method name differs.
         fun invokeNoArgIfExists(target: Any?, methodName: String): Boolean {
@@ -2702,8 +2425,6 @@ STYLE:
         }
 
         fun requestListenCompat(reason: String) {
-            // Don’t fight the conductor; this is a compatibility fallback.
-            // It should be idempotent if your TurnController ignores duplicate requests.
             runOnUiThread {
                 if (isSpeaking || asrSuppressedByTts) {
                     ConversationTelemetry.emit(
@@ -2745,16 +2466,25 @@ STYLE:
         // -------- Single-flight: never overlap TTS --------
         synchronized(speakLock) {
             if (speakInFlight) {
-                // Keep only the latest message (last-write-wins)
-                queuedSpeak = Pair(message, listenAfter)
+                queuedSpeak = QueuedSpeak(
+                    text = message,
+                    listenAfter = listenAfter,
+                    turnId = resolvedTurnId,
+                    tickId = resolvedTickId,
+                    source = source
+                )
+
                 ConversationTelemetry.emit(
                     mapOf(
                         "type" to "TTS_QUEUED_WHILE_SPEAKING",
                         "len" to message.length,
-                        "hash" to message.hashCode(),
+                        "reply_text_sha256" to ConversationTelemetry.sha256Hex(message),
                         "preview" to shortPreview(message),
                         "listenAfter" to listenAfter,
-                        "caller" to callerHint()
+                        "caller" to callerHint(),
+                        "turn_id" to resolvedTurnId,
+                        "tick_id" to resolvedTickId,
+                        "source" to source
                     )
                 )
                 return
@@ -2762,28 +2492,69 @@ STYLE:
             speakInFlight = true
         }
 
+        // ✅ CP7-REQ — right when we request TTS (we committed to speaking; not queued)
+        runCatching {
+            Checkpoint.cp(
+                tag = "CP7-REQ",
+                sessionId = null,
+                turnSeq = null,
+                turnId = resolvedTurnId,
+                tickId = resolvedTickId,
+                correlationId = null,
+                policyReqSeq = null,
+                toolplanId = null,
+                modelCallId = null,
+                kv = mapOf(
+                    "where" to "MainActivity.speakAssistant",
+                    "note" to "tts_request_committed",
+                    "text_len" to message.length,
+                    "listen_after" to listenAfter,
+                    "caller" to callerHint(),
+                    "source" to source
+                )
+            )
+        }
+
+        val replySha = ConversationTelemetry.sha256Hex(message)
+
         ConversationTelemetry.emit(
             mapOf(
                 "type" to "TTS_REQUEST",
                 "len" to message.length,
-                "hash" to message.hashCode(),
+                "reply_text_sha256" to replySha,
                 "preview" to shortPreview(message),
                 "listenAfter" to listenAfter,
                 "caller" to callerHint(),
-                "azure_ready" to (isAzureConfigured() && azureTts?.isReady() == true)
+                "azure_ready" to (isAzureConfigured() && azureTts?.isReady() == true),
+                "turn_id" to resolvedTurnId,
+                "tick_id" to resolvedTickId,
+                "source" to source
             )
         )
 
         fun releaseAndMaybeDrainQueue() {
-            val next: Pair<String, Boolean>?
+            val next: QueuedSpeak?
             synchronized(speakLock) {
                 speakInFlight = false
                 next = queuedSpeak
                 queuedSpeak = null
             }
             if (next != null) {
-                ConversationTelemetry.emit(mapOf("type" to "TTS_DEQUEUED_NEXT"))
-                speakAssistant(next.first, next.second)
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_DEQUEUED_NEXT",
+                        "turn_id" to next.turnId,
+                        "tick_id" to next.tickId,
+                        "source" to next.source
+                    )
+                )
+                speakAssistant(
+                    message = next.text,
+                    listenAfter = next.listenAfter,
+                    turnId = next.turnId,
+                    tickId = next.tickId,
+                    source = next.source
+                )
             }
         }
 
@@ -2796,8 +2567,37 @@ STYLE:
             ConversationTelemetry.emitTurnPair(rowId = replyToRowId, speakReqId = speakReqId)
         }
 
-        // Log exactly what Sudo is about to say (before any engine starts)
-        logSudoSay(message, speakReqId = speakReqId, replyToRowId = replyToRowId)
+        // ✅ Build replyId using resolved turn id (no more -1)
+        val replyId = "turn-${resolvedTurnId ?: -1}-sr-$speakReqId"
+        val replySha12 = replySha.take(12)
+
+        // ✅ 2B: Emit ASSISTANT_REPLY_COMPOSED before calling any TTS engine
+        runCatching {
+            ConversationTelemetry.emitAssistantReplyComposed(
+                turnId = resolvedTurnId,      // ✅ now non-null when resolvable
+                tickId = resolvedTickId,
+                speakReqId = speakReqId,
+                ttsId = null,
+                utteranceId = null,
+                engine = if (isAzureConfigured() && azureTts?.isReady() == true) "Azure" else "Android",
+                source = source,
+                replyText = message,
+                uiText = message,
+                replyToRowId = replyToRowId,
+                replyId = replyId,
+                replySha12 = replySha12
+            )
+        }
+
+        // Log exactly what Sudo is about to say (back-compat)
+        logSudoSay(
+            message,
+            speakReqId = speakReqId,
+            replyToRowId = replyToRowId,
+            turnId = resolvedTurnId?.toInt(),
+            tickId = resolvedTickId,
+            source = source
+        )
 
         val (ssml, localeTag) = buildSsml(message)
 
@@ -2843,9 +2643,12 @@ STYLE:
             asrSuppressedByTts = false
             runCatching { asr?.setSpeaking(false) }
 
-            // IMPORTANT: onTtsFinished must be fired EXACTLY ONCE per actual playback.
             if (didRealStart.get()) {
-                turnController.onTtsFinished()
+                // ✅ Single owner: Conductor decides whether to resume listening.
+                turnController.onTtsFinished(
+                    listenAfter = listenAfter,
+                    finishReason = "$engineTag:$finishReason"
+                )
             } else {
                 ConversationTelemetry.emit(
                     mapOf(
@@ -2856,20 +2659,6 @@ STYLE:
                 )
             }
 
-            // Compatibility fallback:
-            // If your conductor relies only on Eff.Speak(listenAfter=true) and forgets to issue Eff.RequestListen,
-            // we still kick listening here. If the conductor ALSO issues RequestListen, your TurnController should
-            // ignore duplicates (idempotent).
-            if (listenAfter) {
-                ConversationTelemetry.emit(
-                    mapOf(
-                        "type" to "LISTEN_AFTER_COMPAT_REQUEST",
-                        "engine" to engineTag,
-                        "reason" to finishReason
-                    )
-                )
-                requestListenCompat(reason = "listenAfter:$engineTag:$finishReason")
-            }
 
             releaseAndMaybeDrainQueue()
         }
@@ -2890,6 +2679,10 @@ STYLE:
                         localeTag = localeTag,
                         speakReqId = speakReqId,
                         replyToRowId = replyToRowId,
+
+                        // ✅ keep binding identifiers consistent
+                        replyId = replyId,
+                        replySha12 = replySha12,
 
                         onStart = {
                             runOnUiThread {
@@ -2912,10 +2705,13 @@ STYLE:
                                 Log.w("SudoVoice", "TTS_ERROR engine=Azure; falling back to Android", err)
                                 uiFinishSpeaking(engineTag = "azure", finishReason = "azure_tts_error")
                                 speakWithAndroidTts(
-                                    message,
+                                    text = message,
                                     listenAfter = listenAfter,
                                     speakReqId = speakReqId,
-                                    replyToRowId = replyToRowId
+                                    replyToRowId = replyToRowId,
+                                    turnId = resolvedTurnId,
+                                    tickId = resolvedTickId,
+                                    replyTextSha256 = replySha
                                 )
                             }
                         }
@@ -2925,10 +2721,13 @@ STYLE:
                         Log.w("SudoVoice", "Azure speak threw; falling back to Android", t)
                         uiFinishSpeaking(engineTag = "azure", finishReason = "azure_tts_throw")
                         speakWithAndroidTts(
-                            message,
+                            text = message,
                             listenAfter = listenAfter,
                             speakReqId = speakReqId,
-                            replyToRowId = replyToRowId
+                            replyToRowId = replyToRowId,
+                            turnId = resolvedTurnId,
+                            tickId = resolvedTickId,
+                            replyTextSha256 = replySha
                         )
                     }
                 }
@@ -2938,10 +2737,13 @@ STYLE:
 
         // Fallback: Android TTS
         speakWithAndroidTts(
-            message,
+            text = message,
             listenAfter = listenAfter,
             speakReqId = speakReqId,
-            replyToRowId = replyToRowId
+            replyToRowId = replyToRowId,
+            turnId = resolvedTurnId,
+            tickId = resolvedTickId,
+            replyTextSha256 = replySha
         )
     }
 
@@ -2980,7 +2782,10 @@ STYLE:
         text: String,
         listenAfter: Boolean = false,
         speakReqId: Int? = null,
-        replyToRowId: Int? = null
+        replyToRowId: Int? = null,
+        turnId: Long? = null,
+        tickId: Int? = null,
+        replyTextSha256: String? = null
     ) {
         if (!ttsReady) {
             Log.w("SudokuTTS", "Android TTS not ready; dropping line")
@@ -2989,10 +2794,29 @@ STYLE:
 
         val params = Bundle()
 
-        // ✅ Encode correlation ids so initTtsListener can recover them reliably.
+        // ✅ Deterministic, parseable utterance id (no wall-clock).
+        // Add reply_id + reply_sha12 so initTtsListener can pass them into resolveAndEmitAssistantReplySpoken(...).
         val sr = speakReqId?.toString() ?: "na"
         val rr = replyToRowId?.toString() ?: "na"
-        val uttId = "sr${sr}_rr${rr}_${System.currentTimeMillis()}"
+        val tt = turnId?.toString() ?: "na"
+        val kk = tickId?.toString() ?: "na"
+        val n = androidUttSeq.incrementAndGet()
+
+        // Compute hashes (best effort)
+        val replySha256 = replyTextSha256 ?: ConversationTelemetry.sha256Hex(text)
+        val replySha12 = replySha256.take(12)
+
+        // Your recommended scheme (stable + human readable)
+        val replyId: String? = if (turnId != null && speakReqId != null) {
+            "turn-${turnId}-sr-${speakReqId}"
+        } else null
+
+        // IMPORTANT: keep rid/sha12 token values free of underscores, since we parse by splitting on "_" patterns.
+        // replyId has hyphens, that's fine.
+        val ridToken = replyId ?: "na"
+
+        // Format: sr<sr>_rr<rr>_t<turn>_k<tick>_rid<replyId>_sha12<sha12>_n<seq>
+        val uttId = "sr${sr}_rr${rr}_t${tt}_k${kk}_rid${ridToken}_sha12${replySha12}_n${n}"
 
         lastUtteranceId = uttId
         pendingListenAfterUtteranceId = if (listenAfter) uttId else null
@@ -3007,6 +2831,14 @@ STYLE:
                 "utterance_id" to uttId,
                 "speak_req_id" to speakReqId,
                 "reply_to_row_id" to replyToRowId,
+                "turn_id" to turnId,
+                "tick_id" to tickId,
+
+                // ✅ binding
+                "reply_id" to replyId,
+                "reply_sha12" to replySha12,
+                "reply_text_sha256" to replySha256,
+
                 "listen_after" to listenAfter,
                 "text_len" to text.length
             )
@@ -3017,6 +2849,7 @@ STYLE:
             "TTS_ENQUEUE engine=Android locale=${java.util.Locale.getDefault().toLanguageTag()} uttId=$uttId listenAfter=$listenAfter"
         )
 
+        // Pass utteranceId to TTS engine; listener will use utteranceId as the join key.
         tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, uttId)
     }
 
@@ -3362,6 +3195,31 @@ STYLE:
                     return m.groupValues[1].toIntOrNull()
                 }
 
+                // ✅ 6.4: extract reply_id + reply_sha12 from utteranceId if embedded
+                // Accepts patterns like: ridTURN-2-sr-5  OR replyid=turn-2-sr-5
+                fun parseReplyId(utt: String): String? {
+                    val m1 = Regex("""\brid([A-Za-z0-9\-\._:]+)\b""").find(utt)
+                    if (m1 != null) return m1.groupValues[1]
+
+                    val m2 = Regex("""\breplyid=([A-Za-z0-9\-\._:]+)\b""").find(utt)
+                    if (m2 != null) return m2.groupValues[1]
+
+                    return null
+                }
+
+                // Accepts patterns like: sha12abcdef123456 OR replysha12=abcdef123456
+                fun parseReplySha12(utt: String): String? {
+                    val m1 = Regex("""\bsha12([0-9a-fA-F]{12})\b""").find(utt)
+                    if (m1 != null) return m1.groupValues[1]
+
+                    val m2 = Regex("""\breplysha12=([0-9a-fA-F]{12})\b""").find(utt)
+                    if (m2 != null) return m2.groupValues[1]
+
+                    return null
+                }
+
+                private val startElapsedByUtt = mutableMapOf<String, Long>()
+
                 override fun onStart(utteranceId: String?) {
                     runOnUiThread {
                         isSpeaking = true
@@ -3377,6 +3235,11 @@ STYLE:
                         val speakReqId = parseSpeakReqId(utt)
                         val replyToRowId = parseReplyToRowId(utt)
 
+                        val replyId = parseReplyId(utt)
+                        val replySha12 = parseReplySha12(utt)
+
+                        startElapsedByUtt[utt] = android.os.SystemClock.elapsedRealtime()
+
                         ConversationTelemetry.emit(
                             mapOf(
                                 "type" to "TTS_START",
@@ -3384,14 +3247,21 @@ STYLE:
                                 "utterance_id" to utt,
                                 "speak_req_id" to speakReqId,
                                 "reply_to_row_id" to replyToRowId,
-                                "listen_after" to listenAfter
+                                "listen_after" to listenAfter,
+
+                                // ✅ 6.4
+                                "reply_id" to replyId,
+                                "reply_sha12" to replySha12
                             )
                         )
 
                         turnController.onSystemSpeaking("android_tts_start")
                         voiceBars?.startSpeaking(source = "tts_android", truthful = true)
 
-                        Log.i("SudoVoice", "TTS_START engine=Android uttId=$utt listenAfter=$listenAfter sr=$speakReqId rr=$replyToRowId")
+                        Log.i(
+                            "SudoVoice",
+                            "TTS_START engine=Android uttId=$utt listenAfter=$listenAfter sr=$speakReqId rr=$replyToRowId rid=$replyId sha12=$replySha12"
+                        )
                     }
                 }
 
@@ -3410,14 +3280,26 @@ STYLE:
                         asrSuppressedByTts = false
                         runCatching { asr?.setSpeaking(false) }
 
+
+                        val shouldListen = (utteranceId != null && utteranceId == pendingListenAfterUtteranceId)
+
+
                         // ✅ Conductor does cooldown + start listening
-                        turnController.onTtsFinished()
+                        turnController.onTtsFinished(
+                            listenAfter = shouldListen,
+                            finishReason = "android:$reason"
+                        )
 
                         val utt = utteranceId.orEmpty()
-                        val shouldListen = (utteranceId != null && utteranceId == pendingListenAfterUtteranceId)
 
                         val speakReqId = parseSpeakReqId(utt)
                         val replyToRowId = parseReplyToRowId(utt)
+
+                        val replyId = parseReplyId(utt)
+                        val replySha12 = parseReplySha12(utt)
+
+                        val startElapsed = startElapsedByUtt.remove(utt)
+                        val durationMs = startElapsed?.let { android.os.SystemClock.elapsedRealtime() - it }
 
                         val base = mutableMapOf<String, Any?>(
                             "type" to (if (isError) "TTS_ERROR" else "TTS_DONE"),
@@ -3426,15 +3308,43 @@ STYLE:
                             "speak_req_id" to speakReqId,
                             "reply_to_row_id" to replyToRowId,
                             "listen_after" to shouldListen,
-                            "reason" to reason
+                            "reason" to reason,
+
+                            // ✅ 6.4
+                            "reply_id" to replyId,
+                            "reply_sha12" to replySha12
                         )
                         if (errorCode != null) base["error_code"] = errorCode
+                        if (durationMs != null) base["duration_ms"] = durationMs
                         ConversationTelemetry.emit(base)
 
+                        // ✅ Emit canonical spoken/not-spoken with deterministic binding (+ reply_id)
+                        ConversationTelemetry.resolveAndEmitAssistantReplySpoken(
+                            engine = "Android",
+                            ttsId = null,
+                            speakReqId = speakReqId,
+                            utteranceId = utt,
+                            durationMs = durationMs,
+                            cacheHit = null,
+                            ok = !isError,
+                            errorCode = errorCode?.toString(),
+                            reason = reason,
+
+                            // ✅ 6.4 binding
+                            replyId = replyId,
+                            replySha12 = replySha12
+                        )
+
                         if (isError) {
-                            Log.w("SudoVoice", "TTS_ERROR engine=Android code=${errorCode ?: -1} uttId=$utt listenAfter=$shouldListen")
+                            Log.w(
+                                "SudoVoice",
+                                "TTS_ERROR engine=Android code=${errorCode ?: -1} uttId=$utt listenAfter=$shouldListen rid=$replyId"
+                            )
                         } else {
-                            Log.i("SudoVoice", "TTS_DONE engine=Android uttId=$utt listenAfter=$shouldListen")
+                            Log.i(
+                                "SudoVoice",
+                                "TTS_DONE engine=Android uttId=$utt listenAfter=$shouldListen rid=$replyId"
+                            )
                         }
 
                         if (shouldListen) {
@@ -3446,7 +3356,11 @@ STYLE:
                                     "utterance_id" to utt,
                                     "speak_req_id" to speakReqId,
                                     "reply_to_row_id" to replyToRowId,
-                                    "reason" to "android_tts_finished"
+                                    "reason" to "android_tts_finished",
+
+                                    // ✅ 6.4
+                                    "reply_id" to replyId,
+                                    "reply_sha12" to replySha12
                                 )
                             )
                         }
@@ -3712,8 +3626,6 @@ STYLE:
                     return@attachWorkers
                 }
 
-                // Optional defensive check: don't start if we *know* we're speaking/suppressed.
-                // (If SudoASR internally enforces this, keep or remove—either is fine.)
                 if (isSpeaking) {
                     Log.w("SudoASR", "CMD_START_ASR blocked: isSpeaking=true")
                     ConversationTelemetry.emit(
@@ -3725,10 +3637,7 @@ STYLE:
                     return@attachWorkers
                 }
 
-                runCatching {
-                    // Use your real API — keep asr?.start() if that's correct.
-                    a.start()
-                }.onFailure {
+                runCatching { a.startListening() }.onFailure {
                     Log.e("SudoASR", "CMD_START_ASR failed", it)
                     ConversationTelemetry.emit(
                         mapOf(
@@ -3752,9 +3661,7 @@ STYLE:
                     return@attachWorkers
                 }
 
-                runCatching {
-                    a.stop()
-                }.onFailure {
+                runCatching { a.cancelListening("turn_controller_stop") }.onFailure {
                     ConversationTelemetry.emit(
                         mapOf(
                             "type" to "ASR_CMD_STOP_ERROR",
@@ -3762,6 +3669,27 @@ STYLE:
                         )
                     )
                 }
+            },
+            requestSystemSpeak = { text, listenAfter, reason ->
+                // ✅ Keep captions consistent with normal replies
+                runCatching { updateSudoMessage(text) }
+
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "SYSTEM_NUDGE_SPEAK",
+                        "reason" to reason,
+                        "listen_after" to listenAfter,
+                        "text_len" to text.length
+                    )
+                )
+
+                speakAssistant(
+                    message = text,
+                    listenAfter = listenAfter,
+                    turnId = null,
+                    tickId = null,
+                    source = "system_nudge:$reason"
+                )
             }
         )
 
@@ -4309,6 +4237,10 @@ STYLE:
             uiCand[i]   = uiCandIn[i]
         }
 
+        // ✅ Patch 3.1 — New capture => clear confirmations (fresh board)
+        java.util.Arrays.fill(uiConfirmed, false)
+        runCatching { resultsSudokuView?.stopConfirmationPulse() }
+
         resultsDigits = uiDigits.copyOf()
         resultsConfidences = uiConfs.copyOf()
         lastCellReadouts = readouts9x9
@@ -4387,27 +4319,56 @@ STYLE:
             sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.CameraActive)
             val msg = "I received something, but I don’t have a usable grid yet. Try retaking with the full page flat in frame."
             updateSudoMessage(msg)
-            speakAssistant(msg, listenAfter = true)
+            speakAssistant(
+                message = msg,
+                listenAfter = true,
+                turnId = null,
+                tickId = null,
+                source = "repair_no_grid"
+            )
         }
     }
 
 
     // Compact, consistent log lines for voice I/O
-    private fun logSudoSay(text: String, speakReqId: Int? = null, replyToRowId: Int? = null) {
-        // Logcat (unchanged)
-        Log.i("SudoVoice", "SAY: \"${text.replace("\n"," ")}\"")
+    private fun logSudoSay(
+        text: String,
+        speakReqId: Int? = null,
+        replyToRowId: Int? = null,
+        turnId: Int? = null,
+        tickId: Int? = null,
+        source: String = "policy_reply"
+    ) {
+        // Logcat (best-effort, unchanged)
+        Log.i("SudoVoice", "SAY: \"${text.replace("\n", " ")}\" turnId=$turnId tickId=$tickId source=$source sr=$speakReqId rr=$replyToRowId")
 
         // Telemetry JSONL (single source of truth)
         ConversationTelemetry.emitAssistantSay(
             text = text,
-            source = "logSudoSay",
+            source = source,
+            engine = if (isAzureConfigured() && azureTts?.isReady() == true) "Azure" else "Android",
+            locale = java.util.Locale.getDefault().toLanguageTag(),
+            turnId = turnId,          // Int? here is fine (it’s “meta”)
+            tickId = tickId,
             speakReqId = speakReqId,
             replyToRowId = replyToRowId
-            // Optional (only if you have them at this call-site):
-            // mode = currentConversationMode,   // "FREE_TALK" or "GRID"
-            // engine = if (isAzureConfigured()) "azure" else "android",
-            // locale = localeTag
         )
+
+        // Optional: emit a separate event that includes turn/tick/source if emitAssistantSay can’t yet.
+        runCatching {
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "ASSISTANT_SAY_META",
+                    "turn_id" to turnId,
+                    "tick_id" to tickId,
+                    "source" to source,
+                    "speak_req_id" to speakReqId,
+                    "reply_to_row_id" to replyToRowId,
+                    "len" to text.length,
+                    "sha256" to ConversationTelemetry.sha256Hex(text)
+                )
+            )
+        }
     }
 
     private fun logAsrHeard(kind: String, text: String, confidence: Float? = null) {
@@ -4512,16 +4473,19 @@ STYLE:
         }
 
         val truthGiven = safeBool81(truthSnap?.isGiven, uiGiven)
-        val truthSol = safeBool81(truthSnap?.isSolution, uiSol)
+        val truthSol  = safeBool81(truthSnap?.isSolution, uiSol)
         val truthCand = safeInt81(truthSnap?.candidateMask, uiCand)
 
-        // ✅ Confirmed indices (handled already; should not be re-asked)
-        fun isConfirmed(idx: Int): Boolean = (idx in 0..80 && uiConfirmed[idx])
+        // ✅ Patch 4.2 — canonical confirmed source (prefer SessionStore truth over UI)
+        val truthConfirmed81: BooleanArray = safeBool81(truthSnap?.confirmed81, uiConfirmed)
 
-        // ✅ NEW: explicit confirmed list for LLMGridState (facts for coordinator prompt)
+        // ✅ Confirmed indices (handled already; should not be re-asked)
+        fun isConfirmed(idx: Int): Boolean = (idx in 0..80 && truthConfirmed81[idx])
+
+        // ✅ explicit confirmed list for LLMGridState (facts for coordinator prompt)
         val confirmedCells = (0 until 81)
             .asSequence()
-            .filter { uiConfirmed[it] }
+            .filter { truthConfirmed81[it] }
             .toList()
             .sorted()
 
@@ -4595,11 +4559,13 @@ STYLE:
         val isStructurallyValid = state.isStructurallyValid
         val unresolvedCount = unresolvedCells.size
 
-        // Retake policy aligned with "Sudo solves only unique"
+        // Retake policy should reflect capture / OCR quality pressure,
+        // not merely "not uniquely solvable".
+        // A multiple-solution state is handled downstream as a visual-verification /
+        // different-grid flow, not as a generic scan-quality retake prompt.
         val retakeRecommendation = when {
             conflictCells.size >= 8 -> "strong"
             conflictCells.size in 4..7 -> "soft"
-            solvability == "multiple" -> "soft"
             unresolvedCells.size > 6 -> "soft"
             else -> "none"
         }
@@ -4614,6 +4580,8 @@ STYLE:
             changedCells.isNotEmpty() -> "mild"
             else -> "ok"
         }
+
+        android.util.Log.i("MainActivity", "LLMGridState confirmedCells=${confirmedCells.size}")
 
         return LLMGridState(
             correctedGrid = correctedGrid,
@@ -4635,7 +4603,6 @@ STYLE:
             mismatchCells = mismatchCellsSorted,
             mismatchDetails = mismatchDetails,
 
-            // ✅ NEW: pass confirmations through to coordinator prompt
             confirmedCells = confirmedCells,
 
             solvability = solvability,
@@ -4644,229 +4611,6 @@ STYLE:
             severity = severity,
             retakeRecommendation = retakeRecommendation
         )
-    }
-
-
-
-    private fun applyTruthReclassification(idx: Int, kind: String, source: String) {
-        val ok = SessionStore.reclassifyCell(idx, kind)
-        if (!ok) return
-
-        // Reflect truth back into UI flags for rendering
-        val snap = SessionStore.truthSnapshotOrNull() ?: return
-        for (i in 0 until 81) {
-            uiGiven[i] = snap.isGiven[i]
-            uiSol[i] = snap.isSolution[i]
-        }
-
-        // Re-render
-        resultsSudokuView?.setUiData(
-            displayDigits = uiDigits,
-            displayConfs = uiConfs,
-            shownIsGiven = uiGiven,
-            shownIsSolution = uiSol,
-            candidatesMask = uiCand,
-            shownIsAutoCorrected = uiAuto
-        )
-
-        // Send fresh grid snapshot to conductor
-        val gs = buildGridStateFromOverlay() ?: return
-        val llmGrid = buildLLMGridStateFromOverlay(gs)
-        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
-            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
-        ))
-    }
-
-    private fun applyCandidatesSet(idx: Int, mask: Int, source: String) {
-        val ok = SessionStore.setCandidates(idx, mask)
-        if (!ok) return
-
-        val snap = SessionStore.truthSnapshotOrNull() ?: return
-        for (i in 0 until 81) {
-            uiCand[i] = snap.candidateMask[i]
-        }
-
-        resultsSudokuView?.setUiData(
-            displayDigits = uiDigits,
-            displayConfs = uiConfs,
-            shownIsGiven = uiGiven,
-            shownIsSolution = uiSol,
-            candidatesMask = uiCand,
-            shownIsAutoCorrected = uiAuto
-        )
-
-        val gs = buildGridStateFromOverlay() ?: return
-        val llmGrid = buildLLMGridStateFromOverlay(gs)
-        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
-            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
-        ))
-    }
-
-    private fun applyCandidatesToggle(idx: Int, digit: Int, source: String) {
-        val ok = SessionStore.toggleCandidate(idx, digit)
-        if (!ok) return
-        val snap = SessionStore.truthSnapshotOrNull() ?: return
-
-        for (i in 0 until 81) {
-            uiCand[i] = snap.candidateMask[i]
-        }
-
-        resultsSudokuView?.setUiData(
-            displayDigits = uiDigits,
-            displayConfs = uiConfs,
-            shownIsGiven = uiGiven,
-            shownIsSolution = uiSol,
-            candidatesMask = uiCand,
-            shownIsAutoCorrected = uiAuto
-        )
-
-        val gs = buildGridStateFromOverlay() ?: return
-        val llmGrid = buildLLMGridStateFromOverlay(gs)
-        sudoStore.dispatch(com.contextionary.sudoku.conductor.Evt.GridSnapshotUpdated(
-            com.contextionary.sudoku.conductor.GridSnapshot(llm = llmGrid)
-        ))
-    }
-
-
-
-    private fun extractDigit1to9(text: String): Int? {
-        val t = text.lowercase()
-
-        // A) Prefer explicit "to X" / "equals X" / "is X" / "= X"
-        Regex("""\b(?:to|equals|equal|is|=)\s*([1-9])\b""")
-            .find(t)?.groupValues?.getOrNull(1)?.toIntOrNull()
-            ?.let { return it }
-
-        // B) Prefer explicit "to six" etc
-        val wordToDigit = mapOf(
-            "one" to 1,
-            "two" to 2,
-            "three" to 3,
-            "four" to 4,
-            "for" to 4,     // common ASR
-            "five" to 5,
-            "six" to 6,
-            "sex" to 6,     // common ASR
-            "seven" to 7,
-            "eight" to 8,
-            "ate" to 8,     // common ASR
-            "nine" to 9
-        )
-        Regex("""\b(?:to|equals|equal|is|=)\s*(one|two|three|four|for|five|six|sex|seven|eight|ate|nine)\b""")
-            .find(t)?.groupValues?.getOrNull(1)
-            ?.let { w -> wordToDigit[w]?.let { return it } }
-
-        // C) Otherwise, take the LAST standalone numeric digit 1..9 (avoid grabbing "r1c1" because no word-boundary)
-        Regex("""\b([1-9])\b""").findAll(t).toList().lastOrNull()
-            ?.groupValues?.getOrNull(1)?.toIntOrNull()
-            ?.let { return it }
-
-        // D) Otherwise, take the LAST number-word occurrence
-        val hits = wordToDigit.entries
-            .filter { (k, _) -> Regex("""\b$k\b""").containsMatchIn(t) }
-        hits.lastOrNull()?.value?.let { return it }
-
-        return null
-    }
-
-
-
-    private fun applyManualDigitEdit(idx: Int, newDigit: Int) {
-        if (idx !in 0..80) return
-        if (newDigit !in 1..9) return
-        if (resultsDigits == null || resultsConfidences == null || resultsSudokuView == null) return
-
-        val oldDigit = uiDigits[idx]
-        if (oldDigit == newDigit) {
-            // No-op is safe
-            overlayUnresolved.remove(idx)
-            resultsSudokuView?.stopConfirmationPulse()
-            return
-        }
-
-        // 1) Update canonical UI arrays (what is displayed)
-        uiDigits[idx] = newDigit
-        uiConfs[idx] = 1.0f
-
-        // Bold is driven by corrected flags, not "given/solution" booleans
-        uiGiven[idx] = false
-        uiSol[idx] = false
-        uiCand[idx] = 0
-
-        // 2) Mark manual provenance
-        uiManual[idx] = true
-
-        // 3) Append manual edit history for the LLM (epoch time; stable)
-        manualEditSeqGlobal += 1
-        manualEditLog.add(
-            com.contextionary.sudoku.logic.LLMCellEditEvent(
-                seq = manualEditSeqGlobal,
-                index = idx,
-                cellLabel = "r${(idx / 9) + 1}c${(idx % 9) + 1}",
-                fromDigit = oldDigit,
-                toDigit = newDigit,
-                whenEpochMs = System.currentTimeMillis(),
-                source = "manual"
-            )
-        )
-
-        // 4) Keep resultsDigits/resultsConfidences consistent (canonical for solver + GridState)
-        System.arraycopy(uiDigits, 0, resultsDigits!!, 0, 81)
-        System.arraycopy(uiConfs, 0, resultsConfidences!!, 0, 81)
-
-        // 5) Remove from unresolved
-        overlayUnresolved.remove(idx)
-
-        // 6) Repaint with boldCorrected = auto OR manual
-        val boldCorrected = BooleanArray(81) { i -> uiAuto[i] || uiManual[i] }
-
-        resultsSudokuView?.setUiData(
-            displayDigits = uiDigits,
-            displayConfs = uiConfs,
-            shownIsGiven = uiGiven,
-            shownIsSolution = uiSol,
-            candidatesMask = uiCand,
-            // NOTE: View param is misnamed; you're using it as "corrected => bold"
-            shownIsAutoCorrected = boldCorrected
-        )
-
-        // 7) Re-apply logic annotations (cyan=auto-changed, red=unresolved)
-        val changedCellsIdx = lastAutoCorrectionResult?.changedIndices ?: emptyList()
-        resultsSudokuView?.setLogicAnnotations(
-            changed = changedCellsIdx,
-            unresolved = overlayUnresolved.toList()
-        )
-
-        resultsSudokuView?.stopConfirmationPulse()
-
-        // 8) Optional: notify GridConversationCoordinator + log event (your existing pattern)
-        buildGridStateFromOverlay()?.let { state ->
-            val editEvent = com.contextionary.sudoku.logic.GridEditEvent(
-                seq = manualEditSeqGlobal,
-                cellIndex = idx,
-                row = idx / 9,
-                col = idx % 9,
-                oldDigit = oldDigit,
-                newDigit = newDigit,
-                timestampMs = android.os.SystemClock.elapsedRealtime()
-            )
-            gridConversationCoordinator.onManualEditApplied(state, editEvent)
-        }
-    }
-
-
-
-
-    private fun updateProfileFrom(userText: String) {
-        lifecycleScope.launch {
-            runCatching {
-                val delta = llmCoordinator.extractProfileClues(userText)
-                val current = UserProfileStore.load(this@MainActivity)
-                UserProfileStore.mergeAndSave(this@MainActivity, current, delta)
-            }.onFailure {
-                android.util.Log.w("SudoProfile", "Profile extraction failed (non-fatal): ${it.message}")
-            }
-        }
     }
 
 

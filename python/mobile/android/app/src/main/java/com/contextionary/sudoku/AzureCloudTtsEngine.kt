@@ -27,6 +27,8 @@ import java.util.concurrent.atomic.AtomicInteger
 // telemetry
 import com.contextionary.sudoku.telemetry.ConversationTelemetry
 
+import com.contextionary.sudoku.telemetry.Checkpoint
+
 /**
  * AzureCloudTtsEngine (patched):
  *
@@ -69,6 +71,8 @@ class AzureCloudTtsEngine(
 
     @Volatile private var activeTtsId: Int? = null
     @Volatile private var activeStopTtsId: Int? = null
+
+
     var onStopped: ((ttsId: Int, source: String) -> Unit)? = null
 
     // ✅ NEW: capture pairing fields for telemetry correlation
@@ -77,6 +81,11 @@ class AzureCloudTtsEngine(
     @Volatile private var activeConvTurn: Int? = null
     @Volatile private var activeVoiceName: String? = null
     @Volatile private var activeLocaleTag: String? = null
+
+
+    // ✅ 6.4: reply correlation fields (optional but excellent for audits)
+    @Volatile private var activeReplyId: String? = null
+    @Volatile private var activeReplySha12: String? = null
 
     // ✅ NEW: hold per-utterance callbacks so stopInternal can finish the speech contract
     @Volatile private var activeOnStart: (() -> Unit)? = null
@@ -100,6 +109,11 @@ class AzureCloudTtsEngine(
                         "speak_req_id" to activeSpeakReqId,
                         "reply_to_row_id" to activeReplyToRowId,
                         "conv_turn" to activeConvTurn,
+
+                        // ✅ 6.4
+                        "reply_id" to activeReplyId,
+                        "reply_sha12" to activeReplySha12,
+
                         "change" to change
                     )
                 )
@@ -120,9 +134,14 @@ class AzureCloudTtsEngine(
         speakReqId: Int? = null,
         replyToRowId: Int? = null,
         convTurn: Int? = null,
+
         onStart: (() -> Unit)?,
         onDone: (() -> Unit)?,
-        onError: ((Throwable) -> Unit)?
+        onError: ((Throwable) -> Unit)?,
+
+        // ✅ 6.4 — keep at END so old call sites still compile
+        replyId: String? = null,
+        replySha12: String? = null
     ): Int {
 
         // 1) Preempt previous utterance ONLY if playback pipeline exists.
@@ -130,20 +149,54 @@ class AzureCloudTtsEngine(
         if (prevId != null) {
             val hasLivePlayer = (player != null)
             if (hasLivePlayer) {
-                // IMPORTANT: preemption is not a "terminal end" from the app POV, so do NOT
-                // trigger onDone/onError here. Just stop playback quietly.
+                // ✅ Snapshot correlation BEFORE stopInternal clears active state
+                val prevReplyId = activeReplyId
+                val prevReplySha12 = activeReplySha12
+                val prevSpeakReqId = activeSpeakReqId
+
                 stopInternal(source = "pre_new_tts", ttsId = prevId)
+
+                // ✅ Guard telemetry so it cannot break flow
+                runCatching {
+                    ConversationTelemetry.resolveAndEmitAssistantReplySpoken(
+                        engine = "Azure",
+                        ttsId = prevId,
+                        speakReqId = prevSpeakReqId,
+                        utteranceId = null,
+                        durationMs = null,
+                        cacheHit = null,
+                        ok = false,
+                        errorCode = "preempted",
+                        reason = "pre_new_tts",
+
+                        // ✅ 6.4 binding
+                        replyId = prevReplyId,
+                        replySha12 = prevReplySha12
+                    )
+                }.onFailure { e ->
+                    runCatching {
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "ASSISTANT_REPLY_SPOKEN_EMIT_FAILED",
+                                "engine" to "Azure",
+                                "tts_id" to prevId,
+                                "message" to (e.message ?: e.toString())
+                            )
+                        )
+                    }
+                }
             } else {
-                // ✅ Nothing playing anymore; forget stale ids
                 clearActiveState()
                 synchronized(this) { activeStopTtsId = prevId }
-                ConversationTelemetry.emit(
-                    mapOf(
-                        "type" to "TTS_PREEMPT_NOOP",
-                        "engine" to "Azure",
-                        "tts_id" to prevId
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "TTS_PREEMPT_NOOP",
+                            "engine" to "Azure",
+                            "tts_id" to prevId
+                        )
                     )
-                )
+                }
             }
         }
 
@@ -158,92 +211,238 @@ class AzureCloudTtsEngine(
         activeVoiceName = voiceName
         activeLocaleTag = localeTag
 
-        // store callbacks for stopInternal
-        activeOnStart = onStart
-        activeOnDone = onDone
-        activeOnError = onError
+        // ✅ 6.4
+        activeReplyId = replyId
+        activeReplySha12 = replySha12
 
         synchronized(this) { activeStopTtsId = null }
 
-        try {
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_FETCH_BEGIN",
-                    "engine" to "Azure",
-                    "tts_id" to ttsId,
-                    "speak_req_id" to speakReqId,
-                    "reply_to_row_id" to replyToRowId,
-                    "conv_turn" to convTurn,
-                    "voice" to voiceName,
-                    "locale" to localeTag
+        // Track duration + cache info for wrapper telemetry (best effort)
+        var startElapsedMs: Long? = null
+        var cacheHit: Boolean? = null
+
+        // ---- Patch B: define wrappers FIRST, then store wrapper versions into activeOn* ----
+        val wrappedOnStart: (() -> Unit)? = {
+            startElapsedMs = android.os.SystemClock.elapsedRealtime()
+            onStart?.invoke()
+        }
+
+        val wrappedOnDone: (() -> Unit)? = {
+            val dur = startElapsedMs?.let { android.os.SystemClock.elapsedRealtime() - it }
+
+            // ---- Patch A: guard telemetry so it can never block onDone ----
+            runCatching {
+                ConversationTelemetry.resolveAndEmitAssistantReplySpoken(
+                    engine = "Azure",
+                    ttsId = ttsId,
+                    speakReqId = speakReqId,
+                    utteranceId = null,
+                    durationMs = dur,
+                    cacheHit = cacheHit,
+                    ok = true,
+                    errorCode = null,
+                    reason = "azure_play_done",
+
+                    // ✅ 6.4 binding
+                    replyId = replyId,
+                    replySha12 = replySha12
                 )
-            )
+            }.onFailure { e ->
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASSISTANT_REPLY_SPOKEN_EMIT_FAILED",
+                            "engine" to "Azure",
+                            "tts_id" to ttsId,
+                            "message" to (e.message ?: e.toString())
+                        )
+                    )
+                }
+            }
+
+            onDone?.invoke()
+        }
+
+        val wrappedOnError: ((Throwable) -> Unit)? = { t ->
+            val dur = startElapsedMs?.let { android.os.SystemClock.elapsedRealtime() - it }
+
+            // ---- Patch A: guard telemetry so it can never block onError ----
+            runCatching {
+                ConversationTelemetry.resolveAndEmitAssistantReplySpoken(
+                    engine = "Azure",
+                    ttsId = ttsId,
+                    speakReqId = speakReqId,
+                    utteranceId = null,
+                    durationMs = dur,
+                    cacheHit = cacheHit,
+                    ok = false,
+                    errorCode = "azure_play_error",
+                    reason = "azure_play_error",
+
+                    // ✅ 6.4 binding
+                    replyId = replyId,
+                    replySha12 = replySha12
+                )
+            }.onFailure { e ->
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASSISTANT_REPLY_SPOKEN_EMIT_FAILED",
+                            "engine" to "Azure",
+                            "tts_id" to ttsId,
+                            "message" to (e.message ?: e.toString())
+                        )
+                    )
+                }
+            }
+
+            onError?.invoke(t)
+        }
+
+        // store WRAPPERS for stopInternal terminal callback path (Patch B)
+        activeOnStart = wrappedOnStart
+        activeOnDone = wrappedOnDone
+        activeOnError = wrappedOnError
+
+        try {
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_FETCH_BEGIN",
+                        "engine" to "Azure",
+                        "tts_id" to ttsId,
+                        "speak_req_id" to speakReqId,
+                        "reply_to_row_id" to replyToRowId,
+                        "conv_turn" to convTurn,
+                        "voice" to voiceName,
+                        "locale" to localeTag,
+
+                        // ✅ 6.4
+                        "reply_id" to replyId,
+                        "reply_sha12" to replySha12
+                    )
+                )
+            }
 
             val outFile = cachedFileFor(ssml, voiceName, localeTag)
             Log.i(logTag, "Azure TTS: target file=${outFile.absolutePath}")
 
             if (!outFile.exists()) {
+                cacheHit = false
                 Log.i(logTag, "Azure TTS: cache miss, fetching from API…")
                 withContext(Dispatchers.IO) { synthToFile(ssml, voiceName, localeTag, outFile) }
 
-                ConversationTelemetry.emit(
-                    mapOf(
-                        "type" to "TTS_FETCH_OK",
-                        "engine" to "Azure",
-                        "tts_id" to ttsId,
-                        "speak_req_id" to speakReqId,
-                        "reply_to_row_id" to replyToRowId,
-                        "conv_turn" to convTurn,
-                        "bytes" to outFile.length()
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "TTS_FETCH_OK",
+                            "engine" to "Azure",
+                            "tts_id" to ttsId,
+                            "speak_req_id" to speakReqId,
+                            "reply_to_row_id" to replyToRowId,
+                            "conv_turn" to convTurn,
+                            "bytes" to outFile.length(),
+
+                            // ✅ 6.4
+                            "reply_id" to replyId,
+                            "reply_sha12" to replySha12
+                        )
                     )
-                )
+                }
             } else {
+                cacheHit = true
                 Log.i(logTag, "Azure TTS: cache hit, reusing ${outFile.name}")
-                ConversationTelemetry.emit(
-                    mapOf(
-                        "type" to "TTS_FETCH_CACHE_HIT",
-                        "engine" to "Azure",
-                        "tts_id" to ttsId,
-                        "speak_req_id" to speakReqId,
-                        "reply_to_row_id" to replyToRowId,
-                        "conv_turn" to convTurn,
-                        "bytes" to outFile.length()
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "TTS_FETCH_CACHE_HIT",
+                            "engine" to "Azure",
+                            "tts_id" to ttsId,
+                            "speak_req_id" to speakReqId,
+                            "reply_to_row_id" to replyToRowId,
+                            "conv_turn" to convTurn,
+                            "bytes" to outFile.length(),
+
+                            // ✅ 6.4
+                            "reply_id" to replyId,
+                            "reply_sha12" to replySha12
+                        )
                     )
-                )
+                }
             }
 
             withContext(Dispatchers.Main) {
                 playFile(
                     uri = outFile.toUri(),
-                    onStart = onStart,
-                    onDone = onDone,
-                    onError = onError,
+                    onStart = wrappedOnStart,
+                    onDone = wrappedOnDone,
+                    onError = wrappedOnError,
                     voiceName = voiceName,
                     localeTag = localeTag,
                     ttsId = ttsId,
                     speakReqId = speakReqId,
                     replyToRowId = replyToRowId,
-                    convTurn = convTurn
+                    convTurn = convTurn,
+
+                    // ✅ 6.4
+                    replyId = replyId,
+                    replySha12 = replySha12
                 )
             }
 
         } catch (t: Throwable) {
             Log.w(logTag, "Azure speak error", t)
 
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_ERROR",
-                    "engine" to "Azure",
-                    "tts_id" to ttsId,
-                    "speak_req_id" to speakReqId,
-                    "reply_to_row_id" to replyToRowId,
-                    "conv_turn" to convTurn,
-                    "message" to (t.message ?: t.toString())
-                )
-            )
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_ERROR",
+                        "engine" to "Azure",
+                        "tts_id" to ttsId,
+                        "speak_req_id" to speakReqId,
+                        "reply_to_row_id" to replyToRowId,
+                        "conv_turn" to convTurn,
+                        "message" to (t.message ?: t.toString()),
 
-            // stop playback, but do NOT trigger onDone here; caller will handle onError
+                        // ✅ 6.4
+                        "reply_id" to replyId,
+                        "reply_sha12" to replySha12
+                    )
+                )
+            }
+
             stopInternal(source = "speakssml_exception", ttsId = ttsId)
+
+            // Guard telemetry here too
+            runCatching {
+                ConversationTelemetry.resolveAndEmitAssistantReplySpoken(
+                    engine = "Azure",
+                    ttsId = ttsId,
+                    speakReqId = speakReqId,
+                    utteranceId = null,
+                    durationMs = null,
+                    cacheHit = cacheHit,
+                    ok = false,
+                    errorCode = "speakssml_exception",
+                    reason = "speakssml_exception",
+
+                    // ✅ 6.4 binding
+                    replyId = replyId,
+                    replySha12 = replySha12
+                )
+            }.onFailure { e ->
+                runCatching {
+                    ConversationTelemetry.emit(
+                        mapOf(
+                            "type" to "ASSISTANT_REPLY_SPOKEN_EMIT_FAILED",
+                            "engine" to "Azure",
+                            "tts_id" to ttsId,
+                            "message" to (e.message ?: e.toString())
+                        )
+                    )
+                }
+            }
+
             onError?.invoke(t)
         }
 
@@ -297,7 +496,9 @@ class AzureCloudTtsEngine(
         ttsId: Int,
         speakReqId: Int?,
         replyToRowId: Int?,
-        convTurn: Int?
+        convTurn: Int?,
+        replyId: String?,
+        replySha12: String?
     ): Boolean {
         ConversationTelemetry.emit(
             mapOf(
@@ -308,7 +509,11 @@ class AzureCloudTtsEngine(
                 "reply_to_row_id" to replyToRowId,
                 "conv_turn" to convTurn,
                 "usage" to "USAGE_ASSISTANT",
-                "content_type" to "CONTENT_TYPE_SPEECH"
+                "content_type" to "CONTENT_TYPE_SPEECH",
+
+                // ✅ 6.4 (optional extra)
+                "reply_id" to replyId,
+                "reply_sha12" to replySha12
             )
         )
 
@@ -345,7 +550,11 @@ class AzureCloudTtsEngine(
                 "tts_id" to ttsId,
                 "speak_req_id" to speakReqId,
                 "reply_to_row_id" to replyToRowId,
-                "conv_turn" to convTurn
+                "conv_turn" to convTurn,
+
+                // ✅ 6.4 (optional extra)
+                "reply_id" to replyId,
+                "reply_sha12" to replySha12
             )
         )
 
@@ -371,7 +580,11 @@ class AzureCloudTtsEngine(
                 "tts_id" to ttsId,
                 "speak_req_id" to activeSpeakReqId,
                 "reply_to_row_id" to activeReplyToRowId,
-                "conv_turn" to activeConvTurn
+                "conv_turn" to activeConvTurn,
+
+                // ✅ 6.4
+                "reply_id" to activeReplyId,
+                "reply_sha12" to activeReplySha12
             )
         )
     }
@@ -383,6 +596,10 @@ class AzureCloudTtsEngine(
         activeConvTurn = null
         activeVoiceName = null
         activeLocaleTag = null
+
+        // ✅ 6.4
+        activeReplyId = null
+        activeReplySha12 = null
 
         activeOnStart = null
         activeOnDone = null
@@ -413,10 +630,14 @@ class AzureCloudTtsEngine(
         ttsId: Int,
         speakReqId: Int?,
         replyToRowId: Int?,
-        convTurn: Int?
+        convTurn: Int?,
+
+        // ✅ 6.4
+        replyId: String?,
+        replySha12: String?
     ) {
         try {
-            requestAudioFocusOrLog(ttsId, speakReqId, replyToRowId, convTurn)
+            requestAudioFocusOrLog(ttsId, speakReqId, replyToRowId, convTurn, replyId, replySha12)
 
             val p = ExoPlayer.Builder(context).build()
             player = p
@@ -428,19 +649,25 @@ class AzureCloudTtsEngine(
 
             p.setAudioAttributes(exoAttrs, /* handleAudioFocus = */ false)
 
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_AUDIO_ATTR",
-                    "engine" to "Azure",
-                    "tts_id" to ttsId,
-                    "speak_req_id" to speakReqId,
-                    "reply_to_row_id" to replyToRowId,
-                    "conv_turn" to convTurn,
-                    "usage" to "USAGE_ASSISTANT",
-                    "content_type" to "CONTENT_TYPE_SPEECH",
-                    "handle_focus" to false
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_AUDIO_ATTR",
+                        "engine" to "Azure",
+                        "tts_id" to ttsId,
+                        "speak_req_id" to speakReqId,
+                        "reply_to_row_id" to replyToRowId,
+                        "conv_turn" to convTurn,
+                        "usage" to "USAGE_ASSISTANT",
+                        "content_type" to "CONTENT_TYPE_SPEECH",
+                        "handle_focus" to false,
+
+                        // ✅ 6.4 (optional extra)
+                        "reply_id" to replyId,
+                        "reply_sha12" to replySha12
+                    )
                 )
-            )
+            }
 
             p.volume = 1f
             p.setMediaItem(MediaItem.fromUri(uri))
@@ -455,11 +682,13 @@ class AzureCloudTtsEngine(
                 try { p.stop() } catch (_: Throwable) {}
                 try { p.release() } catch (_: Throwable) {}
 
+                // ✅ abandon focus BEFORE wiping active correlation fields
+                abandonAudioFocusIfHeld(ttsId)
+
                 if (isCurrentPlayer()) {
                     player = null
                     clearActiveState()
                 }
-                abandonAudioFocusIfHeld(ttsId)
             }
 
             p.addListener(object : com.google.android.exoplayer2.Player.Listener {
@@ -473,18 +702,55 @@ class AzureCloudTtsEngine(
                         playbackStartMs = System.currentTimeMillis()
 
                         Log.i(logTag, "Azure TTS: playback started (tts_id=$ttsId)")
-                        ConversationTelemetry.emit(
-                            mapOf(
-                                "type" to "TTS_START",
-                                "engine" to "Azure",
-                                "tts_id" to ttsId,
-                                "speak_req_id" to speakReqId,
-                                "reply_to_row_id" to replyToRowId,
-                                "conv_turn" to convTurn,
-                                "voice" to voiceName,
-                                "locale" to localeTag
+
+                        // Guard telemetry so it can't block callback
+                        runCatching {
+                            ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "TTS_START",
+                                    "engine" to "Azure",
+                                    "tts_id" to ttsId,
+                                    "speak_req_id" to speakReqId,
+                                    "reply_to_row_id" to replyToRowId,
+                                    "conv_turn" to convTurn,
+                                    "voice" to voiceName,
+                                    "locale" to localeTag,
+
+                                    // ✅ 6.4 REQUIRED
+                                    "reply_id" to replyId,
+                                    "reply_sha12" to replySha12
+                                )
                             )
-                        )
+                        }
+
+
+                        runCatching {
+                            Checkpoint.cp(
+                                tag = "CP7-START",
+                                sessionId = "unknown", // see note below
+                                turnSeq = null,
+                                turnId = null,
+                                tickId = null,
+                                correlationId = null,
+                                policyReqSeq = null,
+                                toolplanId = null,
+                                modelCallId = null,
+                                kv = mapOf(
+                                    "where" to "AzureCloudTtsEngine.playFile",
+                                    "engine" to "Azure",
+                                    "note" to "real_playback_started",
+                                    "tts_id" to ttsId,
+                                    "speak_req_id" to speakReqId,
+                                    "reply_to_row_id" to replyToRowId,
+                                    "conv_turn" to convTurn,
+                                    "voice" to voiceName,
+                                    "locale" to localeTag,
+                                    "reply_id" to replyId,
+                                    "reply_sha12" to replySha12
+                                )
+                            )
+                        }
+
                         onStart?.invoke()
                     }
                 }
@@ -501,19 +767,56 @@ class AzureCloudTtsEngine(
                             else null
 
                         Log.i(logTag, "Azure TTS: playback ended (tts_id=$ttsId, durationMs=$durationMs)")
-                        ConversationTelemetry.emit(
-                            mapOf(
-                                "type" to "TTS_DONE",
-                                "engine" to "Azure",
-                                "tts_id" to ttsId,
-                                "speak_req_id" to speakReqId,
-                                "reply_to_row_id" to replyToRowId,
-                                "conv_turn" to convTurn,
-                                "duration_ms" to (durationMs ?: -1L),
-                                "voice" to voiceName,
-                                "locale" to localeTag
+
+                        // Guard telemetry so it can't block callback
+                        runCatching {
+                            ConversationTelemetry.emit(
+                                mapOf(
+                                    "type" to "TTS_DONE",
+                                    "engine" to "Azure",
+                                    "tts_id" to ttsId,
+                                    "speak_req_id" to speakReqId,
+                                    "reply_to_row_id" to replyToRowId,
+                                    "conv_turn" to convTurn,
+                                    "duration_ms" to (durationMs ?: -1L),
+                                    "voice" to voiceName,
+                                    "locale" to localeTag,
+
+                                    // ✅ 6.4 REQUIRED
+                                    "reply_id" to replyId,
+                                    "reply_sha12" to replySha12
+                                )
                             )
-                        )
+                        }
+
+
+                        runCatching {
+                            Checkpoint.cp(
+                                tag = "CP7-FIN",
+                                sessionId = "unknown", // see note below
+                                turnSeq = null,
+                                turnId = null,
+                                tickId = null,
+                                correlationId = null,
+                                policyReqSeq = null,
+                                toolplanId = null,
+                                modelCallId = null,
+                                kv = mapOf(
+                                    "where" to "AzureCloudTtsEngine.playFile",
+                                    "engine" to "Azure",
+                                    "note" to "real_playback_finished",
+                                    "tts_id" to ttsId,
+                                    "speak_req_id" to speakReqId,
+                                    "reply_to_row_id" to replyToRowId,
+                                    "conv_turn" to convTurn,
+                                    "duration_ms" to (durationMs ?: -1L),
+                                    "voice" to voiceName,
+                                    "locale" to localeTag,
+                                    "reply_id" to replyId,
+                                    "reply_sha12" to replySha12
+                                )
+                            )
+                        }
 
                         cleanupAfterDone()
                         onDone?.invoke()
@@ -527,17 +830,24 @@ class AzureCloudTtsEngine(
 
                     Log.w(logTag, "Azure TTS: player error (tts_id=$ttsId)", error)
 
-                    ConversationTelemetry.emit(
-                        mapOf(
-                            "type" to "TTS_ERROR",
-                            "engine" to "Azure",
-                            "tts_id" to ttsId,
-                            "speak_req_id" to speakReqId,
-                            "reply_to_row_id" to replyToRowId,
-                            "conv_turn" to convTurn,
-                            "message" to (error.message ?: error.toString())
+                    // Guard telemetry so it can't block callback
+                    runCatching {
+                        ConversationTelemetry.emit(
+                            mapOf(
+                                "type" to "TTS_ERROR",
+                                "engine" to "Azure",
+                                "tts_id" to ttsId,
+                                "speak_req_id" to speakReqId,
+                                "reply_to_row_id" to replyToRowId,
+                                "conv_turn" to convTurn,
+                                "message" to (error.message ?: error.toString()),
+
+                                // ✅ 6.4 (optional extra)
+                                "reply_id" to replyId,
+                                "reply_sha12" to replySha12
+                            )
                         )
-                    )
+                    }
 
                     // Stop and clean. Caller will invoke onError.
                     stopInternal(source = "player_error", ttsId = ttsId)
@@ -551,17 +861,23 @@ class AzureCloudTtsEngine(
         } catch (t: Throwable) {
             Log.w(logTag, "Azure TTS: playFile threw (tts_id=$ttsId)", t)
 
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_ERROR",
-                    "engine" to "Azure",
-                    "tts_id" to ttsId,
-                    "speak_req_id" to speakReqId,
-                    "reply_to_row_id" to replyToRowId,
-                    "conv_turn" to convTurn,
-                    "message" to (t.message ?: t.toString())
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_ERROR",
+                        "engine" to "Azure",
+                        "tts_id" to ttsId,
+                        "speak_req_id" to speakReqId,
+                        "reply_to_row_id" to replyToRowId,
+                        "conv_turn" to convTurn,
+                        "message" to (t.message ?: t.toString()),
+
+                        // ✅ 6.4 (optional extra)
+                        "reply_id" to replyId,
+                        "reply_sha12" to replySha12
+                    )
                 )
-            )
+            }
 
             // Stop playback, but caller handles onError.
             stopInternal(source = "playfile_exception", ttsId = ttsId)
@@ -576,42 +892,64 @@ class AzureCloudTtsEngine(
         val id: Int = ttsId ?: (activeTtsId ?: -1)
 
         if (!stopOnce.compareAndSet(false, true)) {
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_STOP_DUPLICATE_IGNORED",
-                    "engine" to "Azure",
-                    "tts_id" to id,
-                    "speak_req_id" to activeSpeakReqId,
-                    "reply_to_row_id" to activeReplyToRowId,
-                    "conv_turn" to activeConvTurn,
-                    "source" to source
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_STOP_DUPLICATE_IGNORED",
+                        "engine" to "Azure",
+                        "tts_id" to id,
+                        "speak_req_id" to activeSpeakReqId,
+                        "reply_to_row_id" to activeReplyToRowId,
+                        "conv_turn" to activeConvTurn,
+
+                        // ✅ 6.4
+                        "reply_id" to activeReplyId,
+                        "reply_sha12" to activeReplySha12,
+
+                        "source" to source
+                    )
                 )
-            )
+            }
             return
         }
 
         synchronized(this) { activeStopTtsId = id }
+
+        // Snapshot correlation fields BEFORE we clear state
+        val sr = activeSpeakReqId
+        val rr = activeReplyToRowId
+        val ct = activeConvTurn
+        val rid = activeReplyId
+        val rsha = activeReplySha12
 
         // Stop/release player (safe)
         try { player?.stop() } catch (_: Throwable) {}
         try { player?.release() } catch (_: Throwable) {}
         player = null
 
-        ConversationTelemetry.emit(
-            mapOf(
-                "type" to "TTS_STOP",
-                "engine" to "Azure",
-                "tts_id" to id,
-                "speak_req_id" to activeSpeakReqId,
-                "reply_to_row_id" to activeReplyToRowId,
-                "conv_turn" to activeConvTurn,
-                "source" to source
-            )
-        )
+        runCatching {
+            ConversationTelemetry.emit(
+                mapOf(
+                    "type" to "TTS_STOP",
+                    "engine" to "Azure",
+                    "tts_id" to id,
+                    "speak_req_id" to sr,
+                    "reply_to_row_id" to rr,
+                    "conv_turn" to ct,
 
+                    // ✅ 6.4
+                    "reply_id" to rid,
+                    "reply_sha12" to rsha,
+
+                    "source" to source
+                )
+            )
+        }
+
+        // ✅ Abandon focus while fields are still present
         abandonAudioFocusIfHeld(id)
 
-        // Capture callbacks before clearing state
+        // Capture callbacks before clearing state (these should now be WRAPPERS — Patch B)
         val cbDone = activeOnDone
         val cbError = activeOnError
         val shouldInvokeTerminal = shouldInvokeTerminalCallbackOnStop(source)
@@ -622,45 +960,48 @@ class AzureCloudTtsEngine(
         // Legacy notification hook (if MainActivity uses it)
         try {
             onStopped?.invoke(id, source)
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_STOP_NOTIFIED",
-                    "engine" to "Azure",
-                    "tts_id" to id,
-                    "source" to source,
-                    "has_onStopped" to true
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_STOP_NOTIFIED",
+                        "engine" to "Azure",
+                        "tts_id" to id,
+                        "source" to source,
+                        "has_onStopped" to true
+                    )
                 )
-            )
+            }
         } catch (t: Throwable) {
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_STOP_NOTIFY_ERROR",
-                    "engine" to "Azure",
-                    "tts_id" to id,
-                    "source" to source,
-                    "message" to (t.message ?: t.toString())
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_STOP_NOTIFY_ERROR",
+                        "engine" to "Azure",
+                        "tts_id" to id,
+                        "source" to source,
+                        "message" to (t.message ?: t.toString())
+                    )
                 )
-            )
+            }
         }
 
-        // 🔥 CRITICAL PATCH: If this stop is terminal (focus loss, manual stop, etc),
-        // invoke a terminal callback so the app runs its finish logic and resumes listening.
         if (shouldInvokeTerminal) {
-            ConversationTelemetry.emit(
-                mapOf(
-                    "type" to "TTS_STOP_TERMINAL_CALLBACK",
-                    "engine" to "Azure",
-                    "tts_id" to id,
-                    "source" to source,
-                    "invokes" to (if (cbDone != null) "onDone" else if (cbError != null) "onError" else "none")
+            runCatching {
+                ConversationTelemetry.emit(
+                    mapOf(
+                        "type" to "TTS_STOP_TERMINAL_CALLBACK",
+                        "engine" to "Azure",
+                        "tts_id" to id,
+                        "source" to source,
+                        "invokes" to (if (cbDone != null) "onDone" else if (cbError != null) "onError" else "none")
+                    )
                 )
-            )
+            }
 
-            // Prefer onDone to avoid "fallback & repeat speech" behavior.
+            // Prefer onDone to avoid fallback loops. Wrapper guards telemetry inside.
             if (cbDone != null) {
                 mainHandler.post { cbDone.invoke() }
             } else if (cbError != null) {
-                // Worst-case fallback: surface as error so caller can still unstick.
                 val ex = IllegalStateException("Azure TTS stopped: $source")
                 mainHandler.post { cbError.invoke(ex) }
             }

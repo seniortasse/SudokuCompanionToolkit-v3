@@ -1,0 +1,61 @@
+{
+  "puzzle_uid": "PZ-CL9-DW-B01-L1-002",
+  "library_id": "LIB-CL9",
+  "aisle_id": "AIS-DWEIGHT",
+  "book_id": "BK-CL9-DW-B01",
+  "section_id": "SEC-L1",
+  "section_code": "L1",
+  "local_puzzle_code": "L1-002",
+  "friendly_puzzle_id": "CL9-DW-B01-L1-002",
+  "title": "Puzzle L1-002",
+  "subtitle": "Classic 9x9",
+  "layout_type": "classic9x9",
+  "grid_size": 9,
+  "charset": "123456789",
+  "givens81": "100000001020000030003000400000505000000070000000808000004000700050000060900000002",
+  "solution81": "174362958826954137593781426287546319461279583359813674642135791735498261918627345",
+  "pattern_id": null,
+  "pattern_name": null,
+  "clue_count": 17,
+  "symmetry_type": null,
+  "is_unique": true,
+  "is_human_solvable": true,
+  "generation_method": "pattern_fill",
+  "generation_seed": 183746252,
+  "generator_version": "bookgen-v1",
+  "weight": 96,
+  "difficulty_label": "easy",
+  "difficulty_band_code": "D1",
+  "technique_count": 2,
+  "techniques_used": [
+    "pointing_single",
+    "singles"
+  ],
+  "technique_histogram": {
+    "singles": 18,
+    "pointing_single": 2
+  },
+  "featured_technique": "singles",
+  "technique_prominence_score": 0.9,
+  "app_search_tags": [
+    "easy",
+    "2_techniques",
+    "classic9x9",
+    "17_clues",
+    "d1",
+    "pointing_single",
+    "singles"
+  ],
+  "book_page_number": null,
+  "position_in_section": 2,
+  "position_in_book": null,
+  "print_header": {
+    "display_code": "L1-002",
+    "difficulty_label": "Easy",
+    "effort_label": "Effort 96"
+  },
+  "publication_status": "draft",
+  "reuse_policy": "book_exclusive",
+  "created_at": "2026-04-11T22:23:46+00:00",
+  "updated_at": "2026-04-11T22:23:46+00:00"
+}

@@ -1,0 +1,20 @@
+{
+  "section_id": "SEC-L1",
+  "book_id": "BK-CL9-DW-B01",
+  "section_code": "L1",
+  "title": "Section 1",
+  "subtitle": "Easy band",
+  "section_order": 1,
+  "criteria": {
+    "weight_min": 0,
+    "weight_max": 120,
+    "required_techniques": [],
+    "excluded_techniques": [],
+    "pattern_ids": []
+  },
+  "difficulty_label_hint": "easy",
+  "puzzle_count": 100,
+  "puzzle_ids": [
+    "PZ-CL9-DW-B01-L1-001"
+  ]
+}

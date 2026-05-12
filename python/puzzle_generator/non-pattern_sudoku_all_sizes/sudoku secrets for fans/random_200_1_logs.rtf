@@ -1,0 +1,137 @@
+Instance:
+['9', '6', ' ', '7', '4', ' ', '8', '3', ' ']
+['7', '5', '4', ' ', ' ', '3', '9', ' ', '1']
+[' ', '3', ' ', '9', ' ', '5', '7', '2', ' ']
+['2', ' ', '5', ' ', '7', ' ', ' ', '1', '3']
+['6', ' ', ' ', '5', '1', ' ', ' ', ' ', '9']
+[' ', '4', '9', ' ', ' ', '2', '5', '7', '6']
+['3', '9', '8', ' ', ' ', '7', '6', ' ', ' ']
+['5', ' ', '7', '4', ' ', '6', ' ', '9', '8']
+[' ', '2', ' ', '3', '9', '8', ' ', '5', ' ']
+
+
+Step 1
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 1 and row + col dimensions, 5 only fits at (1, 9)
+Looking at row 1 and row + box dimensions, 5 only fits at (1, 9)
+Looking at row 3 and row + box dimensions, 4 only fits at (3, 9)
+Looking at row 4 and row + col dimensions, 9 only fits at (4, 6)
+Looking at row 4 and row + col dimensions, 6 only fits at (4, 4)
+Looking at row 5 and row + col dimensions, 7 only fits at (5, 2)
+Looking at row 6 and row + box dimensions, 1 only fits at (6, 1)
+Looking at row 6 and row + col dimensions, 3 only fits at (6, 5)
+Looking at row 7 and row + col dimensions, 1 only fits at (7, 4)
+Looking at row 8 and row + box dimensions, 3 only fits at (8, 7)
+Looking at row 9 and row + col dimensions, 6 only fits at (9, 3)
+Looking at row 9 and row + col dimensions, 7 only fits at (9, 9)
+Looking at col 1 and col + box dimensions, 4 only fits at (9, 1)
+Looking at col 2 and col + row dimensions, 1 only fits at (8, 2)
+Looking at col 2 and col + row dimensions, 7 only fits at (5, 2)
+Looking at col 3 and col + box dimensions, 6 only fits at (9, 3)
+Looking at col 3 and col + row dimensions, 3 only fits at (5, 3)
+Looking at col 3 and col + box dimensions, 3 only fits at (5, 3)
+Looking at col 5 and col + row dimensions, 5 only fits at (7, 5)
+Looking at col 5 and col + box dimensions, 3 only fits at (6, 5)
+Looking at col 6 and col + row dimensions, 1 only fits at (1, 6)
+Looking at col 6 and col + box dimensions, 1 only fits at (1, 6)
+Looking at col 6 and col + row dimensions, 9 only fits at (4, 6)
+Looking at col 8 and col + box dimensions, 8 only fits at (5, 8)
+Looking at col 8 and col + row dimensions, 6 only fits at (2, 8)
+Looking at col 8 and col + box dimensions, 6 only fits at (2, 8)
+Looking at col 9 and col + row dimensions, 7 only fits at (9, 9)
+Looking at box (1, 1) and box + col dimensions, 8 only fits at (3, 1)
+Looking at box (1, 1) and box + row dimensions, 2 only fits at (1, 3)
+Looking at box (1, 3) and box + row dimensions, 5 only fits at (1, 9)
+Looking at box (1, 3) and box + row dimensions, 4 only fits at (3, 9)
+Looking at box (1, 3) and box + col dimensions, 6 only fits at (2, 8)
+Looking at box (2, 1) and box + row dimensions, 1 only fits at (6, 1)
+Looking at box (2, 1) and box + col dimensions, 3 only fits at (5, 3)
+Looking at box (2, 2) and box + col dimensions, 3 only fits at (6, 5)
+Looking at box (2, 3) and box + col dimensions, 8 only fits at (5, 8)
+Looking at box (3, 1) and box + col dimensions, 4 only fits at (9, 1)
+Looking at box (3, 1) and box + col dimensions, 6 only fits at (9, 3)
+Looking at box (3, 2) and box + col dimensions, 1 only fits at (7, 4)
+Looking at box (3, 3) and box + row dimensions, 3 only fits at (8, 7)
+ Found 20 singles-2: [(1, 3, '2', 'box + row'), (1, 6, '1', 'col + row & col + box'), (1, 9, '5', 'row + col & row + box & box + row'), (2, 8, '6', 'col + row & col + box & box + col'), (3, 1, '8', 'box + col'), (3, 9, '4', 'row + box & box + row'), (4, 4, '6', 'row + col'), (4, 6, '9', 'row + col & col + row'), (5, 2, '7', 'row + col & col + row'), (5, 3, '3', 'col + row & col + box & box + col'), (5, 8, '8', 'col + box & box + col'), (6, 1, '1', 'row + box & box + row'), (6, 5, '3', 'row + col & col + box & box + col'), (7, 4, '1', 'row + col & box + col'), (7, 5, '5', 'col + row'), (8, 2, '1', 'col + row'), (8, 7, '3', 'row + box & box + row'), (9, 1, '4', 'col + box & box + col'), (9, 3, '6', 'row + col & col + box & box + col'), (9, 9, '7', 'row + col & col + row')]
+['9', '6', '2', '7', '4', '1', '8', '3', '5']
+['7', '5', '4', ' ', ' ', '3', '9', '6', '1']
+['8', '3', ' ', '9', ' ', '5', '7', '2', '4']
+['2', ' ', '5', '6', '7', '9', ' ', '1', '3']
+['6', '7', '3', '5', '1', ' ', ' ', '8', '9']
+['1', '4', '9', ' ', '3', '2', '5', '7', '6']
+['3', '9', '8', '1', '5', '7', '6', ' ', ' ']
+['5', '1', '7', '4', ' ', '6', '3', '9', '8']
+['4', '2', '6', '3', '9', '8', ' ', '5', '7']
+
+{'singles-2': 20}
+ 
+Step 2
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 6, 8 is the only missing value at (6, 4)
+Looking at row 8, 2 is the only missing value at (8, 5)
+Looking at row 9, 1 is the only missing value at (9, 7)
+Looking at col 2, 8 is the only missing value at (4, 2)
+Looking at col 3, 1 is the only missing value at (3, 3)
+Looking at col 6, 4 is the only missing value at (5, 6)
+Looking at col 8, 4 is the only missing value at (7, 8)
+Looking at col 9, 2 is the only missing value at (7, 9)
+Looking at box (1, 1), 1 is the only missing value at (3, 3)
+Looking at box (2, 1), 8 is the only missing value at (4, 2)
+Looking at box (3, 2), 2 is the only missing value at (8, 5)
+ Found 8 singles-1: [(3, 3, '1', 'col & box'), (4, 2, '8', 'col & box'), (5, 6, '4', 'col'), (6, 4, '8', 'row'), (7, 8, '4', 'col'), (7, 9, '2', 'col'), (8, 5, '2', 'row & box'), (9, 7, '1', 'row')]
+['9', '6', '2', '7', '4', '1', '8', '3', '5']
+['7', '5', '4', ' ', ' ', '3', '9', '6', '1']
+['8', '3', '1', '9', ' ', '5', '7', '2', '4']
+['2', '8', '5', '6', '7', '9', ' ', '1', '3']
+['6', '7', '3', '5', '1', '4', ' ', '8', '9']
+['1', '4', '9', '8', '3', '2', '5', '7', '6']
+['3', '9', '8', '1', '5', '7', '6', '4', '2']
+['5', '1', '7', '4', '2', '6', '3', '9', '8']
+['4', '2', '6', '3', '9', '8', '1', '5', '7']
+
+{'singles-1': 8, 'singles-2': 20}
+ 
+Step 3
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 3, 6 is the only missing value at (3, 5)
+Looking at row 4, 4 is the only missing value at (4, 7)
+Looking at row 5, 2 is the only missing value at (5, 7)
+Looking at col 4, 2 is the only missing value at (2, 4)
+ Found 4 singles-1: [(2, 4, '2', 'col'), (3, 5, '6', 'row'), (4, 7, '4', 'row'), (5, 7, '2', 'row')]
+['9', '6', '2', '7', '4', '1', '8', '3', '5']
+['7', '5', '4', '2', ' ', '3', '9', '6', '1']
+['8', '3', '1', '9', '6', '5', '7', '2', '4']
+['2', '8', '5', '6', '7', '9', '4', '1', '3']
+['6', '7', '3', '5', '1', '4', '2', '8', '9']
+['1', '4', '9', '8', '3', '2', '5', '7', '6']
+['3', '9', '8', '1', '5', '7', '6', '4', '2']
+['5', '1', '7', '4', '2', '6', '3', '9', '8']
+['4', '2', '6', '3', '9', '8', '1', '5', '7']
+
+{'singles-1': 12, 'singles-2': 20}
+ 
+Step 4
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 2, 8 is the only missing value at (2, 5)
+Looking at col 5, 8 is the only missing value at (2, 5)
+Looking at box (1, 2), 8 is the only missing value at (2, 5)
+ Found 1 singles-1: [(2, 5, '8', 'row & col & box')]
+['9', '6', '2', '7', '4', '1', '8', '3', '5']
+['7', '5', '4', '2', '8', '3', '9', '6', '1']
+['8', '3', '1', '9', '6', '5', '7', '2', '4']
+['2', '8', '5', '6', '7', '9', '4', '1', '3']
+['6', '7', '3', '5', '1', '4', '2', '8', '9']
+['1', '4', '9', '8', '3', '2', '5', '7', '6']
+['3', '9', '8', '1', '5', '7', '6', '4', '2']
+['5', '1', '7', '4', '2', '6', '3', '9', '8']
+['4', '2', '6', '3', '9', '8', '1', '5', '7']
+
+{'singles-1': 13, 'singles-2': 20}
+ 
+Techniques used: {'singles-1': 13, 'singles-2': 20}

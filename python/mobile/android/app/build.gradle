@@ -1,6 +1,7 @@
 plugins {
-    id 'com.android.application' version '8.5.0'
-    id 'org.jetbrains.kotlin.android' version '1.9.24'
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'com.chaquo.python'
 }
 
 import java.util.Properties
@@ -11,77 +12,47 @@ if (localPropsFile.exists()) {
     localProps.load(localPropsFile.newDataInputStream())
 }
 
-/**
- * Sanitizes secrets/props coming from:
- *  - local.properties
- *  - -P Gradle properties
- *
- * Handles:
- *  - surrounding quotes: "eastus", 'eastus'
- *  - trailing quotes: eastus"
- *  - accidental whitespace
- */
 def sanitizeProp = { Object v ->
     if (v == null) return ""
     def s = v.toString().trim()
 
-    // Strip wrapping quotes
     if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
         s = s.substring(1, s.length() - 1).trim()
     }
-
-    // Strip trailing quote(s) if only one side was quoted
-    while (s.endsWith('"') || s.endsWith("'")) {
-        s = s.substring(0, s.length() - 1).trim()
-    }
-    while (s.startsWith('"') || s.startsWith("'")) {
-        s = s.substring(1).trim()
-    }
-
+    while (s.endsWith('"') || s.endsWith("'")) s = s.substring(0, s.length() - 1).trim()
+    while (s.startsWith('"') || s.startsWith("'")) s = s.substring(1).trim()
     return s
 }
 
-// helper: prefer -Pkey, else local.properties; supports UPPERCASE and lowercase
 def readProp = { String... keys ->
     for (k in keys) {
         def v = project.findProperty(k)
         if (v != null && v.toString().trim().length() > 0) return sanitizeProp(v)
-
         v = localProps.getProperty(k)
         if (v != null && v.toString().trim().length() > 0) return sanitizeProp(v)
     }
     return ""
 }
 
-/**
- * Escape value safely for buildConfigField String literal.
- * Ensures we don't break Java string generation if key contains quotes/backslashes.
- */
 def asBuildConfigString = { String s ->
     if (s == null) s = ""
-    def escaped = s
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
+    def escaped = s.replace("\\", "\\\\").replace("\"", "\\\"")
     return "\"${escaped}\""
 }
 
-// Your file uses UPPERCASE; we also allow lowercase fallbacks
 def openAIApiKey      = readProp("OPENAI_API_KEY", "openAIApiKey")
 def azureSpeechKey    = readProp("AZURE_SPEECH_KEY", "azureSpeechKey")
 def azureSpeechRegion = readProp("AZURE_SPEECH_REGION", "azureSpeechRegion")
 
-// ---- OpenCV SDK location (autodetect both third_party and third-party) ----
 def openCvCandidates = [
         file("${projectDir}/src/main/cpp/third_party/OpenCV-android-sdk/sdk"),
         file("${projectDir}/src/main/cpp/third-party/OpenCV-android-sdk/sdk"),
-        // fallback to repo-root/third_party if someone builds from a different layout
         file("${rootProject.projectDir}/third_party/OpenCV-android-sdk/sdk")
 ]
 def opencvSdkRootFile = openCvCandidates.find { it.exists() }
 def opencvSdkRoot = opencvSdkRootFile ? opencvSdkRootFile.absolutePath.replace('\\','/') : null
 if (!opencvSdkRoot) {
-    println "❌ OpenCV SDK not found in expected locations. Expected one of:\n" +
-            openCvCandidates.collect { " - ${it}" }.join("\n")
+    println "❌ OpenCV SDK not found. Expected one of:\n" + openCvCandidates.collect { " - ${it}" }.join("\n")
 } else {
     println "✅ OpenCV SDK detected at: ${opencvSdkRoot}"
 }
@@ -97,31 +68,24 @@ android {
         versionCode 1
         versionName "1.0"
 
-        // Ship only arm64 (matches your OpenCV jniLibs and CMake config)
         ndk { abiFilters "arm64-v8a" }
 
-        // Let CMake decide the C++ standard per CMakeLists; keep only -O3 here.
         externalNativeBuild {
             cmake {
                 cppFlags "-O3"
                 if (opencvSdkRoot) {
-                    // Point CMake to the OpenCV prebuilt JNI config
                     arguments "-DOpenCV_DIR=${opencvSdkRoot}/native/jni"
                 }
             }
         }
 
-        // Expose keys to BuildConfig (sanitized + safely escaped)
         buildConfigField "String", "OPENAI_API_KEY",      asBuildConfigString(openAIApiKey)
         buildConfigField "String", "AZURE_SPEECH_KEY",    asBuildConfigString(azureSpeechKey)
         buildConfigField "String", "AZURE_SPEECH_REGION", asBuildConfigString(azureSpeechRegion)
     }
 
     packagingOptions {
-        jniLibs {
-            // Avoid clashes when other libs package libc++_shared
-            pickFirsts += ['**/libc++_shared.so']
-        }
+        jniLibs { pickFirsts += ['**/libc++_shared.so'] }
     }
 
     buildFeatures { buildConfig = true }
@@ -133,7 +97,6 @@ android {
         }
     }
 
-    // Java/Kotlin toolchains
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
@@ -142,6 +105,18 @@ android {
 
     androidResources {
         noCompress += ["tflite", "ptl", "pt", "bin", "onnx"]
+    }
+}
+
+// Minimal Chaquopy configuration.
+// (You can add pip installs later if you need Python packages.)
+chaquopy {
+    defaultConfig {
+        // Optional: specify Python version if you want
+        // version "3.11"
+        pip {
+            // keep empty for now
+        }
     }
 }
 
@@ -160,12 +135,10 @@ gradle.projectsEvaluated {
 }
 
 kotlin {
-    // Recommended with Kotlin 1.9+/AGP 8+
     jvmToolchain(17)
 }
 
 dependencies {
-    // OpenCV wrapper module (provides org.opencv.* classes & jniLibs)
     implementation project(':openCV')
 
     implementation "androidx.core:core-ktx:1.13.1"
@@ -173,29 +146,52 @@ dependencies {
     implementation "com.google.android.material:material:1.12.0"
     implementation "androidx.constraintlayout:constraintlayout:2.1.4"
 
-    // CameraX
     implementation "androidx.camera:camera-core:1.3.4"
     implementation "androidx.camera:camera-camera2:1.3.4"
     implementation "androidx.camera:camera-lifecycle:1.3.4"
     implementation "androidx.camera:camera-view:1.3.4"
 
-    // TFLite
     implementation "org.tensorflow:tensorflow-lite:2.14.0"
     implementation "org.tensorflow:tensorflow-lite-support:0.4.4"
     implementation "org.tensorflow:tensorflow-lite-select-tf-ops:2.14.0"
 
-    // PyTorch Mobile
     implementation "org.pytorch:pytorch_android:1.13.1"
     implementation "org.pytorch:pytorch_android_torchvision:1.13.1"
 
-    // Networking, coroutines, lifecycle, media
     implementation "com.squareup.okhttp3:okhttp:4.12.0"
     implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.8.0"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1"
     implementation "com.google.android.exoplayer:exoplayer:2.19.1"
 
-    // Tests
     androidTestImplementation "androidx.test.ext:junit:1.1.5"
     androidTestImplementation "androidx.test.espresso:espresso-core:3.5.1"
-    testImplementation 'junit:junit:4.13.2'
+    testImplementation "junit:junit:4.13.2"
+}
+
+// -------------------------------------------------------------------
+// Compatibility shim:
+// Some tools still try to run :app:testClasses (Java plugin task),
+// but Android modules don't define it. Provide it and delegate to the
+// real Android unit-test task.
+// -------------------------------------------------------------------
+afterEvaluate {
+    if (tasks.findByName("testClasses") == null) {
+        tasks.register("testClasses") {
+            group = "verification"
+            description = "Compatibility task for tools expecting ':app:testClasses'. Delegates to Android unit tests."
+
+            // Prefer the real Android unit test task if present.
+            def t = tasks.findByName("testDebugUnitTest")
+            if (t != null) dependsOn(t)
+
+            // Fallbacks (in case variant names differ)
+            def t2 = tasks.findByName("test")
+            if (t == null && t2 != null) dependsOn(t2)
+
+            // If neither exists, make it a no-op but still present (prevents hard failure).
+            doLast {
+                println("testClasses shim executed (delegated if possible).")
+            }
+        }
+    }
 }

@@ -1,0 +1,14 @@
+{
+  "aisle_id": "AIS-DWEIGHT",
+  "library_id": "LIB-CL9",
+  "slug": "difficulty-weight",
+  "title": "Puzzle Difficulty",
+  "description": "Books organized by effort and weight bands.",
+  "sort_order": 3,
+  "organization_principle": "weight_range",
+  "book_ids": [
+    "BK-CL9-DW-B01"
+  ],
+  "created_at": "2026-04-11T00:00:00Z",
+  "updated_at": "2026-04-11T00:00:00Z"
+}

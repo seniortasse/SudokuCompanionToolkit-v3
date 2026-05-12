@@ -2,16 +2,25 @@ package com.contextionary.sudoku
 
 import android.app.Application
 import android.util.Log
-//import org.opencv.core.Core
-//import org.opencv.android.OpenCVLoader
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 import org.opencv.core.Core
 
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // ✅ Chaquopy runtime init (required before any Python.getInstance() calls)
+        try {
+            if (!Python.isStarted()) {
+                Python.start(AndroidPlatform(this))
+                Log.i("Chaquopy", "Python started OK")
+            }
+        } catch (t: Throwable) {
+            Log.e("Chaquopy", "Python start failed", t)
+        }
+
         // 🔹 Run the debug smoke test at startup.
-        // It's safe to call in release too, but keep it while you're verifying.
         OpenCVSmoke.run(this)
 
         // Load native lib first (if it also depends on OpenCV, either order works in practice)
@@ -27,7 +36,6 @@ class App : Application() {
             Log.i("OpenCV", "Loaded OpenCV ${Core.getVersionString()}")
         } catch (t: Throwable) {
             Log.e("OpenCV", "OpenCV init failed", t)
-            // Consider showing a user-friendly message or disabling features that require OpenCV
         }
     }
 }

@@ -24,7 +24,7 @@ class PPConfig:
     thr_weak:   float = 0.3
 
     # Junction extraction
-    j_peak_thr: float = 0.02     # NEW: low default because your J means are ~0.001–0.003
+    j_peak_thr: float = 0.001    # make first-epoch J peaks guaranteed
     j_nms_radius: int = 2
     j_topk_min: int = 120        # ensure we always have enough candidates
     j_topk_cap: int = 180        # safety cap

@@ -1,0 +1,705 @@
+Github Versioning Reference Sudoku Companion
+
+
+This document is the repeatable process to use when saving, reviewing, versioning, and pushing the Sudoku Companion App + Book Publishing Platform to GitHub.
+
+Repository:
+
+https://github.com/seniortasse/SudokuCompanionToolkit-v3
+
+Local working directory:
+
+C:\Users\17347\Desktop\CONTEXTIONARY\1- SUDOKU COMPANION\SudokuCompanionToolkit v3
+
+1. Core principle
+
+Never push blindly.
+
+Use this order every time:
+
+Inspect → Clean → Test → Stage intentionally → Commit → Push branch → Verify CI → Merge/tag/release when stable
+
+For small safe changes, pushing directly to main can be acceptable. For large platform updates, new architecture, publishing engine changes, or many changed files, use a feature branch and pull request.
+
+2. Recommended branch model
+
+Use three kinds of Git history markers:
+
+main
+
+Stable working line. This should always be buildable or at least not knowingly broken.
+
+work/... or feature/... branches
+
+Use these for large development batches.
+
+Examples:
+
+work/publishing-platform-sync-2026-05
+feature/step-solution-packages
+feature/app-catalog-export
+fix/android-ci-build
+version tags
+
+Use tags when a meaningful milestone is pushed.
+
+Examples:
+
+v0.7.0
+v0.8.0
+v0.9.0
+v1.0.0
+
+Suggested interpretation:
+
+v0.7.0 — Publishing platform foundation + expanded app architecture
+v0.8.0 — App catalog + step-solution packages stable
+v0.9.0 — Voice solving loop and grid correction stable
+v1.0.0 — First public-ready Sudoku Companion release
+
+3. Files that should normally be committed
+
+Commit source code, configuration, workflow definitions, schemas, templates, and documentation.
+
+Usually commit:
+
+.github/
+python/**/*.py
+python/mobile/android/app/src/main/java/**/*.kt
+python/mobile/android/app/src/main/python/**/*.py
+python/publishing/**/*.py
+python/publishing/**/*.json if they are schemas/config templates
+python/publishing/**/*.md
+requirements.txt
+.gitignore
+.gitattributes
+README.md
+
+Commit publishing specs only when they are source-of-truth configuration, not generated output.
+
+Examples that may be good to commit:
+
+publication spec templates
+cover design definitions
+schema files
+workflow scripts
+localization template files
+small example fixtures
+4. Files that should normally NOT be committed
+
+Avoid committing generated outputs, local caches, private credentials, heavy datasets, and build artifacts.
+
+Usually do not commit:
+
+.venv/
+.gradle/
+build/
+.cxx/
+local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+runs/
+datasets/
+exports/
+models/
+debug/
+*.zip
+*.png, except Android app resource images explicitly allowed by .gitignore
+large generated PDFs
+large generated Excel output packages
+OpenCV Android SDK local copy
+
+If a file is generated and reproducible, prefer to ignore it and document the command that generates it.
+
+If a file is a large source asset that truly belongs in the repo, consider Git LFS or a separate artifact storage strategy.
+
+5. One-time safety checks before a major push
+
+Run from repo root:
+
+git status --short
+git branch -vv
+git remote -v
+git fetch origin
+git log --oneline --decorate --graph --max-count=20 --all
+
+Check ignored files:
+
+git status --ignored --short
+
+Check whether large files are about to be committed:
+
+git ls-files | ForEach-Object {
+  if (Test-Path $_) {
+    $item = Get-Item $_
+    if (-not $item.PSIsContainer -and $item.Length -gt 50MB) {
+      [PSCustomObject]@{ SizeMB = [math]::Round($item.Length / 1MB, 2); Path = $_ }
+    }
+  }
+} | Sort-Object SizeMB -Descending
+
+Check untracked large files:
+
+Get-ChildItem -Recurse -File -Force |
+  Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Length -gt 50MB } |
+  Select-Object @{Name='SizeMB';Expression={[math]::Round($_.Length / 1MB, 2)}}, FullName |
+  Sort-Object SizeMB -Descending
+
+Search for possible secrets before staging:
+
+git grep -n "OPENAI_API_KEY\|AZURE\|SECRET\|PASSWORD\|TOKEN\|PRIVATE KEY" -- .
+
+For untracked files, also search with PowerShell if needed:
+
+Get-ChildItem -Recurse -File -Force |
+  Where-Object { $_.FullName -notmatch '\\.git\\|\\.venv\\|\\build\\|\\.gradle\\' } |
+  Select-String -Pattern "OPENAI_API_KEY|AZURE|SECRET|PASSWORD|TOKEN|PRIVATE KEY" -CaseSensitive:$false
+6. Recommended major-update workflow
+
+Use this for large changes like the current update.
+
+Step 1 — start clean from repo root
+cd "C:\Users\17347\Desktop\CONTEXTIONARY\1- SUDOKU COMPANION\SudokuCompanionToolkit v3"
+git status --short
+git fetch origin
+Step 2 — create a safety branch from current work
+
+If you already have uncommitted changes, create the branch without changing files:
+
+git switch -c work/publishing-platform-sync-2026-05
+
+If the branch already exists:
+
+git switch work/publishing-platform-sync-2026-05
+Step 3 — review changes
+git status --short
+git diff --stat
+git diff --name-status
+
+For a very large repo update, save a review file:
+
+git diff --stat > git_diff_stat_before_commit.txt
+git status --short > git_status_before_commit.txt
+
+If these files are temporary, delete them after review or keep them under a docs/audit folder if useful.
+
+Step 4 — stage safely
+
+Do not start with git add . on a huge update unless you have checked ignored and large files first.
+
+Preferred:
+
+git add .gitignore .github requirements.txt
+
+
+git add python/publishing
+
+
+git add python/mobile/android/app/src/main/java
+
+
+git add python/mobile/android/app/src/main/python
+
+
+git add python/solver
+
+
+git add python/puzzle_generator
+
+Then inspect staged files:
+
+git status --short
+git diff --cached --stat
+git diff --cached --name-status
+Step 5 — unstage anything wrong
+
+Examples:
+
+git restore --staged path/to/file
+
+If a file should be ignored but is already tracked:
+
+git rm --cached path/to/file
+
+If a whole generated folder is already tracked but should no longer be tracked:
+
+git rm -r --cached datasets exports runs models debug
+
+Only use that command after checking carefully, because it will remove those paths from Git tracking while keeping local files.
+
+Step 6 — run practical validation
+
+At minimum:
+
+python --version
+python -m compileall python
+
+If Android Gradle files are present in your full local repo:
+
+cd python/mobile/android
+./gradlew.bat testDebugUnitTest
+./gradlew.bat assembleDebug
+cd ..\..\..
+
+If those Gradle files are outside the current folder or not present, skip locally and rely on GitHub Actions if configured.
+
+Step 7 — commit
+
+For the current major milestone, a good commit message would be:
+
+git commit -m "feat: add publishing platform and expanded Sudoku companion architecture"
+
+If Git says there is nothing to commit, inspect git status --short again.
+
+Step 8 — push branch
+git push -u origin work/publishing-platform-sync-2026-05
+Step 9 — open pull request
+
+Open GitHub and create a PR:
+
+work/publishing-platform-sync-2026-05 → main
+
+Suggested PR title:
+
+Publishing platform foundation + expanded Sudoku Companion architecture
+
+Suggested PR body:
+
+## Summary
+- Adds the Python Sudoku publishing platform foundation
+- Adds/updates puzzle generation, catalog, publication, cover, PDF, distribution, and workflow modules
+- Expands Android Sudoku Companion app architecture for camera, grid correction, voice, LLM, and solving conductor flows
+- Adds/updates step-solution tooling and app bridge logic
+
+
+## Validation
+- Ran: python -m compileall python
+- Android CI: pending / passed
+
+
+## Notes
+- Generated datasets, runs, exports, models, APK/AAB outputs, keystores, and local SDK artifacts are intentionally ignored
+Step 10 — after CI passes, merge PR
+
+Use GitHub’s merge button, preferably “Squash and merge” for a huge milestone if you want one clean commit on main.
+
+Then update local main:
+
+git switch main
+git pull origin main
+Step 11 — create a version tag
+
+If this is a real milestone:
+
+git tag -a v0.7.0 -m "v0.7.0 — Publishing platform foundation and expanded app architecture"
+git push origin v0.7.0
+
+Optional: create a GitHub Release from the tag.
+
+7. Smaller everyday save workflow
+
+Use this for normal daily progress.
+
+git status --short
+git diff --stat
+git add path/to/changed/source/files
+git diff --cached --stat
+git commit -m "type(scope): short description"
+git push
+
+Good commit message examples:
+
+feat(app): add grid confirmation recovery flow
+fix(tts): prevent ASR restart during playback
+test(publishing): add publication variant compiler fixtures
+chore(gitignore): ignore generated step solution packages
+docs: add GitHub versioning reference
+8. Commit message convention
+
+Use this simple format:
+
+type(scope): summary
+
+Useful types:
+
+feat     new feature
+fix      bug fix
+chore    tooling, cleanup, dependency, gitignore
+docs     documentation only
+test     tests and fixtures
+refactor internal restructuring without behavior change
+perf     performance improvement
+ci       GitHub Actions / build pipeline
+
+Useful scopes for this repo:
+
+app
+android
+vision
+voice
+tts
+asr
+conductor
+llm
+solver
+publishing
+catalog
+patterns
+book-builder
+cover
+pdf
+kdp
+step-solutions
+workflows
+ci
+
+Examples:
+
+feat(publishing): add publication variant bundle exporter
+feat(conductor): add deterministic route boundary controller
+fix(vision): improve grid corner refinement under perspective skew
+chore(gitignore): exclude generated publishing bundles
+9. Version tag convention
+
+Use semantic-style versions:
+
+v0.7.0 = major internal milestone
+v0.7.1 = patch/fix after v0.7.0
+v0.8.0 = next meaningful capability milestone
+
+Suggested next tag for the current update:
+
+v0.7.0
+
+Suggested release title:
+
+v0.7.0 — Publishing Platform Foundation + Expanded Companion App Architecture
+10. Emergency recovery commands
+
+See what changed:
+
+git status --short
+git diff --stat
+git diff --cached --stat
+
+Unstage everything, keep local files:
+
+git restore --staged .
+
+Discard changes to one file:
+
+git restore path/to/file
+
+Discard all uncommitted tracked-file changes:
+
+git restore .
+
+Remove untracked files preview only:
+
+git clean -nd
+
+Actually remove untracked files:
+
+git clean -fd
+
+Be very careful with git clean -fd; it deletes untracked files locally.
+
+See recent commits:
+
+git log --oneline --decorate --graph --max-count=20
+
+Return to previous branch:
+
+git switch -
+11. Rule for generated data
+
+For this project, generated outputs can become enormous. Default rule:
+
+Source of truth goes to Git.
+Generated artifacts do not go to Git.
+
+Examples:
+
+Commit: workflow code that generates interiors
+Do not commit: generated interior PDFs
+
+
+Commit: cover renderer code and cover design JSON source
+Do not commit: rendered PNG previews unless they are small curated docs/examples
+
+
+Commit: schema and publication spec templates
+Do not commit: exports/sudoku_books/bundles outputs
+
+
+Commit: Android Kotlin source
+Do not commit: APK/AAB/build outputs
+12. Current recommended update name
+
+For the current one-month batch, use:
+
+Branch:
+
+work/publishing-platform-sync-2026-05
+
+Commit:
+
+feat: add publishing platform and expanded Sudoku companion architecture
+
+Tag after merge:
+
+v0.7.0
+
+Release title:
+
+v0.7.0 — Publishing Platform Foundation + Expanded Companion App Architecture
+Thought for 1m 18s
+
+I created a reusable reference document for you in the canvas: “GitHub Versioning Reference — Sudoku Companion Toolkit v3.”
+
+Your GitHub repo is reachable and currently shows as a public repo on main, with 29 commits, 6 tags, and folders such as .github/workflows, models, python, tools, and yolo.
+
+Now here is how I would apply the process to your current local progress.
+
+Part A — Important warning before pushing
+
+Your .gitignore is mostly good, but it has one important consequence:
+
+datasets/
+exports/
+runs/
+models/
+debug/
+*.zip
+*.png
+*.jpg
+*.jpeg
+
+This means your generated publishing outputs will be protected from Git, which is good.
+
+But it also means that if some of your source-of-truth publishing specs live under datasets/, they will not be added by normal git add. That may be correct if datasets/ contains generated/private production data. But if it contains important JSON specs, localization files, book configs, or cover design configs that you want on GitHub, you need either to move those source files outside datasets/ or add precise exceptions.
+
+Also, .gitignore only prevents new ignored files from being tracked. If a file was already tracked in Git, changing .gitignore will not remove it automatically; you would need git rm --cached path/to/file. GitHub’s own docs describe .gitignore as the mechanism for excluding files from commits.
+
+Part B — Recommended current branch strategy
+
+Because this is a large one-month update and includes a whole new publishing platform, I would not push directly to main first.
+
+Use this branch:
+
+work/publishing-platform-sync-2026-05
+
+Then push that branch, let GitHub Actions run, open a PR, review, and merge into main.
+
+GitHub Actions workflows can be configured to run on branch or tag pushes, so your previous Android/Models workflows will likely trigger depending on your .github/workflows rules.
+
+Suggested commit message:
+
+feat: add publishing platform and expanded Sudoku companion architecture
+
+Suggested version tag after merge:
+
+v0.7.0
+
+Git tags are normally used to mark important release points, and GitHub releases are based on Git tags.
+
+Part C — Commands to run now in VS Code PowerShell
+
+Run these from your repo root:
+
+cd "C:\Users\17347\Desktop\CONTEXTIONARY\1- SUDOKU COMPANION\SudokuCompanionToolkit v3"
+1. Check where you are
+git status --short
+git branch -vv
+git remote -v
+git fetch origin
+git log --oneline --decorate --graph --max-count=20 --all
+
+Confirm that the remote points to:
+
+https://github.com/seniortasse/SudokuCompanionToolkit-v3
+2. Create a working branch
+git switch -c work/publishing-platform-sync-2026-05
+
+If Git says the branch already exists:
+
+git switch work/publishing-platform-sync-2026-05
+3. Inspect what changed
+git status --short
+git diff --stat
+git diff --name-status
+
+Also check ignored files:
+
+git status --ignored --short
+
+This is very important because your publishing outputs, datasets, models, images, and zip files may be ignored intentionally.
+
+4. Check for large tracked files
+git ls-files | ForEach-Object {
+  if (Test-Path $_) {
+    $item = Get-Item $_
+    if (-not $item.PSIsContainer -and $item.Length -gt 50MB) {
+      [PSCustomObject]@{ SizeMB = [math]::Round($item.Length / 1MB, 2); Path = $_ }
+    }
+  }
+} | Sort-Object SizeMB -Descending
+
+If this prints large files, inspect carefully before pushing.
+
+5. Check for large untracked files
+Get-ChildItem -Recurse -File -Force |
+  Where-Object { $_.FullName -notmatch '\\.git\\' -and $_.Length -gt 50MB } |
+  Select-Object @{Name='SizeMB';Expression={[math]::Round($_.Length / 1MB, 2)}}, FullName |
+  Sort-Object SizeMB -Descending
+
+This helps you catch accidental PDFs, exports, model files, zips, APKs, and image packs.
+
+6. Check for secrets before staging
+
+Run:
+
+git grep -n "OPENAI_API_KEY\|AZURE\|SECRET\|PASSWORD\|TOKEN\|PRIVATE KEY" -- .
+
+Also scan untracked files:
+
+Get-ChildItem -Recurse -File -Force |
+  Where-Object { $_.FullName -notmatch '\\.git\\|\\.venv\\|\\build\\|\\.gradle\\' } |
+  Select-String -Pattern "OPENAI_API_KEY|AZURE|SECRET|PASSWORD|TOKEN|PRIVATE KEY" -CaseSensitive:$false
+
+If you find real secrets, do not commit them. GitHub recommends avoiding hardcoded secrets and using environment variables or secret-management services instead.
+
+Part D — Stage the right files
+
+For this large update, avoid starting with git add ..
+
+Use targeted staging first:
+
+git add .gitignore .github requirements.txt
+git add python/publishing
+git add python/mobile/android/app/src/main/java
+git add python/mobile/android/app/src/main/python
+git add python/solver
+git add python/puzzle_generator
+
+Then inspect:
+
+git status --short
+git diff --cached --stat
+git diff --cached --name-status
+
+If you see something wrong staged:
+
+git restore --staged path/to/file
+
+If you discover an already-tracked generated folder should no longer be tracked:
+
+git rm -r --cached path/to/folder
+
+Example only, do not run blindly:
+
+git rm -r --cached exports runs debug
+Part E — Special check for publishing specs under datasets/
+
+Because your .gitignore ignores datasets/, run this:
+
+git status --ignored --short datasets
+
+If you see important source files under datasets/sudoku_books/... that you actually want in GitHub, do not simply remove datasets/ from .gitignore. A safer strategy is to add precise exceptions, for example:
+
+datasets/*
+!datasets/sudoku_books/
+datasets/sudoku_books/*
+!datasets/sudoku_books/classic9/
+datasets/sudoku_books/classic9/*
+!datasets/sudoku_books/classic9/publication_specs/
+!datasets/sudoku_books/classic9/publication_specs/**/*.json
+!datasets/sudoku_books/classic9/books/
+!datasets/sudoku_books/classic9/books/**/*.json
+!datasets/sudoku_books/classic9/cover_designs/
+!datasets/sudoku_books/classic9/cover_designs/**/*.json
+!datasets/sudoku_books/classic9/cover_designs/**/*.md
+
+But only add those exceptions if those files are truly source-of-truth, not generated/private production data.
+
+To test one file:
+
+git check-ignore -v "datasets/sudoku_books/classic9/publication_specs/YOUR_FILE.json"
+
+If Git prints the .gitignore rule, the file is ignored.
+
+Part F — Run validation
+
+At minimum:
+
+python --version
+python -m compileall python
+
+If your full local Android project has Gradle files available:
+
+cd python/mobile/android
+.\gradlew.bat testDebugUnitTest
+.\gradlew.bat assembleDebug
+cd ..\..\..
+
+If gradlew.bat is not there, skip this locally and let GitHub Actions validate what it can.
+
+Part G — Commit and push
+git commit -m "feat: add publishing platform and expanded Sudoku companion architecture"
+
+Then push the branch:
+
+git push -u origin work/publishing-platform-sync-2026-05
+
+GitHub’s docs describe git push as the command used to push local commits to a remote repository.
+
+Part H — Open the PR
+
+Open GitHub and create a PR:
+
+work/publishing-platform-sync-2026-05 → main
+
+Suggested title:
+
+Publishing platform foundation + expanded Sudoku Companion architecture
+
+Suggested PR body:
+
+## Summary
+- Adds the Python Sudoku publishing platform foundation
+- Adds/updates puzzle generation, catalog, book-building, publication, cover, PDF, distribution, and workflow modules
+- Expands Android Sudoku Companion app architecture for camera, grid correction, voice, LLM, and solving conductor flows
+- Adds/updates step-solution tooling and Android Python bridge logic
+
+## Validation
+- Ran: python -m compileall python
+- Android local build: pending / skipped / passed
+- GitHub Actions: pending
+
+## Notes
+- Generated datasets, runs, exports, models, APK/AAB outputs, keystores, local SDKs, and zip/media artifacts are intentionally ignored
+Part I — After CI passes
+
+Merge the PR into main.
+
+Then locally:
+
+git switch main
+git pull origin main
+
+Create the milestone tag:
+
+git tag -a v0.7.0 -m "v0.7.0 — Publishing platform foundation and expanded app architecture"
+git push origin v0.7.0
+
+Then optionally create a GitHub Release from v0.7.0. GitHub supports creating releases from existing tags or creating a new tag while drafting a release.
+
+The safest next thing for you to run first is:
+
+git status --short
+git status --ignored --short
+git diff --stat
+
+Then paste the output here, and I’ll help you decide exactly what should be staged, ignored, untracked, or committed.

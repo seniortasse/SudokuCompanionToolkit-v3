@@ -1,0 +1,1173 @@
+Instance:
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', ' ', ' ', ' ', ' ', ' ', ' ', '1']
+['4', ' ', ' ', ' ', ' ', '5', ' ', ' ', '3']
+['7', ' ', ' ', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '6', ' ', '2', ' ']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+[' ', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+
+Step 1
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 3 and row + col dimensions, 8 only fits at (3, 8)
+Looking at row 9 and row + box dimensions, 8 only fits at (9, 1)
+Looking at col 9 and col + row dimensions, 8 only fits at (5, 9)
+Looking at box (1, 1) and box + row dimensions, 3 only fits at (2, 3)
+Looking at box (1, 1) and box + col dimensions, 9 only fits at (3, 2)
+Looking at box (3, 1) and box + row dimensions, 8 only fits at (9, 1)
+ Found 5 singles-2: [(2, 3, '3', 'box + row'), (3, 2, '9', 'box + col'), (3, 8, '8', 'row + col'), (5, 9, '8', 'col + row'), (9, 1, '8', 'row + box & box + row')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', ' ', ' ', ' ', '1']
+['4', '9', ' ', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', ' ', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-2': 5}
+ 
+Step 2
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at box (1, 1), 7 is the only missing value at (3, 3)
+ Found 1 singles-1: [(3, 3, '7', 'box')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', ' ', ' ', ' ', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', ' ', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 5}
+ 
+Step 3
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 2 and row + col dimensions, 8 only fits at (2, 6)
+Looking at col 6 and col + row dimensions, 8 only fits at (2, 6)
+ Found 1 singles-2: [(2, 6, '8', 'row + col & col + row')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', ' ', ' ', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', ' ', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 6}
+ 
+Step 4
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+Looking at row 2 and row + col + box dimensions, 5 only fits at (2, 8)
+Looking at row 4 and row + col + box dimensions, 2 only fits at (4, 3)
+Looking at col 8 and col + row + box dimensions, 5 only fits at (2, 8)
+Looking at box (1, 3) and box + row + col dimensions, 5 only fits at (2, 8)
+Looking at box (2, 1) and box + row + col dimensions, 2 only fits at (4, 3)
+ Found 2 singles-3: [(2, 8, '5', 'row & col & box'), (4, 3, '2', 'row & box')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', ' ', '5', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 6, 'singles-3': 2}
+ 
+Step 5
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 2 and row + box dimensions, 9 only fits at (2, 7)
+Looking at col 3 and col + box dimensions, 4 only fits at (5, 3)
+Looking at box (1, 3) and box + row dimensions, 9 only fits at (2, 7)
+Looking at box (2, 1) and box + col dimensions, 4 only fits at (5, 3)
+ Found 2 singles-2: [(2, 7, '9', 'row + box & box + row'), (5, 3, '4', 'col + box & box + col')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', ' ', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 8, 'singles-3': 2}
+ 
+Step 6
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+Looking at row 8 and row + col + box dimensions, 9 only fits at (8, 8)
+Looking at box (3, 3) and box + row + col dimensions, 9 only fits at (8, 8)
+ Found 1 singles-3: [(8, 8, '9', 'row & box')]
+['1', '8', '5', '9', ' ', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 8, 'singles-3': 3}
+ 
+Step 7
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+ Found 0 singles-3: []
+[1mIdentify singles-naked-3[0m
+ Found 0 singles-naked-3: []
+Starting the iterative "cleanup" process as the regular process could not find any values
+[1mAdd next advanced technique (doubles-naked) to the process[0m
+[1mFirst try to apply the latest technique: doubles-naked[0m
+Checking 10 possible combinations for 5 empty cols in row 1
+Checking 1 possible combinations for 2 empty cols in row 2
+Found multiple-naked ('4', '7') in row 2 and cols (4, 5), removing multiple from other cells in row 2
+Checking 3 possible combinations for 3 empty cols in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Checking 21 possible combinations for 7 empty cols in row 7
+Checking 15 possible combinations for 6 empty cols in row 8
+Checking 6 possible combinations for 4 empty cols in row 9
+Checking 6 possible combinations for 4 empty rows in col 1
+Checking 10 possible combinations for 5 empty rows in col 2
+Checking 1 possible combinations for 2 empty rows in col 3
+Found multiple-naked ('1', '6') in col 3 and rows (7, 8), removing multiple from other cells in col 3
+Checking 21 possible combinations for 7 empty rows in col 4
+Checking 21 possible combinations for 7 empty rows in col 5
+Checking 6 possible combinations for 4 empty rows in col 6
+Found multiple-naked ('1', '3') in col 6 and rows (4, 9), removing multiple from other cells in col 6
+Remove 3 from (0, 5)
+Remove 1 from (7, 5)
+Remove 3 from (7, 5)
+Checking 15 possible combinations for 6 empty rows in col 7
+Checking 6 possible combinations for 4 empty rows in col 8
+Checking 6 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 15 possible combinations for 6 empty cells in box (1, 2)
+Found multiple-naked ('4', '7') in box (1, 2) with cells ((2, 4), (2, 5)), removing multiple from other cells in box (1, 2)
+Remove 7 from (0, 4)
+Remove 4 from (0, 4)
+Remove 7 from (0, 5)
+Checking 6 possible combinations for 4 empty cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 15 possible combinations for 6 empty cells in box (3, 1)
+Found multiple-naked ('1', '6') in box (3, 1) with cells ((7, 3), (8, 3)), removing multiple from other cells in box (3, 1)
+Remove 6 from (6, 1)
+Remove 1 from (6, 1)
+Remove 6 from (7, 1)
+Remove 1 from (7, 1)
+Checking 21 possible combinations for 7 empty cells in box (3, 2)
+Checking 6 possible combinations for 4 empty cells in box (3, 3)
+ >> Removing options
+ Remove '3' at (1, 6)
+ Remove '1' at (8, 6)
+ Remove '3' at (8, 6)
+ Remove '7' at (1, 5)
+ Remove '4' at (1, 5)
+ Remove '7' at (1, 6)
+ Remove '6' at (7, 2)
+ Remove '1' at (7, 2)
+ Remove '6' at (8, 2)
+ Remove '1' at (8, 2)
+ >> Identifying new values
+Found new char based on only possible occurrence in cell: 2 at (1, 6)
+Found new char based on only possible occurrence in row 1: 3 at (1, 5)
+Found new char based on only possible occurrence in col 6: 7 at (8, 6)
+Found new char based on only possible occurrence in box (1, 2): 3 at (1, 5)
+ -> After applying doubles-naked, found new value 3 at (1, 5)
+ -> After applying doubles-naked, found new value 2 at (1, 6)
+ -> After applying doubles-naked, found new value 7 at (8, 6)
+ Removed 10 options with doubles-naked, and found 3 new values:
+  ((1, 5), '3', 'row & box')
+  ((1, 6), '2', 'cell')
+  ((8, 6), '7', 'col')
+['1', '8', '5', '9', '3', ' ', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 8, 'singles-3': 3, 'doubles-naked': 1}
+ 
+Step 8
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+ Found 0 singles-3: []
+[1mIdentify singles-naked-3[0m
+ Found 0 singles-naked-3: []
+Starting the iterative "cleanup" process as the regular process could not find any values
+[1mAdd next advanced technique (doubles-naked) to the process[0m
+[1mFirst try to apply the latest technique: doubles-naked[0m
+Checking 6 possible combinations for 4 empty cols in row 1
+Checking 1 possible combinations for 2 empty cols in row 2
+Found multiple-naked ('4', '7') in row 2 and cols (4, 5), removing multiple from other cells in row 2
+Checking 3 possible combinations for 3 empty cols in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Checking 21 possible combinations for 7 empty cols in row 7
+Checking 15 possible combinations for 6 empty cols in row 8
+Checking 6 possible combinations for 4 empty cols in row 9
+Checking 6 possible combinations for 4 empty rows in col 1
+Checking 10 possible combinations for 5 empty rows in col 2
+Checking 1 possible combinations for 2 empty rows in col 3
+Found multiple-naked ('1', '6') in col 3 and rows (7, 8), removing multiple from other cells in col 3
+Checking 21 possible combinations for 7 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 6 possible combinations for 4 empty rows in col 6
+Found multiple-naked ('1', '3') in col 6 and rows (4, 9), removing multiple from other cells in col 6
+Remove 1 from (7, 5)
+Remove 3 from (7, 5)
+Checking 15 possible combinations for 6 empty rows in col 7
+Checking 6 possible combinations for 4 empty rows in col 8
+Checking 6 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 10 possible combinations for 5 empty cells in box (1, 2)
+Found multiple-naked ('4', '7') in box (1, 2) with cells ((2, 4), (2, 5)), removing multiple from other cells in box (1, 2)
+Remove 7 from (0, 5)
+Checking 6 possible combinations for 4 empty cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 15 possible combinations for 6 empty cells in box (3, 1)
+Found multiple-naked ('1', '6') in box (3, 1) with cells ((7, 3), (8, 3)), removing multiple from other cells in box (3, 1)
+Remove 6 from (6, 1)
+Remove 1 from (6, 1)
+Remove 6 from (7, 1)
+Remove 1 from (7, 1)
+Checking 21 possible combinations for 7 empty cells in box (3, 2)
+Checking 6 possible combinations for 4 empty cells in box (3, 3)
+ >> Removing options
+ Remove '1' at (8, 6)
+ Remove '3' at (8, 6)
+ Remove '7' at (1, 6)
+ Remove '6' at (7, 2)
+ Remove '1' at (7, 2)
+ Remove '6' at (8, 2)
+ Remove '1' at (8, 2)
+ >> Identifying new values
+Found new char based on only possible occurrence in cell: 2 at (1, 6)
+Found new char based on only possible occurrence in col 6: 7 at (8, 6)
+ -> After applying doubles-naked, found new value 2 at (1, 6)
+ -> After applying doubles-naked, found new value 7 at (8, 6)
+ Removed 7 options with doubles-naked, and found 2 new values:
+  ((1, 6), '2', 'cell')
+  ((8, 6), '7', 'col')
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', ' ', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', ' ', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 8, 'singles-3': 3, 'doubles-naked': 2}
+ 
+Step 9
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 3 and row + box dimensions, 2 only fits at (3, 7)
+Looking at col 6 and col + row dimensions, 7 only fits at (8, 6)
+Looking at box (1, 3) and box + row dimensions, 2 only fits at (3, 7)
+ Found 2 singles-2: [(3, 7, '2', 'row + box & box + row'), (8, 6, '7', 'col + row')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', ' ', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 10, 'singles-3': 3, 'doubles-naked': 2}
+ 
+Step 10
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+Looking at row 7 and row + col + box dimensions, 7 only fits at (7, 2)
+Looking at col 2 and col + row + box dimensions, 7 only fits at (7, 2)
+Looking at box (3, 1) and box + row + col dimensions, 7 only fits at (7, 2)
+ Found 1 singles-3: [(7, 2, '7', 'row & col & box')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+[' ', '7', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 10, 'singles-3': 4, 'doubles-naked': 2}
+ 
+Step 11
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+Looking at box (3, 1) and box + row + col dimensions, 5 only fits at (7, 1)
+ Found 1 singles-3: [(7, 1, '5', 'box')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+['5', '7', ' ', ' ', ' ', '9', '8', ' ', ' ']
+[' ', ' ', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 10, 'singles-3': 5, 'doubles-naked': 2}
+ 
+Step 12
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 7 and row + col dimensions, 2 only fits at (7, 4)
+Looking at col 1 and col + row dimensions, 2 only fits at (8, 1)
+Looking at col 1 and col + box dimensions, 2 only fits at (8, 1)
+Looking at box (3, 1) and box + col dimensions, 2 only fits at (8, 1)
+ Found 2 singles-2: [(7, 4, '2', 'row + col'), (8, 1, '2', 'col + row & col + box & box + col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+['5', '7', ' ', '2', ' ', '9', '8', ' ', ' ']
+['2', ' ', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 12, 'singles-3': 5, 'doubles-naked': 2}
+ 
+Step 13
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 7 and row + col dimensions, 3 only fits at (7, 8)
+Looking at box (3, 1) and box + col dimensions, 3 only fits at (8, 2)
+ Found 2 singles-2: [(7, 8, '3', 'row + col'), (8, 2, '3', 'box + col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+[' ', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 14, 'singles-3': 5, 'doubles-naked': 2}
+ 
+Step 14
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+ Found 0 singles-2: []
+[1mIdentify singles-naked-2[0m
+ Found 0 singles-naked-2: []
+[1mIdentify singles-3[0m
+ Found 0 singles-3: []
+[1mIdentify singles-naked-3[0m
+ Found 0 singles-naked-3: []
+Starting the iterative "cleanup" process as the regular process could not find any values
+[1mAdd next advanced technique (doubles-naked) to the process[0m
+[1mFirst try to apply the latest technique: doubles-naked[0m
+Checking 3 possible combinations for 3 empty cols in row 1
+Checking 1 possible combinations for 2 empty cols in row 2
+Found multiple-naked ('4', '7') in row 2 and cols (4, 5), removing multiple from other cells in row 2
+Checking 1 possible combinations for 2 empty cols in row 3
+Found multiple-naked ('1', '6') in row 3 and cols (4, 5), removing multiple from other cells in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Found multiple-naked ('1', '6') in row 6 and cols (2, 8), removing multiple from other cells in row 6
+Remove 1 from (5, 3)
+Remove 6 from (5, 8)
+Checking 3 possible combinations for 3 empty cols in row 7
+Checking 3 possible combinations for 3 empty cols in row 8
+Checking 6 possible combinations for 4 empty cols in row 9
+Checking 1 possible combinations for 2 empty rows in col 1
+Found multiple-naked ('3', '9') in col 1 and rows (5, 6), removing multiple from other cells in col 1
+Checking 3 possible combinations for 3 empty rows in col 2
+Checking 1 possible combinations for 2 empty rows in col 3
+Found multiple-naked ('1', '6') in col 3 and rows (7, 8), removing multiple from other cells in col 3
+Checking 15 possible combinations for 6 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 1 possible combinations for 2 empty rows in col 6
+Found multiple-naked ('1', '3') in col 6 and rows (4, 9), removing multiple from other cells in col 6
+Checking 10 possible combinations for 5 empty rows in col 7
+Checking 3 possible combinations for 3 empty rows in col 8
+Checking 6 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 6 possible combinations for 4 empty cells in box (1, 2)
+Found multiple-naked ('4', '7') in box (1, 2) with cells ((2, 4), (2, 5)), removing multiple from other cells in box (1, 2)
+Found multiple-naked ('1', '6') in box (1, 2) with cells ((3, 4), (3, 5)), removing multiple from other cells in box (1, 2)
+Checking 3 possible combinations for 3 empty cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Found multiple-naked ('3', '9') in box (2, 1) with cells ((5, 1), (6, 1)), removing multiple from other cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 1 possible combinations for 2 empty cells in box (3, 1)
+Found multiple-naked ('1', '6') in box (3, 1) with cells ((7, 3), (8, 3)), removing multiple from other cells in box (3, 1)
+Checking 10 possible combinations for 5 empty cells in box (3, 2)
+Checking 3 possible combinations for 3 empty cells in box (3, 3)
+ >> Removing options
+ Remove '1' at (6, 4)
+ Remove '6' at (6, 9)
+ >> Identifying new values
+ Removed 2 options with doubles-naked, and found 0 new values:
+Start the subprocess as no new value was found but at least one option removed
+Iteration 1 of the subprocess including techniques: ['doubles-naked']
+[1mApplying doubles-naked[0m
+Checking 3 possible combinations for 3 empty cols in row 1
+Checking 1 possible combinations for 2 empty cols in row 2
+Found multiple-naked ('4', '7') in row 2 and cols (4, 5), removing multiple from other cells in row 2
+Checking 1 possible combinations for 2 empty cols in row 3
+Found multiple-naked ('1', '6') in row 3 and cols (4, 5), removing multiple from other cells in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Found multiple-naked ('1', '6') in row 6 and cols (2, 8), removing multiple from other cells in row 6
+Checking 3 possible combinations for 3 empty cols in row 7
+Checking 3 possible combinations for 3 empty cols in row 8
+Checking 6 possible combinations for 4 empty cols in row 9
+Checking 1 possible combinations for 2 empty rows in col 1
+Found multiple-naked ('3', '9') in col 1 and rows (5, 6), removing multiple from other cells in col 1
+Checking 3 possible combinations for 3 empty rows in col 2
+Checking 1 possible combinations for 2 empty rows in col 3
+Found multiple-naked ('1', '6') in col 3 and rows (7, 8), removing multiple from other cells in col 3
+Checking 15 possible combinations for 6 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 1 possible combinations for 2 empty rows in col 6
+Found multiple-naked ('1', '3') in col 6 and rows (4, 9), removing multiple from other cells in col 6
+Checking 10 possible combinations for 5 empty rows in col 7
+Checking 3 possible combinations for 3 empty rows in col 8
+Checking 6 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 6 possible combinations for 4 empty cells in box (1, 2)
+Found multiple-naked ('4', '7') in box (1, 2) with cells ((2, 4), (2, 5)), removing multiple from other cells in box (1, 2)
+Found multiple-naked ('1', '6') in box (1, 2) with cells ((3, 4), (3, 5)), removing multiple from other cells in box (1, 2)
+Checking 3 possible combinations for 3 empty cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Found multiple-naked ('3', '9') in box (2, 1) with cells ((5, 1), (6, 1)), removing multiple from other cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 1 possible combinations for 2 empty cells in box (3, 1)
+Found multiple-naked ('1', '6') in box (3, 1) with cells ((7, 3), (8, 3)), removing multiple from other cells in box (3, 1)
+Checking 10 possible combinations for 5 empty cells in box (3, 2)
+Checking 3 possible combinations for 3 empty cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with doubles-naked, and found 0 new values:
+No new value found and no option removed, try to add the next advanced technique
+[1mAdd next advanced technique (triplets-naked) to the process[0m
+[1mFirst try to apply the latest technique: triplets-naked[0m
+Checking 1 possible combinations for 3 empty cols in row 1
+Found multiple-naked ('4', '6', '7') in row 1 and cols (7, 8, 9), removing multiple from other cells in row 1
+Checking 0 possible combinations for 2 empty cols in row 2
+Checking 0 possible combinations for 2 empty cols in row 3
+Checking 20 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Found multiple-naked ('3', '7', '9') in row 6 and cols (1, 4, 9), removing multiple from other cells in row 6
+Checking 1 possible combinations for 3 empty cols in row 7
+Found multiple-naked ('1', '4', '6') in row 7 and cols (3, 5, 9), removing multiple from other cells in row 7
+Checking 1 possible combinations for 3 empty cols in row 8
+Found multiple-naked ('1', '4', '6') in row 8 and cols (3, 4, 7), removing multiple from other cells in row 8
+Checking 4 possible combinations for 4 empty cols in row 9
+Checking 0 possible combinations for 2 empty rows in col 1
+Checking 1 possible combinations for 3 empty rows in col 2
+Found multiple-naked ('1', '5', '6') in col 2 and rows (4, 5, 6), removing multiple from other cells in col 2
+Checking 0 possible combinations for 2 empty rows in col 3
+Checking 20 possible combinations for 6 empty rows in col 4
+Checking 20 possible combinations for 6 empty rows in col 5
+Checking 0 possible combinations for 2 empty rows in col 6
+Checking 10 possible combinations for 5 empty rows in col 7
+Checking 1 possible combinations for 3 empty rows in col 8
+Found multiple-naked ('1', '4', '6') in col 8 and rows (1, 4, 6), removing multiple from other cells in col 8
+Checking 4 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 4 possible combinations for 4 empty cells in box (1, 2)
+Checking 1 possible combinations for 3 empty cells in box (1, 3)
+Found multiple-naked ('4', '6', '7') in box (1, 3) with cells ((1, 7), (1, 8), (1, 9)), removing multiple from other cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Found multiple-naked ('1', '5', '6') in box (2, 1) with cells ((4, 2), (5, 2), (6, 2)), removing multiple from other cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 20 possible combinations for 6 empty cells in box (2, 3)
+Checking 0 possible combinations for 2 empty cells in box (3, 1)
+Checking 10 possible combinations for 5 empty cells in box (3, 2)
+Checking 1 possible combinations for 3 empty cells in box (3, 3)
+Found multiple-naked ('1', '4', '6') in box (3, 3) with cells ((7, 9), (8, 7), (9, 7)), removing multiple from other cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with triplets-naked, and found 0 new values:
+[1mAdd next advanced technique (quads-naked) to the process[0m
+[1mFirst try to apply the latest technique: quads-naked[0m
+Checking 0 possible combinations for 3 empty cols in row 1
+Checking 0 possible combinations for 2 empty cols in row 2
+Checking 0 possible combinations for 2 empty cols in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 5 possible combinations for 5 empty cols in row 5
+Checking 5 possible combinations for 5 empty cols in row 6
+Checking 0 possible combinations for 3 empty cols in row 7
+Checking 0 possible combinations for 3 empty cols in row 8
+Checking 1 possible combinations for 4 empty cols in row 9
+Found multiple-naked ('1', '3', '5', '6') in row 9 and cols (4, 5, 6, 7), removing multiple from other cells in row 9
+Checking 0 possible combinations for 2 empty rows in col 1
+Checking 0 possible combinations for 3 empty rows in col 2
+Checking 0 possible combinations for 2 empty rows in col 3
+Checking 15 possible combinations for 6 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 0 possible combinations for 2 empty rows in col 6
+Checking 5 possible combinations for 5 empty rows in col 7
+Checking 0 possible combinations for 3 empty rows in col 8
+Checking 1 possible combinations for 4 empty rows in col 9
+Found multiple-naked ('4', '6', '7', '9') in col 9 and rows (1, 4, 6, 7), removing multiple from other cells in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 1 possible combinations for 4 empty cells in box (1, 2)
+Found multiple-naked ('1', '4', '6', '7') in box (1, 2) with cells ((2, 4), (2, 5), (3, 4), (3, 5)), removing multiple from other cells in box (1, 2)
+Checking 0 possible combinations for 3 empty cells in box (1, 3)
+Checking 5 possible combinations for 5 empty cells in box (2, 1)
+Checking 5 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 0 possible combinations for 2 empty cells in box (3, 1)
+Checking 5 possible combinations for 5 empty cells in box (3, 2)
+Checking 0 possible combinations for 3 empty cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with quads-naked, and found 0 new values:
+[1mAdd next advanced technique (singles-pointing) to the process[0m
+[1mFirst try to apply the latest technique: singles-pointing[0m
+Identified hor ray for '6' in box (1, 2) at row 3
+Identified hor ray for '1' in box (1, 2) at row 3
+Identified hor ray for '4' in box (1, 2) at row 2
+Identified hor ray for '7' in box (1, 2) at row 2
+Identified hor ray for '6' in box (1, 3) at row 1
+Identified hor ray for '4' in box (1, 3) at row 1
+Identified hor ray for '7' in box (1, 3) at row 1
+Identified ver ray for '6' in box (2, 1) at col 2
+Identified ver ray for '1' in box (2, 1) at col 2
+Identified ver ray for '3' in box (2, 1) at col 1
+Identified ver ray for '9' in box (2, 1) at col 1
+Identified ver ray for '5' in box (2, 1) at col 2
+Identified ver ray for '9' in box (2, 2) at col 5
+Identified hor ray for '4' in box (2, 3) at row 4
+Identified ver ray for '3' in box (2, 3) at col 7
+Identified ver ray for '9' in box (2, 3) at col 9
+Identified ver ray for '6' in box (3, 1) at col 3
+Identified ver ray for '1' in box (3, 1) at col 3
+Identified hor ray for '3' in box (3, 2) at row 9
+Identified hor ray for '5' in box (3, 2) at row 9
+Identified ver ray for '1' in box (3, 3) at col 7
+Remove 1 from (4, 7)
+Remove 1 from (5, 7)
+ >> Removing options
+ Remove '1' at (4, 7)
+ Remove '1' at (5, 7)
+ >> Identifying new values
+ Removed 2 options with singles-pointing, and found 0 new values:
+Start the subprocess as no new value was found but at least one option removed
+Iteration 1 of the subprocess including techniques: ['doubles-naked', 'triplets-naked', 'quads-naked', 'singles-pointing']
+[1mApplying doubles-naked[0m
+Checking 3 possible combinations for 3 empty cols in row 1
+Checking 1 possible combinations for 2 empty cols in row 2
+Found multiple-naked ('4', '7') in row 2 and cols (4, 5), removing multiple from other cells in row 2
+Checking 1 possible combinations for 2 empty cols in row 3
+Found multiple-naked ('1', '6') in row 3 and cols (4, 5), removing multiple from other cells in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Found multiple-naked ('1', '6') in row 6 and cols (2, 8), removing multiple from other cells in row 6
+Checking 3 possible combinations for 3 empty cols in row 7
+Checking 3 possible combinations for 3 empty cols in row 8
+Checking 6 possible combinations for 4 empty cols in row 9
+Checking 1 possible combinations for 2 empty rows in col 1
+Found multiple-naked ('3', '9') in col 1 and rows (5, 6), removing multiple from other cells in col 1
+Checking 3 possible combinations for 3 empty rows in col 2
+Checking 1 possible combinations for 2 empty rows in col 3
+Found multiple-naked ('1', '6') in col 3 and rows (7, 8), removing multiple from other cells in col 3
+Checking 15 possible combinations for 6 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 1 possible combinations for 2 empty rows in col 6
+Found multiple-naked ('1', '3') in col 6 and rows (4, 9), removing multiple from other cells in col 6
+Checking 10 possible combinations for 5 empty rows in col 7
+Checking 3 possible combinations for 3 empty rows in col 8
+Checking 6 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 6 possible combinations for 4 empty cells in box (1, 2)
+Found multiple-naked ('4', '7') in box (1, 2) with cells ((2, 4), (2, 5)), removing multiple from other cells in box (1, 2)
+Found multiple-naked ('1', '6') in box (1, 2) with cells ((3, 4), (3, 5)), removing multiple from other cells in box (1, 2)
+Checking 3 possible combinations for 3 empty cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Found multiple-naked ('3', '9') in box (2, 1) with cells ((5, 1), (6, 1)), removing multiple from other cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 1 possible combinations for 2 empty cells in box (3, 1)
+Found multiple-naked ('1', '6') in box (3, 1) with cells ((7, 3), (8, 3)), removing multiple from other cells in box (3, 1)
+Checking 10 possible combinations for 5 empty cells in box (3, 2)
+Checking 3 possible combinations for 3 empty cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with doubles-naked, and found 0 new values:
+[1mApplying triplets-naked[0m
+Checking 1 possible combinations for 3 empty cols in row 1
+Found multiple-naked ('4', '6', '7') in row 1 and cols (7, 8, 9), removing multiple from other cells in row 1
+Checking 0 possible combinations for 2 empty cols in row 2
+Checking 0 possible combinations for 2 empty cols in row 3
+Checking 20 possible combinations for 6 empty cols in row 4
+Checking 10 possible combinations for 5 empty cols in row 5
+Checking 10 possible combinations for 5 empty cols in row 6
+Found multiple-naked ('3', '7', '9') in row 6 and cols (1, 4, 9), removing multiple from other cells in row 6
+Checking 1 possible combinations for 3 empty cols in row 7
+Found multiple-naked ('1', '4', '6') in row 7 and cols (3, 5, 9), removing multiple from other cells in row 7
+Checking 1 possible combinations for 3 empty cols in row 8
+Found multiple-naked ('1', '4', '6') in row 8 and cols (3, 4, 7), removing multiple from other cells in row 8
+Checking 4 possible combinations for 4 empty cols in row 9
+Checking 0 possible combinations for 2 empty rows in col 1
+Checking 1 possible combinations for 3 empty rows in col 2
+Found multiple-naked ('1', '5', '6') in col 2 and rows (4, 5, 6), removing multiple from other cells in col 2
+Checking 0 possible combinations for 2 empty rows in col 3
+Checking 20 possible combinations for 6 empty rows in col 4
+Checking 20 possible combinations for 6 empty rows in col 5
+Checking 0 possible combinations for 2 empty rows in col 6
+Checking 10 possible combinations for 5 empty rows in col 7
+Checking 1 possible combinations for 3 empty rows in col 8
+Found multiple-naked ('1', '4', '6') in col 8 and rows (1, 4, 6), removing multiple from other cells in col 8
+Checking 4 possible combinations for 4 empty rows in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 4 possible combinations for 4 empty cells in box (1, 2)
+Checking 1 possible combinations for 3 empty cells in box (1, 3)
+Found multiple-naked ('4', '6', '7') in box (1, 3) with cells ((1, 7), (1, 8), (1, 9)), removing multiple from other cells in box (1, 3)
+Checking 10 possible combinations for 5 empty cells in box (2, 1)
+Found multiple-naked ('1', '5', '6') in box (2, 1) with cells ((4, 2), (5, 2), (6, 2)), removing multiple from other cells in box (2, 1)
+Checking 10 possible combinations for 5 empty cells in box (2, 2)
+Checking 20 possible combinations for 6 empty cells in box (2, 3)
+Checking 0 possible combinations for 2 empty cells in box (3, 1)
+Checking 10 possible combinations for 5 empty cells in box (3, 2)
+Checking 1 possible combinations for 3 empty cells in box (3, 3)
+Found multiple-naked ('1', '4', '6') in box (3, 3) with cells ((7, 9), (8, 7), (9, 7)), removing multiple from other cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with triplets-naked, and found 0 new values:
+[1mApplying quads-naked[0m
+Checking 0 possible combinations for 3 empty cols in row 1
+Checking 0 possible combinations for 2 empty cols in row 2
+Checking 0 possible combinations for 2 empty cols in row 3
+Checking 15 possible combinations for 6 empty cols in row 4
+Checking 5 possible combinations for 5 empty cols in row 5
+Checking 5 possible combinations for 5 empty cols in row 6
+Checking 0 possible combinations for 3 empty cols in row 7
+Checking 0 possible combinations for 3 empty cols in row 8
+Checking 1 possible combinations for 4 empty cols in row 9
+Found multiple-naked ('1', '3', '5', '6') in row 9 and cols (4, 5, 6, 7), removing multiple from other cells in row 9
+Checking 0 possible combinations for 2 empty rows in col 1
+Checking 0 possible combinations for 3 empty rows in col 2
+Checking 0 possible combinations for 2 empty rows in col 3
+Checking 15 possible combinations for 6 empty rows in col 4
+Checking 15 possible combinations for 6 empty rows in col 5
+Checking 0 possible combinations for 2 empty rows in col 6
+Checking 5 possible combinations for 5 empty rows in col 7
+Checking 0 possible combinations for 3 empty rows in col 8
+Checking 1 possible combinations for 4 empty rows in col 9
+Found multiple-naked ('4', '6', '7', '9') in col 9 and rows (1, 4, 6, 7), removing multiple from other cells in col 9
+Checking 0 possible combinations for 0 empty cells in box (1, 1)
+Checking 1 possible combinations for 4 empty cells in box (1, 2)
+Found multiple-naked ('1', '4', '6', '7') in box (1, 2) with cells ((2, 4), (2, 5), (3, 4), (3, 5)), removing multiple from other cells in box (1, 2)
+Checking 0 possible combinations for 3 empty cells in box (1, 3)
+Checking 5 possible combinations for 5 empty cells in box (2, 1)
+Checking 5 possible combinations for 5 empty cells in box (2, 2)
+Checking 15 possible combinations for 6 empty cells in box (2, 3)
+Checking 0 possible combinations for 2 empty cells in box (3, 1)
+Checking 5 possible combinations for 5 empty cells in box (3, 2)
+Checking 0 possible combinations for 3 empty cells in box (3, 3)
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with quads-naked, and found 0 new values:
+[1mApplying singles-pointing[0m
+Identified hor ray for '6' in box (1, 2) at row 3
+Identified hor ray for '1' in box (1, 2) at row 3
+Identified hor ray for '4' in box (1, 2) at row 2
+Identified hor ray for '7' in box (1, 2) at row 2
+Identified hor ray for '6' in box (1, 3) at row 1
+Identified hor ray for '4' in box (1, 3) at row 1
+Identified hor ray for '7' in box (1, 3) at row 1
+Identified ver ray for '6' in box (2, 1) at col 2
+Identified ver ray for '1' in box (2, 1) at col 2
+Identified ver ray for '3' in box (2, 1) at col 1
+Identified ver ray for '9' in box (2, 1) at col 1
+Identified ver ray for '5' in box (2, 1) at col 2
+Identified ver ray for '9' in box (2, 2) at col 5
+Identified ver ray for '1' in box (2, 3) at col 8
+Identified hor ray for '4' in box (2, 3) at row 4
+Identified ver ray for '3' in box (2, 3) at col 7
+Identified ver ray for '9' in box (2, 3) at col 9
+Identified ver ray for '6' in box (3, 1) at col 3
+Identified ver ray for '1' in box (3, 1) at col 3
+Identified hor ray for '3' in box (3, 2) at row 9
+Identified hor ray for '5' in box (3, 2) at row 9
+Identified ver ray for '1' in box (3, 3) at col 7
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with singles-pointing, and found 0 new values:
+No new value found and no option removed, try to add the next advanced technique
+[1mAdd next advanced technique (singles-boxed) to the process[0m
+[1mFirst try to apply the latest technique: singles-boxed[0m
+Identified singles-boxed for char '6' in row 1 and box (1, 3), removing all other options from the box
+Identified singles-boxed for char '4' in row 1 and box (1, 3), removing all other options from the box
+Identified singles-boxed for char '7' in row 1 and box (1, 3), removing all other options from the box
+Identified singles-boxed for char '4' in row 2 and box (1, 2), removing all other options from the box
+Identified singles-boxed for char '7' in row 2 and box (1, 2), removing all other options from the box
+Identified singles-boxed for char '6' in row 3 and box (1, 2), removing all other options from the box
+Identified singles-boxed for char '1' in row 3 and box (1, 2), removing all other options from the box
+Identified singles-boxed for char '4' in row 4 and box (2, 3), removing all other options from the box
+Identified singles-boxed for char '3' in row 9 and box (3, 2), removing all other options from the box
+Identified singles-boxed for char '5' in row 9 and box (3, 2), removing all other options from the box
+Identified singles-boxed for char '3' in col 1 and box (2, 1), removing all other options from the box
+Identified singles-boxed for char '9' in col 1 and box (2, 1), removing all other options from the box
+Identified singles-boxed for char '6' in col 2 and box (2, 1), removing all other options from the box
+Identified singles-boxed for char '1' in col 2 and box (2, 1), removing all other options from the box
+Identified singles-boxed for char '5' in col 2 and box (2, 1), removing all other options from the box
+Identified singles-boxed for char '6' in col 3 and box (3, 1), removing all other options from the box
+Identified singles-boxed for char '1' in col 3 and box (3, 1), removing all other options from the box
+Identified singles-boxed for char '9' in col 5 and box (2, 2), removing all other options from the box
+Identified singles-boxed for char '1' in col 7 and box (3, 3), removing all other options from the box
+Identified singles-boxed for char '3' in col 7 and box (2, 3), removing all other options from the box
+Identified singles-boxed for char '1' in col 8 and box (2, 3), removing all other options from the box
+Identified singles-boxed for char '9' in col 9 and box (2, 3), removing all other options from the box
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with singles-boxed, and found 0 new values:
+[1mAdd next advanced technique (doubles) to the process[0m
+[1mFirst try to apply the latest technique: doubles[0m
+Using version 2
+Found multiple in row 1: ('7', '4')
+Found multiple in row 2: ('6', '1')
+Found multiple in row 5: ('6', '1')
+Found multiple in col 0: ('9', '3')
+Found multiple in col 2: ('6', '1')
+Found multiple in col 5: ('1', '3')
+Found multiple in box (0, 1): ('4', '7')
+Found multiple in box (0, 1): ('1', '6')
+Found multiple in box (1, 0): ('3', '9')
+Found multiple in box (2, 0): ('1', '6')
+Found multiple in row 1: ('4', '7')
+Found multiple in row 2: ('1', '6')
+Found multiple in row 5: ('1', '6')
+Found multiple in col 0: ('3', '9')
+Found multiple in col 2: ('1', '6')
+Found multiple in col 5: ('1', '3')
+Found multiple in box (0, 1): ('4', '7')
+Found multiple in box (0, 1): ('1', '6')
+Found multiple in box (1, 0): ('3', '9')
+Found multiple in box (2, 0): ('1', '6')
+Identified multiple ('4', '7') in row 2 and cols (4, 5), removing all other options
+Identified multiple ('1', '6') in row 3 and cols (4, 5), removing all other options
+Identified multiple ('1', '6') in row 6 and cols (2, 8), removing all other options
+Identified multiple ('3', '9') in col 1 and rows (5, 6), removing all other options
+Identified multiple ('1', '6') in col 3 and rows (7, 8), removing all other options
+Identified multiple ('1', '3') in col 6 and rows (4, 9), removing all other options
+Identified multiple ('4', '7') in box (1, 2) at [(2, 4), (2, 5)], removing all other options
+Identified multiple ('1', '6') in box (1, 2) at [(3, 4), (3, 5)], removing all other options
+Identified multiple ('1', '6') in box (3, 1) at [(7, 3), (8, 3)], removing all other options
+Identified multiple ('3', '9') in box (2, 1) at [(5, 1), (6, 1)], removing all other options
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with doubles, and found 0 new values:
+[1mAdd next advanced technique (triplets) to the process[0m
+[1mFirst try to apply the latest technique: triplets[0m
+Using version 2
+Found multiple in row 0: ('7', '6', '4')
+Found multiple in row 5: ('7', '3', '9')
+Found multiple in row 6: ('4', '6', '1')
+Found multiple in row 7: ('4', '6', '1')
+Found multiple in col 1: ('6', '5', '1')
+Found multiple in col 7: ('4', '6', '1')
+Found multiple in box (0, 2): ('4', '6', '7')
+Found multiple in box (1, 0): ('1', '5', '6')
+Found multiple in box (2, 2): ('1', '4', '6')
+Identified multiple ('4', '6', '7') in row 1 and cols (7, 8, 9), removing all other options
+Identified multiple ('3', '7', '9') in row 6 and cols (1, 4, 9), removing all other options
+Identified multiple ('1', '4', '6') in row 7 and cols (3, 5, 9), removing all other options
+Identified multiple ('1', '4', '6') in row 8 and cols (3, 4, 7), removing all other options
+Identified multiple ('1', '5', '6') in col 2 and rows (4, 5, 6), removing all other options
+Identified multiple ('1', '4', '6') in col 8 and rows (1, 4, 6), removing all other options
+Identified multiple ('4', '6', '7') in box (1, 3) at [(1, 7), (1, 8), (1, 9)], removing all other options
+Identified multiple ('1', '5', '6') in box (2, 1) at [(4, 2), (5, 2), (6, 2)], removing all other options
+Identified multiple ('1', '4', '6') in box (3, 3) at [(7, 9), (8, 7), (9, 7)], removing all other options
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with triplets, and found 0 new values:
+[1mAdd next advanced technique (quads) to the process[0m
+[1mFirst try to apply the latest technique: quads[0m
+Using version 2
+Found multiple in row 8: ('6', '5', '1', '3')
+Found multiple in col 8: ('9', '7', '6', '4')
+Found multiple in box (0, 1): ('1', '4', '6', '7')
+Identified multiple ('1', '3', '5', '6') in row 9 and cols (4, 5, 6, 7), removing all other options
+Identified multiple ('4', '6', '7', '9') in col 9 and rows (1, 4, 6, 7), removing all other options
+Identified multiple ('1', '4', '6', '7') in box (1, 2) at [(2, 4), (2, 5), (3, 4), (3, 5)], removing all other options
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with quads, and found 0 new values:
+[1mAdd next advanced technique (x-wings) to the process[0m
+[1mFirst try to apply the latest technique: x-wings[0m
+ >> Removing options
+ >> Identifying new values
+ Removed 0 options with x-wings, and found 0 new values:
+[1mAdd next advanced technique (y-wings) to the process[0m
+[1mFirst try to apply the latest technique: y-wings[0m
+Found a y-wing with wings (5, 1) and (6, 9) and center (5, 7)
+Removing wing value '9' from cells with shared dimension: [(5, 7), (5, 8), (5, 9), (6, 1), (6, 2), (6, 3)]
+Remove '9' from (6, 1)
+Found a y-wing with wings (5, 7) and (6, 1) and center (6, 9)
+Removing wing value '3' from cells with shared dimension: [(5, 1), (5, 2), (5, 3), (6, 7), (6, 8), (6, 9)]
+Remove '3' from (5, 1)
+Found a y-wing with wings (6, 1) and (6, 4) and center (6, 9)
+Removing wing value '3' from cells with shared dimension: [(6, 2), (6, 3), (6, 5), (6, 6), (6, 7), (6, 8), (6, 9)]
+Found a y-wing with wings (6, 1) and (6, 9) and center (6, 4)
+Removing wing value '9' from cells with shared dimension: [(6, 2), (6, 3), (6, 4), (6, 5), (6, 6), (6, 7), (6, 8)]
+Found a y-wing with wings (6, 4) and (6, 9) and center (6, 1)
+Removing wing value '7' from cells with shared dimension: [(6, 1), (6, 2), (6, 3), (6, 5), (6, 6), (6, 7), (6, 8)]
+ >> Removing options
+ Remove '9' at (6, 1)
+ Remove '3' at (5, 1)
+ >> Identifying new values
+Found new char based on only possible occurrence in cell: 9 at (5, 1)
+Found new char based on only possible occurrence in cell: 3 at (6, 1)
+Found new char based on only possible occurrence in row 6: 9 at (6, 9)
+Found new char based on only possible occurrence in col 1: 3 at (6, 1)
+Found new char based on only possible occurrence in col 1: 9 at (5, 1)
+Found new char based on only possible occurrence in box (2, 1): 3 at (6, 1)
+Found new char based on only possible occurrence in box (2, 1): 9 at (5, 1)
+ -> After applying y-wings, found new value 9 at (5, 1)
+ -> After applying y-wings, found new value 3 at (6, 1)
+ -> After applying y-wings, found new value 9 at (6, 9)
+ Removed 2 options with y-wings, and found 3 new values:
+  ((5, 1), '9', 'cell & col & box')
+  ((6, 1), '3', 'cell & col & box')
+  ((6, 9), '9', 'row')
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+['9', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+[' ', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 1, 'singles-2': 14, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 15
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at col 1, 3 is the only missing value at (6, 1)
+ Found 1 singles-1: [(6, 1, '3', 'col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', ' ', ' ', ' ', ' ', ' ']
+['9', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+['3', ' ', '8', ' ', '2', '4', '5', ' ', ' ']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 2, 'singles-2': 14, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 16
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 6 and row + col dimensions, 9 only fits at (6, 9)
+Looking at col 5 and col + row dimensions, 9 only fits at (4, 5)
+ Found 2 singles-2: [(4, 5, '9', 'col + row'), (6, 9, '9', 'row + col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', ' ']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', ' ', '2', '8', '9', ' ', ' ', ' ', ' ']
+['9', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+['3', ' ', '8', ' ', '2', '4', '5', ' ', '9']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 2, 'singles-2': 16, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 17
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 4 and row + col dimensions, 5 only fits at (4, 2)
+Looking at row 6 and row + col dimensions, 7 only fits at (6, 4)
+Looking at col 9 and col + row dimensions, 7 only fits at (1, 9)
+ Found 3 singles-2: [(1, 9, '7', 'col + row'), (4, 2, '5', 'row + col'), (6, 4, '7', 'row + col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', '7']
+['6', '2', '3', ' ', ' ', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', ' ', ' ', ' ', ' ']
+['9', ' ', '4', ' ', ' ', '6', ' ', '2', '8']
+['3', ' ', '8', '7', '2', '4', '5', ' ', '9']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 2, 'singles-2': 19, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 18
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 2 and row + col dimensions, 7 only fits at (2, 5)
+Looking at row 5 and row + box dimensions, 7 only fits at (5, 7)
+Looking at col 2 and col + row dimensions, 6 only fits at (6, 2)
+Looking at col 7 and col + row dimensions, 7 only fits at (5, 7)
+Looking at box (2, 1) and box + row dimensions, 6 only fits at (6, 2)
+Looking at box (2, 3) and box + row dimensions, 7 only fits at (5, 7)
+ Found 3 singles-2: [(2, 5, '7', 'row + col'), (5, 7, '7', 'row + box & col + row & box + row'), (6, 2, '6', 'col + row & box + row')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', '7']
+['6', '2', '3', ' ', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', ' ', ' ', ' ', ' ']
+['9', ' ', '4', ' ', ' ', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', ' ', '9']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 2, 'singles-2': 22, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 19
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 2, 4 is the only missing value at (2, 4)
+Looking at row 6, 1 is the only missing value at (6, 8)
+Looking at col 2, 1 is the only missing value at (5, 2)
+Looking at box (2, 1), 1 is the only missing value at (5, 2)
+ Found 3 singles-1: [(2, 4, '4', 'row'), (5, 2, '1', 'col & box'), (6, 8, '1', 'row')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', ' ', ' ', ' ', ' ']
+['9', '1', '4', ' ', ' ', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', ' ', '2', ' ', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', ' ', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 5, 'singles-2': 22, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 20
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 4 and row + box dimensions, 1 only fits at (4, 6)
+Looking at row 5 and row + col dimensions, 3 only fits at (5, 4)
+Looking at row 8 and row + col dimensions, 4 only fits at (8, 7)
+Looking at col 5 and col + row dimensions, 4 only fits at (7, 5)
+Looking at col 7 and col + box dimensions, 3 only fits at (4, 7)
+Looking at box (2, 2) and box + row dimensions, 1 only fits at (4, 6)
+Looking at box (2, 3) and box + col dimensions, 3 only fits at (4, 7)
+ Found 5 singles-2: [(4, 6, '1', 'row + box & box + row'), (4, 7, '3', 'col + box & box + col'), (5, 4, '3', 'row + col'), (7, 5, '4', 'col + row'), (8, 7, '4', 'row + col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', ' ', ' ']
+['9', '1', '4', '3', ' ', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', ' ', '2', '4', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', '4', '9', '5']
+['8', '4', '9', ' ', ' ', ' ', ' ', '7', '2']
+
+{'singles-1': 5, 'singles-2': 27, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 21
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 5, 5 is the only missing value at (5, 5)
+Looking at col 6, 3 is the only missing value at (9, 6)
+Looking at box (2, 2), 5 is the only missing value at (5, 5)
+ Found 2 singles-1: [(5, 5, '5', 'row & box'), (9, 6, '3', 'col')]
+['1', '8', '5', '9', '3', '2', ' ', ' ', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', ' ', ' ']
+['9', '1', '4', '3', '5', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', ' ', '2', '4', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', '4', '9', '5']
+['8', '4', '9', ' ', ' ', '3', ' ', '7', '2']
+
+{'singles-1': 7, 'singles-2': 27, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 22
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+ Found 0 singles-1: []
+[1mIdentify singles-2[0m
+Looking at row 1 and row + col dimensions, 4 only fits at (1, 8)
+Looking at row 7 and row + col dimensions, 1 only fits at (7, 3)
+Looking at row 9 and row + col dimensions, 5 only fits at (9, 4)
+Looking at col 4 and col + row dimensions, 5 only fits at (9, 4)
+Looking at col 7 and col + row dimensions, 1 only fits at (9, 7)
+Looking at col 7 and col + box dimensions, 1 only fits at (9, 7)
+Looking at col 9 and col + row dimensions, 4 only fits at (4, 9)
+Looking at col 9 and col + box dimensions, 4 only fits at (4, 9)
+Looking at box (1, 3) and box + col dimensions, 4 only fits at (1, 8)
+Looking at box (3, 3) and box + col dimensions, 1 only fits at (9, 7)
+ Found 5 singles-2: [(1, 8, '4', 'row + col & box + col'), (4, 9, '4', 'col + row & col + box'), (7, 3, '1', 'row + col'), (9, 4, '5', 'row + col & col + row'), (9, 7, '1', 'col + row & col + box & box + col')]
+['1', '8', '5', '9', '3', '2', ' ', '4', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', ' ', '4']
+['9', '1', '4', '3', '5', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', '1', '2', '4', '9', '8', '3', ' ']
+['2', '3', ' ', ' ', '8', '7', '4', '9', '5']
+['8', '4', '9', '5', ' ', '3', '1', '7', '2']
+
+{'singles-1': 7, 'singles-2': 32, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 23
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 1, 6 is the only missing value at (1, 7)
+Looking at row 4, 6 is the only missing value at (4, 8)
+Looking at row 7, 6 is the only missing value at (7, 9)
+Looking at row 9, 6 is the only missing value at (9, 5)
+Looking at col 3, 6 is the only missing value at (8, 3)
+Looking at col 7, 6 is the only missing value at (1, 7)
+Looking at col 8, 6 is the only missing value at (4, 8)
+Looking at col 9, 6 is the only missing value at (7, 9)
+Looking at box (1, 3), 6 is the only missing value at (1, 7)
+Looking at box (2, 3), 6 is the only missing value at (4, 8)
+Looking at box (3, 1), 6 is the only missing value at (8, 3)
+Looking at box (3, 3), 6 is the only missing value at (7, 9)
+ Found 5 singles-1: [(1, 7, '6', 'row & col & box'), (4, 8, '6', 'row & col & box'), (7, 9, '6', 'row & col & box'), (8, 3, '6', 'col & box'), (9, 5, '6', 'row')]
+['1', '8', '5', '9', '3', '2', '6', '4', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', ' ', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', '6', '4']
+['9', '1', '4', '3', '5', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', '1', '2', '4', '9', '8', '3', '6']
+['2', '3', '6', ' ', '8', '7', '4', '9', '5']
+['8', '4', '9', '5', '6', '3', '1', '7', '2']
+
+{'singles-1': 12, 'singles-2': 32, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 24
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 8, 1 is the only missing value at (8, 4)
+Looking at col 5, 1 is the only missing value at (3, 5)
+Looking at box (3, 2), 1 is the only missing value at (8, 4)
+ Found 2 singles-1: [(3, 5, '1', 'col'), (8, 4, '1', 'row & box')]
+['1', '8', '5', '9', '3', '2', '6', '4', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', ' ', '1', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', '6', '4']
+['9', '1', '4', '3', '5', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', '1', '2', '4', '9', '8', '3', '6']
+['2', '3', '6', '1', '8', '7', '4', '9', '5']
+['8', '4', '9', '5', '6', '3', '1', '7', '2']
+
+{'singles-1': 14, 'singles-2': 32, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Step 25
+Apply the base (singles) techniques
+[1mIdentify singles-1[0m
+Looking at row 3, 6 is the only missing value at (3, 4)
+Looking at col 4, 6 is the only missing value at (3, 4)
+Looking at box (1, 2), 6 is the only missing value at (3, 4)
+ Found 1 singles-1: [(3, 4, '6', 'row & col & box')]
+['1', '8', '5', '9', '3', '2', '6', '4', '7']
+['6', '2', '3', '4', '7', '8', '9', '5', '1']
+['4', '9', '7', '6', '1', '5', '2', '8', '3']
+['7', '5', '2', '8', '9', '1', '3', '6', '4']
+['9', '1', '4', '3', '5', '6', '7', '2', '8']
+['3', '6', '8', '7', '2', '4', '5', '1', '9']
+['5', '7', '1', '2', '4', '9', '8', '3', '6']
+['2', '3', '6', '1', '8', '7', '4', '9', '5']
+['8', '4', '9', '5', '6', '3', '1', '7', '2']
+
+{'singles-1': 15, 'singles-2': 32, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}
+ 
+Techniques used: {'singles-1': 15, 'singles-2': 32, 'singles-3': 5, 'doubles-naked': 2, 'y-wings': 1}

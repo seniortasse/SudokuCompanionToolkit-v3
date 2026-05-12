@@ -1,0 +1,7 @@
+Wave 3 generator workflow expects normalized JSONL input.
+
+One JSON object per line.
+Each line should match the shape shown in generator_candidate.example.json.
+
+This is a temporary-but-intentional bridge format for the first
+canonical puzzle-record pipeline.

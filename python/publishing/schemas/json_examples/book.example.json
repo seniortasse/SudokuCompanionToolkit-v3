@@ -1,0 +1,33 @@
+{
+  "book_id": "BK-CL9-DW-B01",
+  "library_id": "LIB-CL9",
+  "aisle_id": "AIS-DWEIGHT",
+  "title": "Classic Sudoku Easy to Medium",
+  "subtitle": "A gradual effort progression",
+  "series_name": "Classic Sudoku Library",
+  "volume_number": 1,
+  "isbn": null,
+  "description": "A standard 9x9 Sudoku book progressing from easier to medium-weight puzzles.",
+  "target_audience": "general",
+  "trim_size": "8.5x11",
+  "puzzles_per_page": 4,
+  "page_layout_profile": "classic_four_up",
+  "solution_section_policy": "appendix",
+  "cover_theme": "classic_blue",
+  "layout_type": "classic9x9",
+  "grid_size": 9,
+  "section_ids": [
+    "SEC-L1",
+    "SEC-L2",
+    "SEC-L3"
+  ],
+  "puzzle_count": 300,
+  "publication_status": "draft",
+  "search_tags": [
+    "easy",
+    "medium",
+    "classic9x9"
+  ],
+  "created_at": "2026-04-11T00:00:00Z",
+  "updated_at": "2026-04-11T00:00:00Z"
+}
