@@ -1,0 +1,11 @@
+Wave 6 renderer expects a built book bundle of this shape:
+
+datasets/sudoku_books/classic9/books/BK-.../
+  book_manifest.json
+  sections/
+    SEC-L1.json
+    SEC-L2.json
+  puzzles/
+    PZ-....json
+
+The renderer consumes this built bundle and writes a printable PDF.

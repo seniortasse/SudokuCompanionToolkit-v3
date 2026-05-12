@@ -1,0 +1,21 @@
+{
+  "library_id": "LIB-CL9",
+  "slug": "classic9",
+  "title": "Classic Sudoku Library",
+  "subtitle": "Standard 9x9 Sudoku catalog",
+  "description": "The classic 9x9 Sudoku library used by the app and by printable book production.",
+  "layout_type": "classic9x9",
+  "grid_size": 9,
+  "charset": "123456789",
+  "box_schema": "3x3",
+  "status": "active",
+  "aisle_ids": [
+    "AIS-TCOUNT",
+    "AIS-CTECH",
+    "AIS-DWEIGHT",
+    "AIS-PATTERN",
+    "AIS-MISC"
+  ],
+  "created_at": "2026-04-11T00:00:00Z",
+  "updated_at": "2026-04-11T00:00:00Z"
+}

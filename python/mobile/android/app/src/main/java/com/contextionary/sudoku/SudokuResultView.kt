@@ -64,6 +64,95 @@ class SudokuResultView @JvmOverloads constructor(
         strokeWidth = 4f
     }
 
+
+    private val solvePaintDigit = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+    private val solvePaintConfinedDigit = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+    private val solvePaintConfinedCircle = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.WHITE
+        strokeWidth = 3f
+    }
+
+    private val solvePaintSubsetCandidates = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+    }
+
+
+    // ----------------------------
+// Solve Overlay (Milestone 2)
+// ----------------------------
+    private var solveOverlayFocusCellIndex: Int? = null
+    private var solveOverlayHighlights: List<org.json.JSONObject> = emptyList()
+    private var solveOverlayRevealCellIndex: Int? = null
+    private var solveOverlayRevealDigit: Int? = null
+
+    private val solvePaintFocus = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.argb(60, 255, 235, 59) // soft yellow
+    }
+    private val solvePaintPattern = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.argb(40, 33, 150, 243) // soft blue
+    }
+    private val solvePaintElim = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.argb(40, 244, 67, 54) // soft red
+    }
+    private val solvePaintReveal = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.argb(70, 76, 175, 80) // soft green
+    }
+
+
+    // Phase 4: Link rendering (fish/wings/chains)
+    private val solvePaintLinkA = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = android.graphics.Color.argb(170, 255, 255, 255) // bright white-ish
+    }
+
+    private val solvePaintLinkB = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        // dashed-ish (optional but helpful)
+        pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+        color = android.graphics.Color.argb(170, 255, 255, 255)
+    }
+
+    private val solvePaintLinkNeutral = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = android.graphics.Color.argb(140, 255, 255, 255)
+    }
+
+    private val solvePaintLinkNode = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.argb(190, 255, 255, 255)
+    }
+
+
+
     /** Listener for cell taps. */
     interface OnCellClickListener {
         fun onCellClicked(row: Int, col: Int)
@@ -267,6 +356,37 @@ class SudokuResultView @JvmOverloads constructor(
         confirmationAnimator = null
     }
 
+
+    // ---------------- Cleanup helpers (Seal UI) ----------------
+
+    fun clearLogicAnnotations() {
+        java.util.Arrays.fill(changedFlags, false)
+        java.util.Arrays.fill(unresolvedFlags, false)
+        invalidate()
+    }
+
+    fun clearAnnotations() = clearLogicAnnotations()
+
+    fun clearChanged() {
+        java.util.Arrays.fill(changedFlags, false)
+        invalidate()
+    }
+
+    fun clearUnresolved() {
+        java.util.Arrays.fill(unresolvedFlags, false)
+        invalidate()
+    }
+
+    // If you later add other highlight systems, wire them here.
+// For now, these are safe no-ops that still force a redraw.
+    fun clearHighlights() {
+        invalidate()
+    }
+
+    fun clearConflictBorders() {
+        invalidate()
+    }
+
     // ------------- Palette & thresholds -------------
     private val COLOR_HIGH = Color.WHITE
     private val COLOR_MED  = Color.argb(0xE0, 0xFF, 0xD5, 0x4F)
@@ -390,6 +510,11 @@ class SudokuResultView @JvmOverloads constructor(
 
         // Candidate text size (smaller)
         candPaint.textSize = (cell - 2f * cellInset) * 0.32f
+
+        solvePaintDigit.textSize = cell * 0.28f
+        solvePaintConfinedDigit.textSize = cell * 0.38f
+        solvePaintConfinedCircle.strokeWidth = maxOf(2f, cell * 0.045f)
+        solvePaintSubsetCandidates.textSize = textPaint.textSize * 0.70f
     }
 
     // ---------------- Drawing ----------------
@@ -415,6 +540,9 @@ class SudokuResultView @JvmOverloads constructor(
             drawAlignedV(canvas, x, boardRect.top, boardRect.bottom, gridPaint)
             drawAlignedH(canvas, y, boardRect.left, boardRect.right, gridPaint)
         }
+
+        // ✅ Solve overlay (highlights/focus/reveal)
+        drawSolveOverlay(canvas)
 
         // 4) Digits + markers + annotations
         for (r in 0 until 9) for (c in 0 until 9) {
@@ -488,6 +616,320 @@ class SudokuResultView @JvmOverloads constructor(
             }
         }
     }
+
+
+    private fun drawSolveOverlay(canvas: Canvas) {
+        val cs = cell
+        if (cs <= 0f) return
+
+        val gridLeft = boardRect.left
+        val gridTop = boardRect.top
+
+        // 1) Focus cell (if any)
+        solveOverlayFocusCellIndex?.let { idx ->
+            if (idx in 0..80) {
+                val r = idx / 9
+                val c = idx % 9
+                val left = gridLeft + c * cs
+                val top = gridTop + r * cs
+                canvas.drawRect(left, top, left + cs, top + cs, solvePaintFocus)
+            }
+        }
+
+        // 2) Highlights list
+        // 2) Highlights list (cells/houses first, then links on top)
+        if (solveOverlayHighlights.isNotEmpty()) {
+
+            // Collect links so we can draw them after fills.
+            val linkHighlights = ArrayList<org.json.JSONObject>()
+
+            // Helper: center of a cell in pixels.
+            fun cellCenter(idx: Int): Pair<Float, Float> {
+                val r = idx / 9
+                val c = idx % 9
+                val cx = gridLeft + c * cs + cs * 0.5f
+                val cy = gridTop + r * cs + cs * 0.5f
+                return cx to cy
+            }
+
+            // Pass 1: draw cell/house fills + digit mini annotations
+            for (h in solveOverlayHighlights) {
+                val kind = h.optString("kind").trim()
+
+                if (kind.equals("link", ignoreCase = true)) {
+                    linkHighlights += h
+                    continue
+                }
+
+                val role = h.optString("role").trim()
+
+                val paint = when (role.lowercase()) {
+                    "focus" -> solvePaintFocus
+
+                    // Setup / pattern / explanation tableau roles
+                    "subset_house" -> solvePaintPattern
+                    "secondary_house" -> solvePaintPattern
+                    "source_house" -> solvePaintPattern
+                    "target_house" -> solvePaintPattern
+
+                    // Pattern CELLS should now share the same yellow fill as focus
+                    "subset_member" -> solvePaintFocus
+                    "subset_candidates" -> solvePaintFocus
+                    "pattern_cell" -> solvePaintFocus
+                    "overlap_cell" -> solvePaintFocus
+                    "confined_digit" -> solvePaintFocus
+                    "pattern" -> solvePaintFocus
+
+                    // Keep explanation / bridge helpers blue
+                    "sweep_cell" -> solvePaintPattern
+                    "witness" -> solvePaintPattern
+                    "peer" -> solvePaintPattern
+
+                    // Proof / elimination roles
+                    "elimination", "elim", "eliminate_digit" -> solvePaintElim
+                    "target_eliminations" -> solvePaintElim
+                    "target_remaining" -> solvePaintFocus
+                    "reveal" -> solvePaintReveal
+                    "lock_digit" -> solvePaintPattern
+
+                    else -> solvePaintPattern
+                }
+
+                if (kind.equals("cell", ignoreCase = true)) {
+                    val idx = if (h.has("cellIndex")) h.optInt("cellIndex", -1) else -1
+                    if (idx !in 0..80) continue
+                    val r = idx / 9
+                    val c = idx % 9
+                    val left = gridLeft + c * cs
+                    val top = gridTop + r * cs
+                    val rect = RectF(left, top, left + cs, top + cs)
+                    canvas.drawRect(rect, paint)
+
+// NEW: centered overlay-specific candidate grid for subset cells
+                    val candsArr = h.optJSONArray("candidates")
+                    val cands = buildList {
+                        if (candsArr != null) {
+                            for (i in 0 until candsArr.length()) {
+                                val d = candsArr.optInt(i, -1)
+                                if (d in 1..9) add(d)
+                            }
+                        }
+                    }.distinct().sorted()
+
+                    if (cands.isNotEmpty()) {
+                        drawOverlaySubsetCandidates(canvas, rect, cands)
+                    } else {
+                        val d = h.optInt("digit", -1)
+                        when {
+                            role.equals("confined_digit", ignoreCase = true) && d in 1..9 -> {
+                                drawOverlayConfinedDigit(canvas, rect, d)
+                            }
+
+                            // legacy single-digit top-right annotation (kept for other overlay roles)
+                            d in 1..9 -> {
+                                val tx = left + cs * 0.78f
+                                val ty = top + cs * 0.32f
+                                canvas.drawText(d.toString(), tx, ty, solvePaintDigit)
+                            }
+                        }
+                    }
+
+                } else if (kind.equals("house", ignoreCase = true)) {
+                    val ho = h.optJSONObject("house") ?: continue
+                    val type = ho.optString("type").trim()
+                    val index1 = ho.optInt("index1to9", -1)
+                    if (index1 !in 1..9) continue
+
+                    when (type.lowercase()) {
+                        "row" -> {
+                            val rr = index1 - 1
+                            for (cc in 0..8) {
+                                val left = gridLeft + cc * cs
+                                val top = gridTop + rr * cs
+                                canvas.drawRect(left, top, left + cs, top + cs, paint)
+                            }
+                        }
+                        "col" -> {
+                            val cc = index1 - 1
+                            for (rr in 0..8) {
+                                val left = gridLeft + cc * cs
+                                val top = gridTop + rr * cs
+                                canvas.drawRect(left, top, left + cs, top + cs, paint)
+                            }
+                        }
+                        "box" -> {
+                            val b = index1 - 1
+                            val br = (b / 3) * 3
+                            val bc = (b % 3) * 3
+                            for (dr in 0..2) for (dc in 0..2) {
+                                val rr = br + dr
+                                val cc = bc + dc
+                                val left = gridLeft + cc * cs
+                                val top = gridTop + rr * cs
+                                canvas.drawRect(left, top, left + cs, top + cs, paint)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Pass 2: draw links on top (simple line between cell centers)
+            for (h in linkHighlights) {
+                val role = h.optString("role").trim().lowercase()
+
+                // Accept both camelCase and snake_case keys
+                val fromIdx = when {
+                    h.has("fromCellIndex") -> h.optInt("fromCellIndex", -1)
+                    h.has("from_cell_index") -> h.optInt("from_cell_index", -1)
+                    else -> -1
+                }
+                val toIdx = when {
+                    h.has("toCellIndex") -> h.optInt("toCellIndex", -1)
+                    h.has("to_cell_index") -> h.optInt("to_cell_index", -1)
+                    else -> -1
+                }
+
+                if (fromIdx !in 0..80 || toIdx !in 0..80) continue
+
+                val (x1, y1) = cellCenter(fromIdx)
+                val (x2, y2) = cellCenter(toIdx)
+
+                val p = when {
+                    role.contains("link_a") -> solvePaintLinkA
+                    role.contains("link_b") -> solvePaintLinkB
+                    role.contains("inference_link") -> solvePaintLinkNeutral
+                    else -> solvePaintLinkNeutral
+                }
+
+                canvas.drawLine(x1, y1, x2, y2, p)
+
+                // Endpoint nodes (helps visibility even if line overlaps highlights)
+                val rad = cs * 0.08f
+                canvas.drawCircle(x1, y1, rad, solvePaintLinkNode)
+                canvas.drawCircle(x2, y2, rad, solvePaintLinkNode)
+            }
+        }
+
+        // 3) Reveal (stronger highlight)
+        val ridx = solveOverlayRevealCellIndex
+        if (ridx != null && ridx in 0..80) {
+            val r = ridx / 9
+            val c = ridx % 9
+            val left = gridLeft + c * cs
+            val top = gridTop + r * cs
+            canvas.drawRect(left, top, left + cs, top + cs, solvePaintReveal)
+
+            // ✅ digit annotation for reveal (if present)
+            val rd = solveOverlayRevealDigit
+            if (rd != null && rd in 1..9) {
+                val tx = left + cs * 0.78f
+                val ty = top + cs * 0.32f
+                canvas.drawText(rd.toString(), tx, ty, solvePaintDigit)
+            }
+        }
+    }
+
+
+    private fun drawOverlayConfinedDigit(
+        canvas: Canvas,
+        rect: RectF,
+        digit: Int
+    ) {
+        if (digit !in 1..9) return
+
+        val radius = min(rect.width(), rect.height()) * 0.28f
+        val cx = rect.centerX()
+        val cy = rect.centerY()
+
+        canvas.drawCircle(cx, cy, radius, solvePaintConfinedCircle)
+
+        val fm = solvePaintConfinedDigit.fontMetrics
+        val baselineAdjust = -(fm.ascent + fm.descent) / 2f
+        canvas.drawText(
+            digit.toString(),
+            cx,
+            cy + baselineAdjust,
+            solvePaintConfinedDigit
+        )
+    }
+
+
+    private fun drawOverlaySubsetCandidates(
+        canvas: Canvas,
+        rect: RectF,
+        digits: List<Int>
+    ) {
+        val ds = digits.filter { it in 1..9 }.distinct().sorted().take(4)
+        if (ds.isEmpty()) return
+
+        val cols: Int
+        val rows: Int
+        when (ds.size) {
+            1 -> {
+                cols = 1
+                rows = 1
+            }
+            2 -> {
+                cols = 2
+                rows = 1
+            }
+            3 -> {
+                cols = 3
+                rows = 1
+            }
+            else -> {
+                // 4 digits => 2 x 2
+                cols = 2
+                rows = 2
+            }
+        }
+
+        val contentW = rect.width() * 0.64f
+        val contentH = if (rows == 1) {
+            rect.height() * 0.28f
+        } else {
+            rect.height() * 0.48f
+        }
+
+        val startX = rect.centerX() - contentW / 2f
+        val startY = rect.centerY() - contentH / 2f
+        val cellW = contentW / cols
+        val cellH = contentH / rows
+
+        val fm = solvePaintSubsetCandidates.fontMetrics
+        val baselineAdjust = -(fm.ascent + fm.descent) / 2f
+
+        ds.forEachIndexed { i, d ->
+            val row: Int
+            val col: Int
+
+            when (ds.size) {
+                1 -> {
+                    row = 0
+                    col = 0
+                }
+                2 -> {
+                    row = 0
+                    col = i
+                }
+                3 -> {
+                    row = 0
+                    col = i
+                }
+                else -> {
+                    row = i / 2
+                    col = i % 2
+                }
+            }
+
+            val cx = startX + col * cellW + cellW * 0.5f
+            val cy = startY + row * cellH + cellH * 0.5f + baselineAdjust
+            canvas.drawText(d.toString(), cx, cy, solvePaintSubsetCandidates)
+        }
+    }
+
+
+
 
     // Draw 3×3 candidate notes inside a cell.
     private fun drawMiniCandidates(canvas: Canvas, rect: RectF, mask: Int) {
@@ -602,5 +1044,58 @@ class SudokuResultView @JvmOverloads constructor(
         canvas.drawColor(Color.BLACK)
         draw(canvas)
         return bmp
+    }
+
+
+
+    fun clearSolveOverlay() {
+        solveOverlayFocusCellIndex = null
+        solveOverlayHighlights = emptyList()
+        solveOverlayRevealCellIndex = null
+        solveOverlayRevealDigit = null
+        invalidate()
+    }
+
+    /**
+     * Primary entrypoint: the conductor/runner gives us the SAME JSON it emitted,
+     * we store it and render highlights in onDraw.
+     */
+    fun setSolveOverlayFromJson(frameJson: String) {
+        val obj = runCatching { org.json.JSONObject(frameJson) }.getOrNull() ?: return
+        val v = obj.optInt("v", 0)
+        if (v != 1) return
+
+        val focusIdx = obj.optJSONObject("focus")
+            ?.let { f -> if (f.isNull("cellIndex")) null else f.optInt("cellIndex", -1).takeIf { it in 0..80 } }
+
+        val revealObj = obj.optJSONObject("reveal")
+        val revealIdx = revealObj?.optInt("cellIndex", -1)?.takeIf { it in 0..80 }
+        val revealDigit = revealObj?.optInt("digit", -1)?.takeIf { it in 1..9 }
+
+        val hiArr = obj.optJSONArray("highlights")
+        val highlights = ArrayList<org.json.JSONObject>()
+        if (hiArr != null) {
+            for (i in 0 until hiArr.length()) {
+                val h = hiArr.optJSONObject(i) ?: continue
+                highlights += h
+            }
+        }
+
+        solveOverlayFocusCellIndex = focusIdx
+        solveOverlayRevealCellIndex = revealIdx
+        solveOverlayRevealDigit = revealDigit
+        solveOverlayHighlights = highlights
+
+
+        invalidate()
+    }
+
+    /**
+     * Optional convenience used by older runner code.
+     */
+    fun showSolvePlacementHint(cellIndex: Int, digit: Int) {
+        solveOverlayRevealCellIndex = cellIndex.takeIf { it in 0..80 }
+        solveOverlayRevealDigit = digit.takeIf { it in 1..9 }
+        invalidate()
     }
 }

@@ -3,6 +3,9 @@ pluginManagement {
         google()
         mavenCentral()
         gradlePluginPortal()
+
+        // Chaquopy plugin + Python artifacts repository
+        maven { url "https://chaquo.com/maven" }
     }
 }
 
@@ -11,10 +14,13 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+
+        // Chaquopy runtime + Python wheels
+        maven { url "https://chaquo.com/maven" }
     }
 }
 
 rootProject.name = "SudokuCompanion"
 
 include(":app")
-include(":openCV") // our thin wrapper module around the OpenCV SDK
+include(":openCV")

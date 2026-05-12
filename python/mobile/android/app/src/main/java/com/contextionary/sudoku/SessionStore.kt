@@ -2,6 +2,19 @@ package com.contextionary.sudoku
 
 import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
+import org.json.JSONObject
+
+import com.contextionary.sudoku.conductor.policy.AssistantTallyV1
+import com.contextionary.sudoku.conductor.policy.ContextSpanHintV1
+import com.contextionary.sudoku.conductor.policy.RelationshipDeltaV1
+import com.contextionary.sudoku.conductor.policy.RelationshipMemoryMergerV1
+import com.contextionary.sudoku.conductor.policy.RelationshipMemoryV1
+import com.contextionary.sudoku.conductor.policy.RepairSignalV1
+import com.contextionary.sudoku.conductor.policy.TranscriptTurnV1
+import com.contextionary.sudoku.conductor.policy.TurnContextV1
+import com.contextionary.sudoku.conductor.policy.UserTallyV1
+
+
 
 /**
  * SessionStore — single source of truth for the CURRENT capture session.
@@ -99,6 +112,14 @@ object SessionStore {
             pendingCellIdx = cellIdx,
             pendingDigit = digit
         )
+
+        // Phase 4: deterministic discourse update
+        discourseTopicIssue = kind?.name?.lowercase()
+        if (cellIdx != null) discourseTopicCell = cellNameOfIndex(cellIdx)
+
+        discourseOpenAgendaIds.clear()
+        if (kind != null) discourseOpenAgendaIds.add("pending:${kind.name.lowercase()}")
+
         Log.d(TAG, "setPending(): kind=$kind idx=$cellIdx digit=$digit")
     }
 
@@ -109,6 +130,12 @@ object SessionStore {
             pendingCellIdx = null,
             pendingDigit = null
         )
+
+        // Phase 4: deterministic discourse update
+        discourseOpenAgendaIds.clear()
+        discourseTopicIssue = null
+        // keep discourseTopicCell (often still useful as “current topic”)
+
         Log.d(TAG, "clearPending()")
     }
 
@@ -125,6 +152,351 @@ object SessionStore {
     @Synchronized
     private fun resetStep2Unsafe() {
         step2State = Step2State()
+    }
+
+
+
+    // ---------------------------------------------------------------------
+    // Phase 4: Discourse state (deterministic, App-owned)
+    // ---------------------------------------------------------------------
+
+    private var discourseTopicCell: String? = null          // e.g., "r4c2"
+    private var discourseTopicIssue: String? = null         // e.g., "confirm_edit"|"ask_cell_value"|...
+    private var discourseOpenAgendaIds: MutableList<String> = mutableListOf()
+
+    private fun cellNameOfIndex(idx: Int): String {
+        val i = idx.coerceIn(0, 80)
+        val r = (i / 9) + 1
+        val c = (i % 9) + 1
+        return "r${r}c${c}"
+    }
+
+    @Synchronized
+    fun snapshotDiscourseStateJson(): String {
+        val o = JSONObject().apply {
+            put("topic_cell", discourseTopicCell ?: "")
+            put("topic_issue", discourseTopicIssue ?: "")
+            put("open_agenda_ids", org.json.JSONArray().apply {
+                discourseOpenAgendaIds.forEach { put(it) }
+            })
+        }
+        return o.toString()
+    }
+
+
+    // ---------------------------------------------------------------------
+    // Conversation memory (App brain owns 100%)
+    // - per-session, cleared on reset()
+    // ---------------------------------------------------------------------
+
+    private var userTally: UserTallyV1 = UserTallyV1()
+    private var assistantTally: AssistantTallyV1 = AssistantTallyV1.defaults()
+    private var relationshipMemory: RelationshipMemoryV1 = RelationshipMemoryV1.defaults()
+
+    // last 3 completed turns (user+assistant pairs)
+    private val lastTurns: ArrayDeque<TranscriptTurnV1> = ArrayDeque()
+
+    private var onboardingDone: Boolean = false
+
+    @Synchronized fun getUserTally(): UserTallyV1 = userTally
+    @Synchronized fun getAssistantTally(): AssistantTallyV1 = assistantTally
+    @Synchronized fun getRelationshipMemory(): RelationshipMemoryV1 = relationshipMemory
+    @Synchronized fun isOnboardingDone(): Boolean = onboardingDone
+    @Synchronized fun setOnboardingDone(done: Boolean) { onboardingDone = done }
+
+    @Synchronized
+    fun setRelationshipMemory(memory: RelationshipMemoryV1) {
+        relationshipMemory = memory
+    }
+
+    @Synchronized
+    fun replaceRelationshipMemory(memory: RelationshipMemoryV1) {
+        relationshipMemory = memory
+    }
+
+    @Synchronized
+    fun resetRelationshipMemory() {
+        relationshipMemory = RelationshipMemoryV1.defaults()
+    }
+
+    @Synchronized
+    fun mergeRelationshipDelta(delta: RelationshipDeltaV1) {
+        relationshipMemory = RelationshipMemoryMergerV1.merge(relationshipMemory, delta)
+    }
+
+    @Synchronized
+    fun mergeUserTallyDelta(delta: UserTallyV1) {
+        userTally = userTally.merge(delta)
+    }
+
+    @Synchronized
+    fun mergeAssistantTallyDelta(delta: AssistantTallyV1) {
+        assistantTally = assistantTally.merge(delta)
+    }
+
+    @Synchronized
+    fun ensureFirstUserSpeech(firstSpeech: String) {
+        if (userTally.firstSpeech.isNullOrBlank()) {
+            userTally = userTally.merge(UserTallyV1(firstSpeech = firstSpeech))
+        }
+    }
+
+    @Synchronized
+    fun ensureFirstAssistantSpeech(firstSpeech: String) {
+        if (assistantTally.firstSpeech.isNullOrBlank()) {
+            assistantTally = assistantTally.merge(AssistantTallyV1(firstSpeech = firstSpeech))
+        }
+    }
+
+    // Keep more than 3 turns so we can expand context when coreference is likely.
+    // Phase 3: adaptive transcript window (3 → 6 → 10).
+    private const val MAX_TRANSCRIPT_TURNS = 10
+
+    @Synchronized
+    fun appendTurnToTranscript(turnId: Long, userText: String, assistantText: String) {
+        val t = TranscriptTurnV1(
+            turnId = turnId,
+            user = userText.trim(),
+            assistant = assistantText.trim()
+        )
+        lastTurns.addLast(t)
+        while (lastTurns.size > MAX_TRANSCRIPT_TURNS) lastTurns.removeFirst()
+    }
+
+    /** Returns the most recent N turns (oldest→newest), capped by what we have. */
+    @Synchronized
+    fun getRecentTurns(maxTurns: Int): List<TranscriptTurnV1> {
+        val n = maxTurns.coerceIn(0, MAX_TRANSCRIPT_TURNS)
+        val all = lastTurns.toList()
+        return if (all.size <= n) all else all.takeLast(n)
+    }
+
+    /** Legacy convenience (kept): last 3 turns. */
+    @Synchronized
+    fun getLast3Turns(): List<TranscriptTurnV1> = getRecentTurns(3)
+
+    /**
+     * Series 6 — structured transcript lookback hints for Tick-1.
+     *
+     * Important:
+     * This API must not infer meaning from raw user text.
+     * Upstream callers should pass structured hints or state-derived pre-hints.
+     */
+    data class TranscriptContextHintsV1(
+        val contextSpanHint: ContextSpanHintV1? = null,
+        val referencesPriorTurns: Boolean? = null,
+        val repairSignal: RepairSignalV1? = null,
+        val hasOpenAgenda: Boolean = false
+    )
+
+
+
+    private fun isUserAgendaBridgeKeyV1(value: String?): Boolean =
+        value?.contains("UserAgendaBridge", ignoreCase = true) == true
+
+    /**
+     * Series 6 — pre-Tick1 fallback hints derived only from authoritative state.
+     *
+     * Because this runs before the current Tick-1 parse exists, it may only use
+     * already-known state such as pending/open agenda. It must not inspect raw user text.
+     */
+    fun derivePreTick1TranscriptContextHintsV1(
+        pendingBefore: String?,
+        lastAssistantQuestionKey: String?
+    ): TranscriptContextHintsV1 {
+        val isUserAgendaBridge =
+            isUserAgendaBridgeKeyV1(pendingBefore) ||
+                    isUserAgendaBridgeKeyV1(lastAssistantQuestionKey)
+
+        val hasAppOpenAgenda =
+            !isUserAgendaBridge &&
+                    (!pendingBefore.isNullOrBlank() || !lastAssistantQuestionKey.isNullOrBlank())
+
+        return TranscriptContextHintsV1(
+            contextSpanHint =
+                when {
+                    isUserAgendaBridge -> ContextSpanHintV1.LOCAL
+                    hasAppOpenAgenda -> ContextSpanHintV1.MEDIUM
+                    else -> ContextSpanHintV1.LOCAL
+                },
+            referencesPriorTurns = hasAppOpenAgenda,
+            repairSignal = null,
+            hasOpenAgenda = hasAppOpenAgenda
+        )
+    }
+
+    /**
+     * Series 6 — adaptive transcript window selection for Tick-1 driven by structured hints.
+     *
+     * Policy:
+     * - default 3
+     * - medium 6 when nearby conversational context likely matters
+     * - wide 10 for repair / explicit broader prior-turn dependence
+     */
+    @Synchronized
+    fun getRecentTurnsAdaptive(
+        hints: TranscriptContextHintsV1
+    ): List<TranscriptTurnV1> {
+        val n = when {
+            hints.repairSignal == RepairSignalV1.MISHEARD ||
+                    hints.repairSignal == RepairSignalV1.MISUNDERSTOOD ||
+                    hints.repairSignal == RepairSignalV1.CONTRADICTION ||
+                    hints.repairSignal == RepairSignalV1.LOOP_COMPLAINT ||
+                    hints.repairSignal == RepairSignalV1.REPEATED_QUESTION -> 10
+
+            hints.contextSpanHint == ContextSpanHintV1.LONG -> 10
+
+            hints.contextSpanHint == ContextSpanHintV1.MEDIUM ||
+                    hints.referencesPriorTurns == true ||
+                    hints.hasOpenAgenda -> 6
+
+            else -> 3
+        }
+
+        return getRecentTurns(n)
+    }
+
+
+
+
+
+    // ---------------------------------------------------------------------
+// Conversation memory snapshot helper (for telemetry + LLM payloads)
+// ---------------------------------------------------------------------
+
+    data class MemorySnapshotJson(
+        val userTallyJson: String,
+        val assistantTallyJson: String,
+        val relationshipMemoryJson: String,
+        val recentTurnsJson: String
+    )
+
+    @Synchronized
+    fun snapshotMemoryJson(): MemorySnapshotJson {
+        // IMPORTANT:
+        // Emit full-shape JSON so telemetry/audits always show all keys
+        // even when the underlying fields are still null.
+        val u = userTallyToFullJsonString(getUserTally())
+        val a = assistantTallyToFullJsonString(getAssistantTally())
+        val r = relationshipMemoryToFullJsonString(getRelationshipMemory())
+        val t = TranscriptTurnV1.jsonArray(getLast3Turns()).toString()
+        return MemorySnapshotJson(
+            userTallyJson = u,
+            assistantTallyJson = a,
+            relationshipMemoryJson = r,
+            recentTurnsJson = t
+        )
+    }
+
+    private fun buildSolvingHandoffCtxV1(
+        pendingBefore: String?,
+        pendingTargetCell: String?,
+        lastAssistantQuestionKey: String?,
+        canonicalSolvingPositionKind: String?
+    ): TurnContextV1.SolvingHandoffCtxV1? {
+        val pendingUpper = pendingBefore?.trim()?.uppercase()
+        val questionUpper = lastAssistantQuestionKey?.trim()?.uppercase()
+        val canonicalUpper = canonicalSolvingPositionKind?.trim()?.uppercase()
+
+        val isPostResolutionFollowup =
+            canonicalUpper == "RESOLUTION_COMMIT" ||
+                    canonicalUpper == "RESOLUTION_POST_COMMIT" ||
+                    pendingUpper == "APPLY_HINT_NOW" ||
+                    pendingUpper == "AFTER_RESOLUTION" ||
+                    questionUpper == "APPLY_HINT_NOW" ||
+                    questionUpper == "AFTER_RESOLUTION"
+
+        if (!isPostResolutionFollowup) return null
+
+        return TurnContextV1.SolvingHandoffCtxV1(
+            handoffKind = "POST_RESOLUTION_CONTINUE",
+            authority = "STRUCTURED_APP_STATE",
+            commitAlreadyApplied = true,
+            committedCell = pendingTargetCell,
+            assistantCtaKind = "CONTINUE_ROUTE",
+            assistantCtaScope = "NEXT_STEP",
+            genericAssentDefaultIntent = "SOLVE_CONTINUE",
+            detourOverrideRule = "ONLY_IF_EXPLICIT"
+        )
+    }
+
+    @Synchronized
+    fun snapshotTurnContextV1(
+        turnId: Long,
+        mode: String,
+        phase: String,
+        userText: String,
+        pendingBefore: String?,
+        pendingExpectedAnswerKind: String?,
+        pendingTargetCell: String?,
+        focusCell: String?,
+        lastAssistantQuestionKey: String?,
+        canonicalSolvingPositionKind: String? = null
+    ): TurnContextV1 {
+        val mem0 = snapshotMemoryJson()
+
+        val isUserAgendaBridge =
+            isUserAgendaBridgeKeyV1(pendingBefore) ||
+                    isUserAgendaBridgeKeyV1(lastAssistantQuestionKey)
+
+        // Series 6: structured transcript window hints for Tick-1.
+        // Pre-Tick1, only authoritative prior state may be used here.
+        val transcriptHints =
+            derivePreTick1TranscriptContextHintsV1(
+                pendingBefore = pendingBefore,
+                lastAssistantQuestionKey = lastAssistantQuestionKey
+            )
+
+        val recentTurnsAdaptive = getRecentTurnsAdaptive(
+            hints = transcriptHints
+        )
+        val recentTurnsJsonAdaptive = TranscriptTurnV1.jsonArray(recentTurnsAdaptive).toString()
+
+        val awaitedAssistantAnswer =
+            if (!pendingBefore.isNullOrBlank() || !lastAssistantQuestionKey.isNullOrBlank()) {
+                TurnContextV1.AwaitedAssistantAnswerCtxV1(
+                    owner = if (isUserAgendaBridge) "USER_AGENDA_OWNER" else "APP_ROUTE_OWNER",
+                    questionKey = lastAssistantQuestionKey ?: pendingBefore,
+                    questionKind = pendingBefore ?: lastAssistantQuestionKey,
+                    expectedAnswerKind = pendingExpectedAnswerKind,
+                    followupDisposition =
+                        if (isUserAgendaBridge) "USER_AGENDA_DETOUR" else "APP_ROUTE_FOLLOWUP"
+                )
+            } else {
+                null
+            }
+
+        val solvingHandoff =
+            buildSolvingHandoffCtxV1(
+                pendingBefore = pendingBefore,
+                pendingTargetCell = pendingTargetCell,
+                lastAssistantQuestionKey = lastAssistantQuestionKey,
+                canonicalSolvingPositionKind = canonicalSolvingPositionKind
+            )
+
+        return TurnContextV1(
+            turnId = turnId,
+            mode = mode,
+            phase = phase,
+            userText = userText,
+            pending = TurnContextV1.PendingCtxV1(
+                pendingBefore = pendingBefore,
+                expectedAnswerKind = pendingExpectedAnswerKind,
+                targetCell = pendingTargetCell
+            ),
+            focusCell = focusCell,
+            focusCoreferencePolicy =
+                if (isUserAgendaBridge) "STRICT_DEICTIC_ONLY" else "NORMAL",
+            lastAssistantQuestionKey = lastAssistantQuestionKey,
+            canonicalSolvingPositionKind = canonicalSolvingPositionKind,
+            solvingHandoff = solvingHandoff,
+            awaitedAssistantAnswer = awaitedAssistantAnswer,
+            recentTurnsPolicy =
+                if (isUserAgendaBridge) "DEICTIC_ONLY_NO_CELL_COMPLETION" else "ADAPTIVE",
+            userTallyJson = mem0.userTallyJson,
+            assistantTallyJson = mem0.assistantTallyJson,
+            recentTurnsJson = recentTurnsJsonAdaptive
+        )
     }
 
     // -------- Raw artifacts from rectification / capture
@@ -162,6 +534,8 @@ object SessionStore {
     // Candidates are inherently user-thought; we store them as "truth candidates"
     private var truthCandidateMask: IntArray? = null
 
+    private var truthConfirmed: BooleanArray? = null
+
 
 
     // -------- Lifecycle flags
@@ -175,6 +549,14 @@ object SessionStore {
      */
     @Synchronized
     fun reset() {
+
+
+        userTally = UserTallyV1()
+        assistantTally = AssistantTallyV1.defaults()
+        relationshipMemory = RelationshipMemoryV1.defaults()
+        lastTurns.clear()
+        onboardingDone = false
+
         rectifyRunPath = null
         points10x10 = null
         tilePaths = null
@@ -196,12 +578,15 @@ object SessionStore {
         truthIsGiven = null
         truthIsSolution = null
         truthCandidateMask = null
+        truthConfirmed = null
 
         isAutoCorrected.set(false)
         isValidated.set(false)
         isReady.set(false)
 
         resetStep2Unsafe()
+
+        truthConfirmed = BooleanArray(81)
 
         Log.d(TAG, "reset() → session cleared (including Step-2 state)")
     }
@@ -281,7 +666,8 @@ object SessionStore {
     data class TruthSnapshot(
         val isGiven: BooleanArray,
         val isSolution: BooleanArray,
-        val candidateMask: IntArray
+        val candidateMask: IntArray,
+        val confirmed81: BooleanArray
     )
 
     @Synchronized
@@ -289,12 +675,18 @@ object SessionStore {
         val g = truthIsGiven ?: return null
         val s = truthIsSolution ?: return null
         val c = truthCandidateMask ?: return null
-        return TruthSnapshot(g.copyOf(), s.copyOf(), c.copyOf())
+        val k = truthConfirmed ?: BooleanArray(81)
+        return TruthSnapshot(g.copyOf(), s.copyOf(), c.copyOf(), k.copyOf())
     }
 
     @Synchronized
     fun ensureTruthInitializedFromCanonicalIfPossible() {
-        if (truthIsGiven != null && truthIsSolution != null && truthCandidateMask != null) return
+        // If baseline truth exists, still ensure confirmed exists.
+        if (truthIsGiven != null && truthIsSolution != null && truthCandidateMask != null) {
+            if (truthConfirmed == null || truthConfirmed?.size != 81) truthConfirmed = BooleanArray(81)
+            return
+        }
+
         val g = canonicalIsGiven
         val s = canonicalIsSolution
         val c = canonicalCandidateMask
@@ -302,7 +694,8 @@ object SessionStore {
             truthIsGiven = g.copyOf()
             truthIsSolution = s.copyOf()
             truthCandidateMask = c.copyOf()
-            Log.d(TAG, "ensureTruthInitializedFromCanonicalIfPossible(): initialized from canonical")
+            if (truthConfirmed == null || truthConfirmed?.size != 81) truthConfirmed = BooleanArray(81)
+            Log.d(TAG, "ensureTruthInitializedFromCanonicalIfPossible(): initialized from canonical (+confirmed81)")
         }
     }
 
@@ -320,6 +713,23 @@ object SessionStore {
             else -> return false
         }
         return true
+    }
+
+    @Synchronized
+    fun setConfirmed(idx: Int, confirmed: Boolean): Boolean {
+        ensureTruthInitializedFromCanonicalIfPossible()
+        val k = truthConfirmed ?: run {
+            truthConfirmed = BooleanArray(81)
+            truthConfirmed!!
+        }
+        if (idx !in 0..80) return false
+        k[idx] = confirmed
+        return true
+    }
+
+    @Synchronized
+    fun clearAllConfirmed() {
+        truthConfirmed = BooleanArray(81)
     }
 
     @Synchronized
@@ -378,6 +788,7 @@ object SessionStore {
         truthIsGiven = canonicalIsGiven?.copyOf()
         truthIsSolution = canonicalIsSolution?.copyOf()
         truthCandidateMask = canonicalCandidateMask?.copyOf()
+        truthConfirmed = truthConfirmed?.takeIf { it.size == 81 } ?: BooleanArray(81)
 
         isAutoCorrected.set(true)
 
@@ -463,6 +874,46 @@ object SessionStore {
             step2PendingDigit = s2.pendingDigit
         )
     }
+
+
+
+    // ---------------------------------------------------------------------
+    // Full-shape JSON (for telemetry + LLM context)
+    // - Always includes ALL keys, using "" for missing values.
+    // - Prevents “only first_speech shows up” when other fields are null.
+    // ---------------------------------------------------------------------
+
+    private fun userTallyToFullJsonString(u: UserTallyV1): String {
+        val o = org.json.JSONObject()
+        o.put("name", u.name ?: "")
+        o.put("age", u.age ?: "")
+        o.put("facts", u.facts ?: "")
+        o.put("sudoku_level", u.sudokuLevel ?: "")
+        o.put("thinking_process", u.thinkingProcess ?: "")
+        o.put("dislikes", u.dislikes ?: "")
+        o.put("preferences", u.preferences ?: "")
+        o.put("personality", u.personality ?: "")
+        o.put("first_speech", u.firstSpeech ?: "")
+        return o.toString()
+    }
+
+    private fun assistantTallyToFullJsonString(a: AssistantTallyV1): String {
+        val o = org.json.JSONObject()
+        o.put("name", a.name ?: "")
+        o.put("age", a.age ?: "")
+        o.put("about", a.about ?: "")
+        o.put("dislikes", a.dislikes ?: "")
+        o.put("preferences", a.preferences ?: "")
+        o.put("personality", a.personality ?: "")
+        o.put("first_speech", a.firstSpeech ?: "")
+        return o.toString()
+    }
+
+    private fun relationshipMemoryToFullJsonString(r: RelationshipMemoryV1): String {
+        return r.toJson().toString()
+    }
+
+
 }
 
 /**
@@ -497,4 +948,6 @@ data class SessionSnapshot(
     val step2PendingKind: String? = null,
     val step2PendingCellIdx: Int? = null,
     val step2PendingDigit: Int? = null
+
+
 )

@@ -1,0 +1,63 @@
+{
+  "book_id": "BK-CL9-DW-B01",
+  "library_id": "LIB-CL9",
+  "aisle_id": "AIS-DWEIGHT",
+  "title": "Classic Sudoku Easy to Medium",
+  "subtitle": "A gradual effort progression",
+  "series_name": "Classic Sudoku Library",
+  "volume_number": 1,
+  "isbn": null,
+  "description": "A standard 9x9 Sudoku book progressing from easier to medium-weight puzzles.",
+  "target_audience": "general",
+  "trim_size": "8.5x11",
+  "puzzles_per_page": 4,
+  "page_layout_profile": "classic_four_up",
+  "solution_section_policy": "appendix",
+  "cover_theme": "classic_blue",
+  "layout_type": "classic9x9",
+  "grid_size": 9,
+  "search_tags": [
+    "easy",
+    "medium",
+    "classic9x9"
+  ],
+  "publication_status": "draft",
+  "global_filters": {
+    "layout_type": "classic9x9",
+    "is_unique": true,
+    "is_human_solvable": true
+  },
+  "ordering_policy": {
+    "within_section": "weight_asc",
+    "tie_breakers": [
+      "technique_count",
+      "clue_count",
+      "generation_seed"
+    ]
+  },
+  "reuse_policy": "book_exclusive",
+  "sections": [
+    {
+      "section_code": "L1",
+      "title": "Section 1",
+      "subtitle": "Easy band",
+      "criteria": {
+        "weight_min": 0,
+        "weight_max": 120
+      },
+      "difficulty_label_hint": "easy",
+      "puzzle_count": 4
+    },
+    {
+      "section_code": "L2",
+      "title": "Section 2",
+      "subtitle": "Medium band",
+      "criteria": {
+        "weight_min": 121,
+        "weight_max": 240
+      },
+      "difficulty_label_hint": "medium",
+      "puzzle_count": 4
+    }
+  ]
+}

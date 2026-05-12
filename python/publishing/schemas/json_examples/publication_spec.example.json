@@ -1,0 +1,45 @@
+{
+  "publication_id": "PUB-BK-CL9-DW-B01-KDP-8511-BW",
+  "book_id": "BK-CL9-DW-B01",
+  "channel_id": "amazon_kdp_paperback",
+  "format_id": "amazon_kdp_paperback_8_5x11_bw",
+  "include_cover": true,
+  "include_solutions": true,
+  "mirror_margins": true,
+  "front_matter_profile": "classic_with_tutorials",
+  "end_matter_profile": "review_request",
+  "section_separator_policy": "section_openers",
+  "blank_page_policy": "enforce_recto_major_sections",
+  "page_numbering_policy": "body_only",
+  "puzzle_page_template": "classic_4up_clean",
+  "solution_page_template": "solution_4up_basic",
+  "cover_template": "basic_full_wrap",
+  "paper_type": "white_bw",
+  "metadata": {
+    "imprint_id": "sudoku_companion",
+    "imprint_name": "Sudoku Companion",
+    "marketplace": "amazon_kdp",
+    "language": "English",
+    "contributor_name": "Sudoku Companion",
+    "series_name": "Classic Sudoku Library",
+    "audience": "Adults",
+    "keywords": [
+      "sudoku",
+      "sudoku for adults",
+      "easy to medium sudoku",
+      "brain games",
+      "logic puzzles"
+    ],
+    "categories": [
+      "Games & Activities / Sudoku",
+      "Games & Activities / Logic & Brain Teasers"
+    ],
+    "spine_text": "Classic Sudoku Easy to Medium",
+    "back_copy": "A standard 9x9 Sudoku book progressing from easier to medium-weight puzzles. Includes guided front matter, sectioned progression, and appended solutions.",
+    "marketplace_description": "A standard 9x9 Sudoku book progressing from easier to medium-weight puzzles. Includes guided front matter, sectioned progression, and appended solutions.",
+    "isbn_assignment": "demo_empty",
+    "isbn": "",
+    "front_design_asset": "",
+    "back_design_asset": ""
+  }
+}

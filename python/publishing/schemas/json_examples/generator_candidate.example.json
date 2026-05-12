@@ -1,0 +1,25 @@
+{
+  "givens81": "075900308000008020108000000600800700050709060007001004080000601036180000012007580",
+  "solution81": "275916348943758126168234957691842735854379261327561894489523671536187492712694583",
+  "weight": 184,
+  "techniques_used": [
+    "singles",
+    "naked_double",
+    "pointing_single",
+    "x_wing"
+  ],
+  "technique_histogram": {
+    "singles": 22,
+    "naked_double": 3,
+    "pointing_single": 2,
+    "x_wing": 1
+  },
+  "pattern_mask81": "000010000001111100011111110111111111111111111111111111011111110001111100000010000",
+  "generation_seed": 183746251,
+  "generator_version": "bookgen-v1",
+  "generation_method": "pattern_fill",
+  "is_unique": true,
+  "is_human_solvable": true,
+  "title": "Puzzle L1-001",
+  "subtitle": "Classic 9x9"
+}

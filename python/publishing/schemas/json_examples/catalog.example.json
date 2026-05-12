@@ -1,0 +1,45 @@
+{
+  "catalog_version": "1.0.0",
+  "generated_at": "2026-04-11T00:00:00Z",
+  "library_ids": [
+    "LIB-CL9"
+  ],
+  "libraries": [
+    {
+      "library_id": "LIB-CL9",
+      "slug": "classic9",
+      "title": "Classic Sudoku Library",
+      "subtitle": "Standard 9x9 Sudoku catalog",
+      "description": "The classic 9x9 Sudoku library used by the app and by printable book production.",
+      "layout_type": "classic9x9",
+      "grid_size": 9,
+      "charset": "123456789",
+      "box_schema": "3x3",
+      "status": "active",
+      "aisle_ids": [
+        "AIS-TCOUNT",
+        "AIS-CTECH",
+        "AIS-DWEIGHT",
+        "AIS-PATTERN",
+        "AIS-MISC"
+      ],
+      "created_at": "2026-04-11T00:00:00Z",
+      "updated_at": "2026-04-11T00:00:00Z"
+    }
+  ],
+  "book_summaries": [
+    {
+      "book_id": "BK-CL9-DW-B01",
+      "title": "Classic Sudoku Easy to Medium",
+      "subtitle": "A gradual effort progression",
+      "aisle_id": "AIS-DWEIGHT",
+      "puzzle_count": 300
+    }
+  ],
+  "index_files": {
+    "books_by_title": "indexes/books_by_title.json",
+    "puzzles_by_technique": "indexes/puzzles_by_technique.json",
+    "puzzles_by_weight_band": "indexes/puzzles_by_weight_band.json",
+    "puzzles_by_pattern": "indexes/puzzles_by_pattern.json"
+  }
+}

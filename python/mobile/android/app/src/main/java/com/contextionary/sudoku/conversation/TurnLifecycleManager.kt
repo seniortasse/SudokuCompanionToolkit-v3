@@ -41,7 +41,6 @@ class TurnLifecycleManager(
         return t
     }
 
-
     /**
      * Persist a system-initiated assistant message as its own completed turn.
      *
@@ -57,10 +56,8 @@ class TurnLifecycleManager(
         text: String,
         source: String = "PRELUDE"
     ): TurnRecord {
-        // 1) Create a new turn
         val created = createTurn(sessionId = sessionId, persona = persona)
 
-        // 2) Move it to ASSISTANT_INFLIGHT (system-initiated path; no user message)
         val t0 = requireNotNull(store.loadLast(sessionId)) { "No turn exists right after createTurn()" }
         require(t0.turnId == created.turnId) { "Prelude must apply to latest turn" }
         require(t0.status == TurnStatus.CREATED) { "Illegal prelude base state ${t0.status}" }
@@ -77,11 +74,9 @@ class TurnLifecycleManager(
             )
         )
 
-        // 3) Commit assistant + finalize
         val committed = commitAssistant(sessionId = sessionId, turnId = created.turnId, text = text)
         val done = finalizeTurn(sessionId = sessionId, turnId = created.turnId)
 
-        // Optional extra breadcrumb (helps Bucket S diagnosis quickly)
         emit(
             "TURN_PRELUDE_PERSISTED",
             sessionId,
@@ -149,6 +144,23 @@ class TurnLifecycleManager(
         return t1
     }
 
+    /**
+     * ✅ Safety helper: commit assistant only if still inflight.
+     * - If already committed, return latest turn unchanged (prevents double-commit crash).
+     * - Keeps strictness for other states.
+     */
+    fun commitAssistantOnce(sessionId: SessionId, turnId: TurnId, text: String): TurnRecord {
+        val t0 = requireNotNull(store.loadLast(sessionId)) { "No turn exists" }
+        require(t0.turnId == turnId) { "commitAssistantOnce must apply to latest turn" }
+
+        return when (t0.status) {
+            TurnStatus.ASSISTANT_INFLIGHT -> commitAssistant(sessionId, turnId, text)
+            TurnStatus.ASSISTANT_COMMITTED,
+            TurnStatus.DONE -> t0
+            else -> error("Illegal transition ${t0.status} -> ASSISTANT_COMMITTED (commitAssistantOnce)")
+        }
+    }
+
     fun finalizeTurn(sessionId: SessionId, turnId: TurnId): TurnRecord {
         val t0 = requireNotNull(store.loadLast(sessionId)) { "No turn exists" }
         require(t0.turnId == turnId) { "finalizeTurn must apply to latest turn" }
@@ -158,6 +170,21 @@ class TurnLifecycleManager(
         store.upsert(t1)
         emit("TURN_DONE", sessionId, mapOf("turn_id" to turnId))
         return t1
+    }
+
+    /**
+     * ✅ Safety helper: finalize only if committed.
+     * - If already DONE, do nothing.
+     */
+    fun finalizeTurnOnce(sessionId: SessionId, turnId: TurnId): TurnRecord {
+        val t0 = requireNotNull(store.loadLast(sessionId)) { "No turn exists" }
+        require(t0.turnId == turnId) { "finalizeTurnOnce must apply to latest turn" }
+
+        return when (t0.status) {
+            TurnStatus.ASSISTANT_COMMITTED -> finalizeTurn(sessionId, turnId)
+            TurnStatus.DONE -> t0
+            else -> error("Illegal transition ${t0.status} -> DONE (finalizeTurnOnce)")
+        }
     }
 
     // ✅ This is what your RecoveryController was trying to call

@@ -1,0 +1,27 @@
+{
+  "pattern_id": "PAT-CL9-0001",
+  "library_id": "LIB-CL9",
+  "name": "Classic Diamond 33",
+  "slug": "classic-diamond-33",
+  "description": "Symmetric diamond-shaped clue pattern for standard 9x9 Sudoku.",
+  "grid_size": 9,
+  "layout_type": "classic9x9",
+  "mask81": "000010000001111100011111110111111111111111111111111111011111110001111100000010000",
+  "clue_count": 53,
+  "symmetry_type": "vertical",
+  "visual_family": "geometric",
+  "tags": [
+    "diamond",
+    "symmetric",
+    "classic"
+  ],
+  "source_type": "manual",
+  "source_ref": "legacy_excel_import",
+  "author": "internal",
+  "is_verified": true,
+  "print_score": 0.92,
+  "legibility_score": 0.90,
+  "aesthetic_score": 0.89,
+  "created_at": "2026-04-11T00:00:00Z",
+  "updated_at": "2026-04-11T00:00:00Z"
+}

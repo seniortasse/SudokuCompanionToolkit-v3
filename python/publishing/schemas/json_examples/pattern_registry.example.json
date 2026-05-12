@@ -1,0 +1,59 @@
+{
+  "library_id": "LIB-CL9",
+  "pattern_count": 2,
+  "patterns": [
+    {
+      "pattern_id": "PAT-CL9-0001",
+      "library_id": "LIB-CL9",
+      "name": "Classic Diamond 33",
+      "slug": "classic-diamond-33",
+      "description": "Symmetric diamond-shaped clue pattern for standard 9x9 Sudoku.",
+      "grid_size": 9,
+      "layout_type": "classic9x9",
+      "mask81": "000010000001111100011111110111111111111111111111111111011111110001111100000010000",
+      "clue_count": 53,
+      "symmetry_type": "vertical",
+      "visual_family": "geometric",
+      "tags": [
+        "diamond",
+        "symmetric",
+        "classic"
+      ],
+      "source_type": "excel_import",
+      "source_ref": "legacy_patterns.xlsx::Diamond",
+      "author": "internal",
+      "is_verified": false,
+      "print_score": 0.85,
+      "legibility_score": 0.82,
+      "aesthetic_score": 0.88,
+      "created_at": "2026-04-11T00:00:00Z",
+      "updated_at": "2026-04-11T00:00:00Z"
+    },
+    {
+      "pattern_id": "PAT-CL9-0002",
+      "library_id": "LIB-CL9",
+      "name": "Classic Sparse 29",
+      "slug": "classic-sparse-29",
+      "description": "A sparse symmetric pattern for standard 9x9 Sudoku.",
+      "grid_size": 9,
+      "layout_type": "classic9x9",
+      "mask81": "100000001010000010001000100000111000000101000000111000001000100010000010100000001",
+      "clue_count": 21,
+      "symmetry_type": "rotational",
+      "visual_family": "classic_symmetric",
+      "tags": [
+        "sparse",
+        "classic"
+      ],
+      "source_type": "excel_import",
+      "source_ref": "legacy_patterns.xlsx::Sparse",
+      "author": "internal",
+      "is_verified": false,
+      "print_score": 0.72,
+      "legibility_score": 0.70,
+      "aesthetic_score": 0.85,
+      "created_at": "2026-04-11T00:00:00Z",
+      "updated_at": "2026-04-11T00:00:00Z"
+    }
+  ]
+}

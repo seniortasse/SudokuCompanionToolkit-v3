@@ -1,0 +1,33 @@
+{
+  "puzzles_by_technique": {
+    "pointing_single": [
+      "PZ-CL9-DW-B01-L1-001",
+      "PZ-CL9-DW-B01-L1-002"
+    ],
+    "x_wing": [
+      "PZ-CL9-DW-B01-L1-001"
+    ]
+  },
+  "puzzles_by_weight_band": {
+    "easy": [
+      "PZ-CL9-DW-B01-L1-002"
+    ],
+    "d1": [
+      "PZ-CL9-DW-B01-L1-002"
+    ],
+    "medium": [
+      "PZ-CL9-DW-B01-L1-001"
+    ],
+    "d2": [
+      "PZ-CL9-DW-B01-L1-001"
+    ]
+  },
+  "puzzles_by_pattern": {
+    "PAT-CL9-0001": [
+      "PZ-CL9-DW-B01-L1-001"
+    ]
+  },
+  "books_by_title": {
+    "bk-cl9-dw-b01": "BK-CL9-DW-B01"
+  }
+}
